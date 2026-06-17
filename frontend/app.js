@@ -3,16 +3,18 @@
 const state = {
   projects: [],
   activeProject: null,
+  activeProjectMeta: null,
   sessions: [],
   activeSession: null,
   detailTab: "conversation",
+  projView: "sessions", // sessions | tasks | memory | claude
   showPrompts: true,
+  sortBy: "time", // time | name
   convOffset: 0,
   convTotal: 0,
 };
 
 const CONV_PAGE = 40;
-
 const $ = (sel) => document.querySelector(sel);
 
 async function api(path) {
@@ -28,14 +30,14 @@ function esc(s) {
 
 function fmtTokens(n) {
   if (!n) return "0";
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + "M";
   if (n >= 1000) return (n / 1000).toFixed(1) + "k";
   return String(n);
 }
 
 function fmtTime(ts) {
   const d = new Date(ts * 1000);
-  const now = Date.now();
-  const diff = (now - d.getTime()) / 1000;
+  const diff = (Date.now() - d.getTime()) / 1000;
   if (diff < 60) return "just now";
   if (diff < 3600) return Math.floor(diff / 60) + "m ago";
   if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
@@ -43,7 +45,14 @@ function fmtTime(ts) {
   return d.toLocaleDateString();
 }
 
-const CTX_LIMIT = 200000; // context window reference for the bar
+function shortModel(m) {
+  if (!m) return "";
+  if (m.includes("opus")) return "opus";
+  if (m.includes("sonnet")) return "sonnet";
+  if (m.includes("haiku")) return "haiku";
+  if (m.includes("synthetic")) return "synthetic";
+  return m.slice(0, 12);
+}
 
 // ---------------------------------------------------------------------------
 // Projects
@@ -53,20 +62,47 @@ async function loadProjects() {
   renderProjects();
 }
 
+function sortedProjects() {
+  const ps = [...state.projects];
+  if (state.sortBy === "name") {
+    ps.sort((a, b) => a.name.localeCompare(b.name));
+  } else {
+    ps.sort((a, b) => b.mtime - a.mtime);
+  }
+  return ps;
+}
+
 function renderProjects() {
   const el = $("#projectList");
   if (!state.projects.length) {
     el.innerHTML = '<div class="empty">No projects found.</div>';
     return;
   }
-  el.innerHTML = state.projects.map((p) => `
-    <div class="project ${p.name === state.activeProject ? "active" : ""}" data-name="${esc(p.name)}">
-      <div class="pname">${esc(p.name)}</div>
-      <div class="pmeta">
-        <span>${p.session_count} session${p.session_count === 1 ? "" : "s"}</span>
-        ${p.has_memory ? '<span>· memory</span>' : ""}
-      </div>
-    </div>`).join("");
+  el.innerHTML = sortedProjects().map((p) => {
+    const git = p.git
+      ? `<span class="pchip git" title="git repository">⎇ ${esc(p.git.branch || p.git.repo)}</span>`
+      : "";
+    const mem = p.has_memory ? '<span class="pchip mem">◆ mem</span>' : "";
+    const cmd = p.has_claude_md ? '<span class="pchip cmd">CLAUDE.md</span>' : "";
+    let task = "";
+    let prog = "";
+    if (p.total_tasks) {
+      if (p.open_tasks) {
+        task = `<span class="pchip task-open">⏳ ${p.open_tasks}/${p.total_tasks}</span>`;
+      } else {
+        task = `<span class="pchip task-done">✓ ${p.total_tasks}</span>`;
+      }
+      const donePct = ((p.total_tasks - p.open_tasks) / p.total_tasks) * 100;
+      prog = `<div class="pprog"><div class="pfill" style="width:${donePct}%"></div></div>`;
+    }
+    return `
+      <div class="project ${p.name === state.activeProject ? "active" : ""}" data-name="${esc(p.name)}">
+        <div class="pname">${esc(p.name)}</div>
+        <div class="ptime">${p.session_count} session${p.session_count === 1 ? "" : "s"} · ${fmtTime(p.mtime)}</div>
+        <div class="pbadges">${git}${mem}${cmd}${task}</div>
+        ${prog}
+      </div>`;
+  }).join("");
   el.querySelectorAll(".project").forEach((node) => {
     node.addEventListener("click", () => selectProject(node.dataset.name));
   });
@@ -74,12 +110,64 @@ function renderProjects() {
 
 async function selectProject(name) {
   state.activeProject = name;
+  state.activeProjectMeta = state.projects.find((p) => p.name === name) || null;
   state.activeSession = null;
+  state.projView = "sessions";
   closeDetail();
   renderProjects();
-  $("#sessionPane").innerHTML = '<div class="loading">loading sessions…</div>';
-  state.sessions = await api(`/api/projects/${encodeURIComponent(name)}/sessions`);
-  renderSessions();
+  renderProjNav();
+  loadProjView();
+}
+
+function renderProjNav() {
+  const nav = $("#projNav");
+  if (!state.activeProject) { nav.hidden = true; return; }
+  nav.hidden = false;
+  const m = state.activeProjectMeta || {};
+  const taskCount = m.total_tasks ? `<span class="pn-count">${m.open_tasks}/${m.total_tasks}</span>` : "";
+  const views = [
+    { key: "sessions", label: "Sessions", count: `<span class="pn-count">${m.session_count || 0}</span>` },
+    { key: "tasks", label: "Tasks", count: taskCount },
+    { key: "memory", label: "Memory", count: m.has_memory ? "" : "" },
+    { key: "claude", label: "CLAUDE.md", count: "" },
+  ];
+  nav.innerHTML = views.map((v) =>
+    `<button class="pnav-btn ${state.projView === v.key ? "active" : ""}" data-view="${v.key}">${v.label}${v.count}</button>`
+  ).join("");
+  nav.querySelectorAll(".pnav-btn").forEach((b) => {
+    b.addEventListener("click", () => {
+      state.projView = b.dataset.view;
+      renderProjNav();
+      loadProjView();
+    });
+  });
+}
+
+async function loadProjView() {
+  const el = $("#sessionPane");
+  el.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    if (state.projView === "sessions") {
+      state.sessions = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions`);
+      renderSessions();
+    } else if (state.projView === "tasks") {
+      const tasks = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/tasks`);
+      renderProjectTasks(el, tasks);
+    } else if (state.projView === "memory") {
+      const mem = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`);
+      renderMemory(el, mem, true);
+    } else if (state.projView === "claude") {
+      const cm = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/claude-md`);
+      renderClaudeMd(el, cm);
+    }
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`;
+  }
+}
+
+function ctxPct(s) {
+  const limit = s.context_limit || 200000;
+  return Math.min(100, (s.context_tokens / limit) * 100);
 }
 
 function renderSessions() {
@@ -89,7 +177,8 @@ function renderSessions() {
     return;
   }
   const rows = state.sessions.map((s) => {
-    const pct = Math.min(100, (s.context_tokens / CTX_LIMIT) * 100);
+    const pct = ctxPct(s);
+    const limLabel = (s.context_limit || 200000) >= 1000000 ? "1M" : "200k";
     const taskBadge = s.total_tasks
       ? (s.open_tasks
           ? `<span class="badge task-open">⏳ ${s.open_tasks}/${s.total_tasks} tasks</span>`
@@ -105,7 +194,7 @@ function renderSessions() {
         </div>
         <div class="session-prompt ${state.showPrompts ? "" : "hidden"}">${esc(s.last_prompt || s.first_prompt || "(no prompt)")}</div>
         <div class="ctxbar">
-          <div class="label"><span>context</span><span>${fmtTokens(s.context_tokens)} tok</span></div>
+          <div class="label"><span>context · ${limLabel} window</span><span>${fmtTokens(s.context_tokens)} (${pct.toFixed(0)}%)</span></div>
           <div class="track"><div class="fill" style="width:${pct}%"></div></div>
         </div>
         <div class="badges">
@@ -120,21 +209,71 @@ function renderSessions() {
   });
 }
 
-function shortModel(m) {
-  if (m.includes("opus")) return "opus";
-  if (m.includes("sonnet")) return "sonnet";
-  if (m.includes("haiku")) return "haiku";
-  return m.slice(0, 12);
+// Aggregated task board across all sessions in the project
+function renderProjectTasks(el, tasks) {
+  if (!tasks.length) { el.innerHTML = '<div class="empty">No tasks in this project.</div>'; return; }
+  const byCol = { pending: [], in_progress: [], completed: [] };
+  for (const t of tasks) (byCol[t.status] || byCol.pending).push(t);
+  const colHtml = KCOLS.map((c) => `
+    <div class="kcol" data-status="${c.key}">
+      <h4>${c.title} <span class="kcount">${byCol[c.key].length}</span></h4>
+      <div class="kdrop" data-status="${c.key}">
+        ${byCol[c.key].map((t) => `
+          <div class="kcard" draggable="true" data-id="${esc(t.id)}" data-sid="${esc(t.session_id)}">
+            <div class="ksub">${esc(t.subject || "(untitled)")}</div>
+            <div class="kowner">${t.owner ? "@" + esc(t.owner) + " · " : ""}${esc(t.session_id.slice(0,8))}</div>
+          </div>`).join("")}
+      </div>
+    </div>`).join("");
+  el.innerHTML = `<h2 class="pane-title">${tasks.length} tasks across ${new Set(tasks.map(t=>t.session_id)).size} sessions</h2>
+    <div class="kanban">${colHtml}</div><div class="khint">Drag to update status — writes back to each task's file.</div>`;
+  wireKanban(el, { perCard: true });
+}
+
+function renderClaudeMd(el, cm) {
+  if (!cm.cwd) {
+    el.innerHTML = '<div class="empty">No working directory known for this project (no session has a cwd yet).</div>';
+    return;
+  }
+  const status = cm.exists ? "" : "CLAUDE.md does not exist yet — saving will create it.";
+  el.innerHTML = `
+    <div class="editor-wrap">
+      <div class="editor-head">
+        <strong>CLAUDE.md</strong>
+        <span class="ehpath">${esc(cm.path)}</span>
+      </div>
+      <textarea class="editor" id="cmEditor" spellcheck="false">${esc(cm.content)}</textarea>
+      <div class="editor-actions">
+        <button class="dbtn" id="cmSave">Save</button>
+        <span class="editor-status" id="cmStatus">${esc(status)}</span>
+      </div>
+    </div>`;
+  $("#cmSave").addEventListener("click", async () => {
+    $("#cmStatus").textContent = "saving…";
+    try {
+      const r = await fetch(`/api/projects/${encodeURIComponent(state.activeProject)}/claude-md`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: $("#cmEditor").value }),
+      });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const res = await r.json();
+      $("#cmStatus").textContent = "saved ✓";
+      flash("CLAUDE.md saved to " + res.saved);
+    } catch (e) {
+      $("#cmStatus").textContent = "failed: " + e.message;
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
-// Detail pane (conversation / memory / tasks)
+// Detail pane (per-session: conversation / tasks / memory)
 // ---------------------------------------------------------------------------
 async function openSession(id) {
   state.activeSession = id;
   state.detailTab = "conversation";
   renderSessions();
-  $(".layout").classList.add("detail-open");
+  $("#layout").classList.add("detail-open");
+  $("#splitter2").hidden = false;
   const pane = $("#detailPane");
   pane.hidden = false;
   pane.innerHTML = '<div class="loading">loading…</div>';
@@ -171,7 +310,6 @@ function renderDetailShell() {
 
 function exportSession() {
   const url = `/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/export`;
-  // trigger a download of the markdown
   const a = document.createElement("a");
   a.href = url;
   a.download = `${state.activeSession.slice(0, 8)}.md`;
@@ -209,15 +347,13 @@ function openDeleteModal() {
     $("#mStatus").textContent = "deleting…";
     try {
       const r = await fetch(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/delete`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ export_first: exportFirst, save_memory: saveMemory, hard }),
       });
       if (!r.ok) throw new Error(`${r.status}`);
       const res = await r.json();
       close();
       closeDetail();
-      // refresh session list
       state.sessions = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions`);
       renderSessions();
       const note = res.export ? ` Exported.` : "";
@@ -240,11 +376,12 @@ function flash(msg) {
 
 function closeDetail() {
   state.activeSession = null;
-  $(".layout").classList.remove("detail-open");
+  $("#layout").classList.remove("detail-open");
+  $("#splitter2").hidden = true;
   const pane = $("#detailPane");
   pane.hidden = true;
   pane.innerHTML = "";
-  renderSessions();
+  if (state.projView === "sessions") renderSessions();
 }
 
 async function loadTab() {
@@ -264,7 +401,7 @@ async function loadTab() {
       renderTasks(body, tasks);
     } else if (state.detailTab === "memory") {
       const mem = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`);
-      renderMemory(body, mem);
+      renderMemory(body, mem, false);
     }
   } catch (e) {
     body.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`;
@@ -272,9 +409,7 @@ async function loadTab() {
 }
 
 function turnPreview(turn) {
-  for (const b of turn.blocks) {
-    if (b.type === "text" && b.text) return b.text.slice(0, 120);
-  }
+  for (const b of turn.blocks) if (b.type === "text" && b.text) return b.text.slice(0, 120);
   for (const b of turn.blocks) {
     if (b.type === "thinking" && b.text) return "(thinking) " + b.text.slice(0, 100);
     if (b.type === "tool_use") return `→ ${b.name}`;
@@ -366,9 +501,7 @@ const KCOLS = [
 function renderTasks(body, tasks) {
   if (!tasks.length) { body.innerHTML = '<div class="empty">No tasks for this session.</div>'; return; }
   const byCol = { pending: [], in_progress: [], completed: [] };
-  for (const t of tasks) {
-    (byCol[t.status] || byCol.pending).push(t);
-  }
+  for (const t of tasks) (byCol[t.status] || byCol.pending).push(t);
   const colHtml = KCOLS.map((c) => `
     <div class="kcol" data-status="${c.key}">
       <h4>${c.title} <span class="kcount">${byCol[c.key].length}</span></h4>
@@ -381,14 +514,18 @@ function renderTasks(body, tasks) {
       </div>
     </div>`).join("");
   body.innerHTML = `<div class="kanban">${colHtml}</div><div class="khint">Drag cards between columns to update status — writes back to the task file.</div>`;
-  wireKanban(body);
+  wireKanban(body, { sid: state.activeSession });
 }
 
-function wireKanban(scope) {
+// opts.sid: fixed session for all cards (session view).
+// opts.perCard: read session id from each card's data-sid (project view).
+function wireKanban(scope, opts = {}) {
   let dragId = null;
+  let dragSid = null;
   scope.querySelectorAll(".kcard").forEach((card) => {
     card.addEventListener("dragstart", (e) => {
       dragId = card.dataset.id;
+      dragSid = opts.perCard ? card.dataset.sid : opts.sid;
       card.classList.add("dragging");
       e.dataTransfer.effectAllowed = "move";
     });
@@ -401,74 +538,173 @@ function wireKanban(scope) {
       e.preventDefault();
       drop.classList.remove("over");
       const newStatus = drop.dataset.status;
-      if (!dragId) return;
+      if (!dragId || !dragSid) return;
       const card = scope.querySelector(`.kcard[data-id="${CSS.escape(dragId)}"]`);
       if (card && card.parentElement !== drop) {
-        drop.appendChild(card); // optimistic move
+        drop.appendChild(card);
         try {
-          const r = await fetch(`/api/sessions/${state.activeSession}/tasks/${encodeURIComponent(dragId)}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
+          const r = await fetch(`/api/sessions/${dragSid}/tasks/${encodeURIComponent(dragId)}`, {
+            method: "PATCH", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ status: newStatus }),
           });
           if (!r.ok) throw new Error(`${r.status}`);
-          // refresh counts
-          const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
-          renderTasks($("#tabBody"), tasks);
+          reloadTasksView();
         } catch (err) {
           flash("Failed to update task: " + err.message);
-          const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
-          renderTasks($("#tabBody"), tasks);
+          reloadTasksView();
         }
       }
-      dragId = null;
+      dragId = null; dragSid = null;
     });
   });
 }
 
-function renderMemory(body, mem) {
-  if (!mem.index && !mem.files.length) { body.innerHTML = '<div class="empty">No memory for this project.</div>'; return; }
+async function reloadTasksView() {
+  if (state.activeSession && state.detailTab === "tasks") {
+    const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
+    renderTasks($("#tabBody"), tasks);
+  } else if (state.projView === "tasks") {
+    const tasks = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/tasks`);
+    renderProjectTasks($("#sessionPane"), tasks);
+  }
+}
+
+function renderMemory(scope, mem, editable) {
+  if (!mem.index && !mem.files.length) {
+    scope.innerHTML = `<div class="md"><div class="empty">No memory for this project.</div>
+      <div class="mem-path">dir: ${esc(mem.dir || "")}</div></div>`;
+    return;
+  }
   let html = '<div class="md">';
-  if (mem.index) html += `<div class="mem-file"><h4>MEMORY.md</h4><pre>${esc(mem.index)}</pre></div>`;
+  html += `<div class="mem-path">memory dir: ${esc(mem.dir || "")}</div>`;
+  if (mem.index) {
+    html += memBlock("MEMORY.md", mem.index_path, mem.index, editable);
+  }
   for (const f of mem.files) {
-    html += `<div class="mem-file"><h4>${esc(f.name)}</h4><pre>${esc(f.content)}</pre></div>`;
+    html += memBlock(f.name, f.path, f.content, editable);
   }
   html += "</div>";
-  body.innerHTML = html;
+  scope.innerHTML = html;
+  if (editable) wireMemoryEditors(scope);
+}
+
+function memBlock(name, path, content, editable) {
+  if (editable) {
+    return `
+      <div class="mem-file" data-name="${esc(name)}">
+        <h4>${esc(name)}</h4>
+        <div class="mem-path">${esc(path || "")}</div>
+        <textarea class="editor mem-editor" spellcheck="false">${esc(content)}</textarea>
+        <div class="editor-actions">
+          <button class="dbtn mem-save">Save</button>
+          <span class="editor-status"></span>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="mem-file">
+      <h4>${esc(name)}</h4>
+      <div class="mem-path">${esc(path || "")}</div>
+      <pre>${esc(content)}</pre>
+    </div>`;
+}
+
+function wireMemoryEditors(scope) {
+  scope.querySelectorAll(".mem-file").forEach((blk) => {
+    const btn = blk.querySelector(".mem-save");
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      const name = blk.dataset.name;
+      const content = blk.querySelector(".mem-editor").value;
+      const status = blk.querySelector(".editor-status");
+      status.textContent = "saving…";
+      try {
+        const r = await fetch(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`, {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, content }),
+        });
+        if (!r.ok) throw new Error(`${r.status}`);
+        status.textContent = "saved ✓";
+      } catch (e) {
+        status.textContent = "failed: " + e.message;
+      }
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
-// Init
+// Layout: sidebar collapse + resizable splitters
 // ---------------------------------------------------------------------------
-$("#showPrompts").addEventListener("change", (e) => {
-  state.showPrompts = e.target.checked;
-  document.querySelectorAll(".session-prompt").forEach((p) => p.classList.toggle("hidden", !state.showPrompts));
-});
-
-let searchTimer = null;
-$("#searchBox").addEventListener("input", (e) => {
-  clearTimeout(searchTimer);
-  const q = e.target.value.trim();
-  if (!q) { renderSessions(); return; }
-  searchTimer = setTimeout(() => runSearch(q), 300);
-});
-
-$("#reindexBtn").addEventListener("click", async () => {
-  const btn = $("#reindexBtn");
-  btn.textContent = "indexing…";
-  try {
-    const r = await fetch("/api/reindex", { method: "POST" });
-    const res = await r.json();
-    flash(`Index updated: ${res.indexed} indexed, ${res.skipped} unchanged, ${res.turns} turns.`);
-  } catch (e) {
-    flash("Reindex failed: " + e.message);
-  } finally {
-    btn.textContent = "↻ index";
+function initLayout() {
+  // restore persisted widths/collapse
+  const sw = localStorage.getItem("cc_sidebarWidth");
+  if (sw) $("#sidebar").style.width = sw + "px";
+  const dw = localStorage.getItem("cc_detailWidth");
+  if (dw) $("#detailPane").style.width = dw + "px";
+  if (localStorage.getItem("cc_sidebarCollapsed") === "1") {
+    $("#layout").classList.add("sidebar-collapsed");
   }
-});
+
+  $("#sidebarToggle").addEventListener("click", () => {
+    const collapsed = $("#layout").classList.toggle("sidebar-collapsed");
+    localStorage.setItem("cc_sidebarCollapsed", collapsed ? "1" : "0");
+  });
+
+  makeSplitter($("#splitter1"), $("#sidebar"), "cc_sidebarWidth", 160, 600, false);
+  makeSplitter($("#splitter2"), $("#detailPane"), "cc_detailWidth", 280, 900, true);
+}
+
+function makeSplitter(splitter, target, storageKey, min, max, fromRight) {
+  splitter.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    splitter.classList.add("dragging");
+    const startX = e.clientX;
+    const startW = target.getBoundingClientRect().width;
+    const onMove = (ev) => {
+      const delta = fromRight ? (startX - ev.clientX) : (ev.clientX - startX);
+      let w = Math.max(min, Math.min(max, startW + delta));
+      target.style.width = w + "px";
+    };
+    const onUp = () => {
+      splitter.classList.remove("dragging");
+      localStorage.setItem(storageKey, Math.round(target.getBoundingClientRect().width));
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+let searchTimer = null;
+function initSearch() {
+  $("#searchBox").addEventListener("input", (e) => {
+    clearTimeout(searchTimer);
+    const q = e.target.value.trim();
+    if (!q) { if (state.activeProject) loadProjView(); return; }
+    searchTimer = setTimeout(() => runSearch(q), 300);
+  });
+  $("#reindexBtn").addEventListener("click", async () => {
+    const btn = $("#reindexBtn");
+    btn.textContent = "indexing…";
+    try {
+      const r = await fetch("/api/reindex", { method: "POST" });
+      const res = await r.json();
+      flash(`Index updated: ${res.indexed} indexed, ${res.skipped} unchanged, ${res.turns} turns.`);
+    } catch (e) {
+      flash("Reindex failed: " + e.message);
+    } finally {
+      btn.textContent = "↻ index";
+    }
+  });
+}
 
 async function runSearch(q) {
   const el = $("#sessionPane");
+  $("#projNav").hidden = true;
   el.innerHTML = '<div class="loading">searching…</div>';
   try {
     const data = await api(`/api/search?q=${encodeURIComponent(q)}&limit=80`);
@@ -499,14 +735,30 @@ function renderSearchResults(el, results, q) {
   el.querySelectorAll(".searchres").forEach((node) => {
     node.addEventListener("click", async () => {
       const proj = node.dataset.project;
-      if (proj !== state.activeProject) {
-        await selectProject(proj);
-      }
+      if (proj !== state.activeProject) await selectProject(proj);
       openSession(node.dataset.id);
     });
   });
 }
 
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+$("#showPrompts").addEventListener("change", (e) => {
+  state.showPrompts = e.target.checked;
+  document.querySelectorAll(".session-prompt").forEach((p) => p.classList.toggle("hidden", !state.showPrompts));
+});
+
+document.querySelectorAll(".sortbtn").forEach((b) => {
+  b.addEventListener("click", () => {
+    state.sortBy = b.dataset.sort;
+    document.querySelectorAll(".sortbtn").forEach((x) => x.classList.toggle("active", x === b));
+    renderProjects();
+  });
+});
+
+initLayout();
+initSearch();
 loadProjects().catch((e) => {
   $("#projectList").innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
 });

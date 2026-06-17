@@ -8,6 +8,7 @@
 </head>
 <body>
   <header class="topbar">
+    <button class="iconbtn" id="sidebarToggle" title="Collapse / expand sidebar">☰</button>
     <div class="brand">cc_mgr</div>
     <div class="sub">local Claude project viewer</div>
     <input type="search" id="searchBox" class="searchbox" placeholder="Search all conversations…" />
@@ -18,16 +19,28 @@
     </label>
   </header>
 
-  <div class="layout">
-    <aside class="sidebar" id="projectList">
-      <div class="loading">loading projects…</div>
+  <div class="layout" id="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <span class="sh-title">Projects</span>
+        <div class="sortctl">
+          <button class="sortbtn active" data-sort="time" title="Sort by recent activity">time</button>
+          <button class="sortbtn" data-sort="name" title="Sort alphabetically">name</button>
+        </div>
+      </div>
+      <div id="projectList"><div class="loading">loading projects…</div></div>
     </aside>
 
+    <div class="splitter" id="splitter1" data-target="sidebar"></div>
+
     <main class="content">
+      <nav class="projnav" id="projNav" hidden></nav>
       <section id="sessionPane" class="pane">
         <div class="empty">Select a project to view its sessions.</div>
       </section>
     </main>
+
+    <div class="splitter" id="splitter2" data-target="content" hidden></div>
 
     <aside class="detail" id="detailPane" hidden></aside>
   </div>

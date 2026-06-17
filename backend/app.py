@@ -31,6 +31,43 @@ def api_memory(project: str):
     return store.get_memory(project)
 
 
+class MemoryFileRequest(BaseModel):
+    name: str
+    content: str
+
+
+@app.put("/api/projects/{project}/memory")
+def api_save_memory_file(project: str, req: MemoryFileRequest):
+    try:
+        path = store.save_memory_file(project, req.name, req.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"saved": str(path)}
+
+
+@app.get("/api/projects/{project}/claude-md")
+def api_get_claude_md(project: str):
+    return store.get_claude_md(project)
+
+
+class ClaudeMdRequest(BaseModel):
+    content: str
+
+
+@app.put("/api/projects/{project}/claude-md")
+def api_save_claude_md(project: str, req: ClaudeMdRequest):
+    try:
+        path = store.save_claude_md(project, req.content)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"saved": str(path)}
+
+
+@app.get("/api/projects/{project}/tasks")
+def api_project_tasks(project: str):
+    return store.project_tasks(project)
+
+
 @app.get("/api/projects/{project}/sessions/{session_id}")
 def api_conversation(
     project: str, session_id: str, offset: int = 0, limit: int = 40

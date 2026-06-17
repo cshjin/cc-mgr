@@ -50,6 +50,83 @@ def unmangle_path(folder_name: str) -> str:
     return name.replace("-", "/") if False else folder_name
 
 
+# Context-window tiers (tokens). Model IDs don't encode the 1M-context variant,
+# so we infer the tier from observed usage and bump up as needed.
+CTX_TIERS = (200_000, 1_000_000)
+
+
+def context_limit_for(observed_tokens: int) -> int:
+    """Smallest tier that comfortably contains the observed context."""
+    for tier in CTX_TIERS:
+        if observed_tokens <= tier * 0.98:
+            return tier
+    return CTX_TIERS[-1]
+
+
+def read_git_info(cwd: str | None) -> dict[str, Any] | None:
+    """Read repo name + current branch from <cwd>/.git without invoking git.
+
+    Returns None if cwd is missing or not a git working tree.
+    """
+    if not cwd:
+        return None
+    try:
+        root = Path(cwd)
+    except (TypeError, ValueError):
+        return None
+    git = root / ".git"
+    if not git.exists():
+        return None
+    branch = None
+    detached = False
+    head_file = git / "HEAD" if git.is_dir() else None
+    # Worktrees use a .git *file* pointing elsewhere; handle the common dir case.
+    if git.is_file():
+        try:
+            content = git.read_text(encoding="utf-8", errors="replace").strip()
+            if content.startswith("gitdir:"):
+                head_file = Path(content.split(":", 1)[1].strip()) / "HEAD"
+        except OSError:
+            head_file = None
+    if head_file and head_file.is_file():
+        try:
+            head = head_file.read_text(encoding="utf-8", errors="replace").strip()
+            if head.startswith("ref:"):
+                branch = head.split("/")[-1]
+            elif head:
+                branch = head[:8]
+                detached = True
+        except OSError:
+            pass
+    return {"repo": root.name, "branch": branch, "detached": detached}
+
+
+def _peek_session_meta(path: Path, max_lines: int = 40) -> dict[str, Any]:
+    """Cheaply read cwd/gitBranch from the head of a transcript (no full parse)."""
+    meta: dict[str, Any] = {"cwd": "", "git_branch": ""}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("cwd") and not meta["cwd"]:
+                    meta["cwd"] = rec["cwd"]
+                if rec.get("gitBranch") and not meta["git_branch"]:
+                    meta["git_branch"] = rec["gitBranch"]
+                if meta["cwd"] and meta["git_branch"]:
+                    break
+    except OSError:
+        pass
+    return meta
+
+
 # ---------------------------------------------------------------------------
 # JSONL parsing
 # ---------------------------------------------------------------------------
@@ -102,6 +179,7 @@ class SessionSummary:
     user_turns: int = 0
     assistant_turns: int = 0
     context_tokens: int = 0  # best estimate of live context window size
+    context_limit: int = 200_000  # inferred context-window tier
     total_output_tokens: int = 0
     model: str = ""
     git_branch: str = ""
@@ -112,6 +190,11 @@ class SessionSummary:
 
 
 def list_projects() -> list[dict[str, Any]]:
+    """Project rows with cheap aggregates: latest activity, task progress, git.
+
+    Deliberately avoids full transcript parsing — only stat() and a short head
+    peek of the most-recent session for cwd/git — so the list stays fast.
+    """
     root = projects_dir()
     if not root.is_dir():
         return []
@@ -122,12 +205,40 @@ def list_projects() -> list[dict[str, Any]]:
         sessions = list(d.glob("*.jsonl"))
         if not sessions and not (d / "memory").is_dir():
             continue
-        last_mtime = max((s.stat().st_mtime for s in sessions), default=d.stat().st_mtime)
+
+        # newest session by mtime drives "active time" + cwd/git
+        sessions_by_mtime = sorted(sessions, key=lambda s: s.stat().st_mtime, reverse=True)
+        last_mtime = (
+            sessions_by_mtime[0].stat().st_mtime if sessions_by_mtime else d.stat().st_mtime
+        )
+
+        # aggregate task progress across this project's sessions
+        open_tasks = total_tasks = 0
+        for s in sessions:
+            tdir = tasks_dir() / s.stem
+            if tdir.is_dir():
+                t, o = _count_tasks(tdir)
+                total_tasks += t
+                open_tasks += o
+
+        # cwd + git from the newest session (cheap head peek)
+        cwd = ""
+        git = None
+        if sessions_by_mtime:
+            meta = _peek_session_meta(sessions_by_mtime[0])
+            cwd = meta.get("cwd", "")
+            git = read_git_info(cwd)
+
         out.append({
             "name": d.name,
-            "display_path": unmangle_path(d.name),
+            "display_path": cwd or unmangle_path(d.name),
+            "cwd": cwd,
             "session_count": len(sessions),
             "has_memory": (d / "memory").is_dir(),
+            "has_claude_md": bool(cwd and (Path(cwd) / "CLAUDE.md").is_file()),
+            "open_tasks": open_tasks,
+            "total_tasks": total_tasks,
+            "git": git,
             "mtime": last_mtime,
         })
     out.sort(key=lambda p: p["mtime"], reverse=True)
@@ -182,6 +293,7 @@ def _scan_session(path: Path, project: str) -> SessionSummary:
             if ctx:
                 last_assistant_context = ctx
     summ.context_tokens = last_assistant_context
+    summ.context_limit = context_limit_for(last_assistant_context)
     return summ
 
 
@@ -249,7 +361,7 @@ def update_task_status(session_id: str, task_id: str, status: str) -> dict[str, 
 def get_memory(project: str) -> dict[str, Any]:
     mem_dir = projects_dir() / project / "memory"
     if not mem_dir.is_dir():
-        return {"index": "", "files": []}
+        return {"index": "", "index_path": "", "dir": str(mem_dir), "files": []}
     index = ""
     idx_path = mem_dir / "MEMORY.md"
     if idx_path.is_file():
@@ -260,9 +372,81 @@ def get_memory(project: str) -> dict[str, Any]:
             continue
         files.append({
             "name": f.name,
+            "path": str(f),
             "content": f.read_text(encoding="utf-8", errors="replace"),
         })
-    return {"index": index, "files": files}
+    return {
+        "index": index,
+        "index_path": str(idx_path) if idx_path.is_file() else str(idx_path),
+        "dir": str(mem_dir),
+        "files": files,
+    }
+
+
+def save_memory_file(project: str, name: str, content: str) -> Path:
+    """Write a memory file (MEMORY.md or *.md) under the project's memory dir.
+
+    `name` is a bare filename — path components are rejected to prevent escapes.
+    """
+    if "/" in name or "\\" in name or name in ("", ".", ".."):
+        raise ValueError("invalid memory file name")
+    if not name.endswith(".md"):
+        raise ValueError("memory files must end in .md")
+    mem_dir = projects_dir() / project / "memory"
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    out = mem_dir / name
+    out.write_text(content, encoding="utf-8")
+    return out
+
+
+def _project_cwd(project: str) -> str:
+    """Resolve the working directory for a project from its newest session."""
+    d = projects_dir() / project
+    sessions = sorted(d.glob("*.jsonl"), key=lambda s: s.stat().st_mtime, reverse=True)
+    if not sessions:
+        return ""
+    return _peek_session_meta(sessions[0]).get("cwd", "")
+
+
+def get_claude_md(project: str) -> dict[str, Any]:
+    """Read the project's CLAUDE.md from its working directory, if present."""
+    cwd = _project_cwd(project)
+    if not cwd:
+        return {"exists": False, "path": "", "content": "", "cwd": ""}
+    path = Path(cwd) / "CLAUDE.md"
+    if path.is_file():
+        return {
+            "exists": True,
+            "path": str(path),
+            "content": path.read_text(encoding="utf-8", errors="replace"),
+            "cwd": cwd,
+        }
+    return {"exists": False, "path": str(path), "content": "", "cwd": cwd}
+
+
+def save_claude_md(project: str, content: str) -> Path:
+    """Write CLAUDE.md into the project's working directory."""
+    cwd = _project_cwd(project)
+    if not cwd:
+        raise FileNotFoundError("no working directory known for this project")
+    base = Path(cwd)
+    if not base.is_dir():
+        raise FileNotFoundError(f"working directory does not exist: {cwd}")
+    path = base / "CLAUDE.md"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def project_tasks(project: str) -> list[dict[str, Any]]:
+    """All tasks across all sessions in a project, tagged with their session id."""
+    d = projects_dir() / project
+    out: list[dict[str, Any]] = []
+    for s in sorted(d.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
+        for t in get_tasks(s.stem):
+            t = dict(t)
+            t["session_id"] = s.stem
+            out.append(t)
+    return out
 
 
 def get_conversation(

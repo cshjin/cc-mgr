@@ -7,13 +7,22 @@ Reads (read-only) from `~/.claude/projects/`, `~/.claude/tasks/`, and per-projec
 
 ## Features
 
-- **Projects list** sorted by recency.
+- **Projects list** sorted by recency or name (toggle), showing each project's
+  latest activity time, aggregated task progress, memory/CLAUDE.md presence, and
+  git branch (read directly from `.git/HEAD`). Sidebar collapses; all three panes
+  are resizable via draggable splitters (widths persist in `localStorage`).
+- **Project-level nav** — jump straight to a project's aggregated Tasks board
+  (kanban across all its sessions), project Memory, or CLAUDE.md without opening a
+  session.
+- **CLAUDE.md & memory editing** — view, edit, and save the project's CLAUDE.md
+  (in its working dir) and any memory file; absolute paths are shown.
 - **Sessions by time** with last-prompt preview (toggleable) and a context-size bar.
 - **Per-session badges**: turn counts, model, memory presence, open/total tasks.
 - **Collapsible conversation viewer** — prompts expanded, responses/tool calls
   collapse-by-default; click any turn to expand. Thinking, tool_use, and
   tool_result blocks are shown distinctly. Large sessions load lazily (40 turns
-  per page with a "Load more" button).
+  per page with a "Load more" button). The context bar adapts to the session's
+  actual window (200k vs 1M) instead of assuming a fixed size.
 - **Draggable kanban tasks tab** — drag cards between pending / in progress /
   completed; the new status is written back to the task JSON.
 - **Memory tab** — renders `MEMORY.md` and all memory files for the project.
