@@ -275,14 +275,18 @@ body {
 .mem-path { font-size: 10px; color: var(--fg-faint); font-family: var(--mono); word-break: break-all; margin: 0 0 6px; }
 
 /* editor (CLAUDE.md / memory) */
-.editor-wrap { padding: 14px 16px; display: flex; flex-direction: column; height: 100%; }
+.editor-wrap { padding: 14px 16px; display: flex; flex-direction: column; }
 .editor-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .editor-head .ehpath { font-size: 10.5px; color: var(--fg-faint); font-family: var(--mono); word-break: break-all; flex: 1; }
 .editor {
-  width: 100%; min-height: 320px; flex: 1; resize: vertical;
+  /* No flex-grow here: a flex item's height is controlled by the flex
+     algorithm, which overrides the drag-resize handle. Use an explicit
+     default height + resize:vertical so the handle actually works. */
+  display: block; width: 100%; height: 60vh; min-height: 200px; resize: vertical;
   background: var(--bg); color: var(--fg); border: 1px solid var(--border);
   border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
 }
+.editor.mem-editor { height: 240px; min-height: 120px; }
 .editor:focus { outline: none; border-color: var(--accent); }
 .editor[readonly] { opacity: 0.85; }
 .editor-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
