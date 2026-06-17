@@ -356,6 +356,71 @@ def export_session_to_file(project: str, session_id: str, out_dir: Path | None =
     return out_path
 
 
+def save_session_as_memory(project: str, session_id: str) -> Path:
+    """Distill a session into a project-reference memory file.
+
+    Deterministic summary (no model call): first/last prompt, turn/token stats,
+    skills used, and task subjects. Written under the project's memory/ dir and
+    registered in MEMORY.md so future sessions can recall it.
+    """
+    summ = None
+    for s in list_sessions(project):
+        if s.session_id == session_id:
+            summ = s
+            break
+    if summ is None:
+        raise FileNotFoundError(f"session {session_id} not found in {project}")
+
+    data = get_conversation(project, session_id, offset=0, limit=None)
+    skills = sorted({t["attribution_skill"] for t in data["turns"] if t.get("attribution_skill")})
+    tasks = get_tasks(session_id)
+    short = session_id[:8]
+
+    body = [
+        "---",
+        f"name: session-{short}",
+        f"description: archived summary of Claude session {short} in {project}",
+        "metadata:",
+        "  type: reference",
+        "---",
+        "",
+        f"Archived summary of session `{session_id}` (project `{project}`), saved "
+        f"before deletion via cc_mgr.",
+        "",
+        f"- **Turns:** {summ.message_count} ({summ.user_turns} user / {summ.assistant_turns} assistant)",
+        f"- **Context size:** ~{summ.context_tokens} tokens; total output ~{summ.total_output_tokens}",
+        f"- **Model:** {summ.model or 'n/a'}    **Git branch:** {summ.git_branch or 'n/a'}",
+    ]
+    if skills:
+        body.append(f"- **Skills used:** {', '.join(skills)}")
+    body.append("")
+    body.append(f"**First prompt:** {summ.first_prompt or '(none)'}")
+    body.append("")
+    body.append(f"**Last prompt:** {summ.last_prompt or '(none)'}")
+    if tasks:
+        body.append("")
+        body.append("**Tasks:**")
+        for t in tasks:
+            body.append(f"- [{t.get('status','?')}] {t.get('subject','(untitled)')}")
+    body.append("")
+
+    mem_dir = projects_dir() / project / "memory"
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    out = mem_dir / f"session_{short}.md"
+    out.write_text("\n".join(body), encoding="utf-8")
+
+    # register in MEMORY.md (create if absent)
+    idx = mem_dir / "MEMORY.md"
+    line = f"- [Session {short}](session_{short}.md) — archived session summary saved by cc_mgr"
+    if idx.is_file():
+        existing = idx.read_text(encoding="utf-8")
+        if line not in existing:
+            idx.write_text(existing.rstrip() + "\n" + line + "\n", encoding="utf-8")
+    else:
+        idx.write_text("# Memory Index\n\n" + line + "\n", encoding="utf-8")
+    return out
+
+
 def delete_session(project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
     """Remove a session's transcript, sidecar dir, and tasks.
 

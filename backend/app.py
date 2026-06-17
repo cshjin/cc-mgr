@@ -72,6 +72,7 @@ def api_export_inline(project: str, session_id: str):
 
 class DeleteRequest(BaseModel):
     export_first: bool = True
+    save_memory: bool = False
     hard: bool = False
 
 
@@ -81,11 +82,27 @@ def api_delete(project: str, session_id: str, req: DeleteRequest):
     if not jsonl.is_file():
         raise HTTPException(status_code=404, detail="session not found")
     export_path = None
+    memory_path = None
     if req.export_first:
         export_path = str(store.export_session_to_file(project, session_id))
+    if req.save_memory:
+        memory_path = str(store.save_session_as_memory(project, session_id))
     result = store.delete_session(project, session_id, hard=req.hard)
     result["export"] = export_path
+    result["memory"] = memory_path
     return result
+
+
+class SaveMemoryRequest(BaseModel):
+    pass
+
+
+@app.post("/api/projects/{project}/sessions/{session_id}/save-memory")
+def api_save_memory(project: str, session_id: str):
+    try:
+        return {"memory": str(store.save_session_as_memory(project, session_id))}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="session not found")
 
 
 @app.get("/api/search")

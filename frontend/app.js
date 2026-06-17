@@ -190,6 +190,7 @@ function openDeleteModal() {
       <p>This removes the transcript, sidecar files, and tasks. By default it
          is a <b>soft delete</b> (moved to a trash folder, reversible).</p>
       <label class="mrow"><input type="checkbox" id="mExport" checked /> Export to Markdown first</label>
+      <label class="mrow"><input type="checkbox" id="mMemory" /> Save a summary to project memory</label>
       <label class="mrow"><input type="checkbox" id="mHard" /> Permanent delete (skip trash)</label>
       <div class="modal-actions">
         <button class="dbtn" id="mCancel">Cancel</button>
@@ -203,13 +204,14 @@ function openDeleteModal() {
   $("#mCancel").addEventListener("click", close);
   $("#mConfirm").addEventListener("click", async () => {
     const exportFirst = $("#mExport").checked;
+    const saveMemory = $("#mMemory").checked;
     const hard = $("#mHard").checked;
     $("#mStatus").textContent = "deleting…";
     try {
       const r = await fetch(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/delete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ export_first: exportFirst, hard }),
+        body: JSON.stringify({ export_first: exportFirst, save_memory: saveMemory, hard }),
       });
       if (!r.ok) throw new Error(`${r.status}`);
       const res = await r.json();
@@ -218,9 +220,10 @@ function openDeleteModal() {
       // refresh session list
       state.sessions = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions`);
       renderSessions();
-      const note = res.export ? ` Exported to ${res.export}.` : "";
-      const where = res.trash ? ` Moved to trash: ${res.trash}.` : " Permanently removed.";
-      flash(`Session deleted.${note}${where}`);
+      const note = res.export ? ` Exported.` : "";
+      const mem = res.memory ? ` Saved to memory.` : "";
+      const where = res.trash ? ` Moved to trash.` : " Permanently removed.";
+      flash(`Session deleted.${note}${mem}${where}`);
     } catch (e) {
       $("#mStatus").textContent = "Failed: " + e.message;
     }
