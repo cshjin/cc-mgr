@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
-from functools import lru_cache
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -295,6 +296,88 @@ def get_conversation(
     end = total if limit is None else min(total, offset + limit)
     window = turns[offset:end]
     return {"total": total, "offset": offset, "limit": limit, "turns": window}
+
+
+# ---------------------------------------------------------------------------
+# Export + delete (the only mutating operations)
+# ---------------------------------------------------------------------------
+
+def export_session_markdown(project: str, session_id: str) -> str:
+    """Render a full session transcript to Markdown text."""
+    data = get_conversation(project, session_id, offset=0, limit=None)
+    lines = [f"# Session {session_id}", f"_Project: {project}_", ""]
+    for t in data["turns"]:
+        role = t["kind"]
+        ts = t.get("timestamp") or ""
+        header = f"## {role}"
+        if t.get("attribution_skill"):
+            header += f"  ·  skill: {t['attribution_skill']}"
+        if ts:
+            header += f"  ·  {ts}"
+        lines.append(header)
+        for b in t["blocks"]:
+            bt = b["type"]
+            if bt == "text":
+                lines.append(b["text"])
+            elif bt == "thinking":
+                lines.append(f"> _(thinking)_\n>\n> " + b["text"].replace("\n", "\n> "))
+            elif bt == "tool_use":
+                lines.append(f"**→ tool: {b['name']}**\n\n```json\n{json.dumps(b['input'], indent=2, ensure_ascii=False)}\n```")
+            elif bt == "tool_result":
+                txt = b.get("text", "")
+                lines.append(f"**tool result**\n\n```\n{txt}\n```")
+            lines.append("")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def export_session_to_file(project: str, session_id: str, out_dir: Path | None = None) -> Path:
+    """Write the session export to exports/<project>/<session>.md and return the path."""
+    if out_dir is None:
+        out_dir = Path.cwd() / "exports" / project
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = out_dir / f"{session_id}.{stamp}.md"
+    out_path.write_text(export_session_markdown(project, session_id), encoding="utf-8")
+    return out_path
+
+
+def delete_session(project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
+    """Remove a session's transcript, sidecar dir, and tasks.
+
+    By default this is a soft delete: artifacts are moved to
+    <claude_home>/.cc_mgr_trash/<timestamp>/ so the action is reversible.
+    Set hard=True to permanently remove instead.
+    """
+    proj_dir = projects_dir() / project
+    jsonl = proj_dir / f"{session_id}.jsonl"
+    sidecar = proj_dir / session_id
+    tdir = tasks_dir() / session_id
+
+    moved: list[str] = []
+    if hard:
+        for p in (jsonl, sidecar, tdir):
+            if p.is_file():
+                p.unlink()
+                moved.append(str(p))
+            elif p.is_dir():
+                shutil.rmtree(p)
+                moved.append(str(p))
+        return {"deleted": moved, "trash": None}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    trash = claude_home() / ".cc_mgr_trash" / f"{session_id}.{stamp}"
+    trash.mkdir(parents=True, exist_ok=True)
+    if jsonl.is_file():
+        shutil.move(str(jsonl), str(trash / jsonl.name))
+        moved.append(str(jsonl))
+    if sidecar.is_dir():
+        shutil.move(str(sidecar), str(trash / f"sidecar_{session_id}"))
+        moved.append(str(sidecar))
+    if tdir.is_dir():
+        shutil.move(str(tdir), str(trash / f"tasks_{session_id}"))
+        moved.append(str(tdir))
+    return {"deleted": moved, "trash": str(trash)}
 
 
 def _structured_blocks(content: Any) -> list[dict[str, Any]]:

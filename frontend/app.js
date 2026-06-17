@@ -150,6 +150,10 @@ function renderDetailShell() {
       <span class="dclose" id="dclose">×</span>
       <div class="dtitle">${esc(s ? s.session_id.slice(0, 8) : "")}</div>
       <div class="dmeta">${esc(s ? (s.git_branch || "") : "")} ${s ? fmtTokens(s.context_tokens) + " tok" : ""}</div>
+      <div class="dactions">
+        <button class="dbtn" id="exportBtn">⬇ Export .md</button>
+        <button class="dbtn danger" id="deleteBtn">🗑 Delete</button>
+      </div>
     </div>
     <div class="tabs">
       <div class="tab ${state.detailTab === "conversation" ? "active" : ""}" data-tab="conversation">Conversation</div>
@@ -158,9 +162,77 @@ function renderDetailShell() {
     </div>
     <div id="tabBody"></div>`;
   $("#dclose").addEventListener("click", closeDetail);
+  $("#exportBtn").addEventListener("click", exportSession);
+  $("#deleteBtn").addEventListener("click", openDeleteModal);
   pane.querySelectorAll(".tab").forEach((t) => {
     t.addEventListener("click", () => { state.detailTab = t.dataset.tab; renderDetailShell(); loadTab(); });
   });
+}
+
+function exportSession() {
+  const url = `/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/export`;
+  // trigger a download of the markdown
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${state.activeSession.slice(0, 8)}.md`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function openDeleteModal() {
+  const sid = state.activeSession.slice(0, 8);
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>Delete session ${esc(sid)}?</h3>
+      <p>This removes the transcript, sidecar files, and tasks. By default it
+         is a <b>soft delete</b> (moved to a trash folder, reversible).</p>
+      <label class="mrow"><input type="checkbox" id="mExport" checked /> Export to Markdown first</label>
+      <label class="mrow"><input type="checkbox" id="mHard" /> Permanent delete (skip trash)</label>
+      <div class="modal-actions">
+        <button class="dbtn" id="mCancel">Cancel</button>
+        <button class="dbtn danger" id="mConfirm">Delete</button>
+      </div>
+      <div class="modal-status" id="mStatus"></div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  $("#mCancel").addEventListener("click", close);
+  $("#mConfirm").addEventListener("click", async () => {
+    const exportFirst = $("#mExport").checked;
+    const hard = $("#mHard").checked;
+    $("#mStatus").textContent = "deleting…";
+    try {
+      const r = await fetch(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ export_first: exportFirst, hard }),
+      });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const res = await r.json();
+      close();
+      closeDetail();
+      // refresh session list
+      state.sessions = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions`);
+      renderSessions();
+      const note = res.export ? ` Exported to ${res.export}.` : "";
+      const where = res.trash ? ` Moved to trash: ${res.trash}.` : " Permanently removed.";
+      flash(`Session deleted.${note}${where}`);
+    } catch (e) {
+      $("#mStatus").textContent = "Failed: " + e.message;
+    }
+  });
+}
+
+function flash(msg) {
+  const f = document.createElement("div");
+  f.className = "flash";
+  f.textContent = msg;
+  document.body.appendChild(f);
+  setTimeout(() => f.remove(), 6000);
 }
 
 function closeDetail() {

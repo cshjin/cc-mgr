@@ -5,8 +5,9 @@ from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from . import store
 
@@ -44,6 +45,33 @@ def api_conversation(
 @app.get("/api/sessions/{session_id}/tasks")
 def api_tasks(session_id: str):
     return store.get_tasks(session_id)
+
+
+@app.get("/api/projects/{project}/sessions/{session_id}/export", response_class=PlainTextResponse)
+def api_export_inline(project: str, session_id: str):
+    """Return the session as Markdown text (for in-browser preview/download)."""
+    md = store.export_session_markdown(project, session_id)
+    if not md.strip():
+        raise HTTPException(status_code=404, detail="session not found or empty")
+    return md
+
+
+class DeleteRequest(BaseModel):
+    export_first: bool = True
+    hard: bool = False
+
+
+@app.post("/api/projects/{project}/sessions/{session_id}/delete")
+def api_delete(project: str, session_id: str, req: DeleteRequest):
+    jsonl = store.projects_dir() / project / f"{session_id}.jsonl"
+    if not jsonl.is_file():
+        raise HTTPException(status_code=404, detail="session not found")
+    export_path = None
+    if req.export_first:
+        export_path = str(store.export_session_to_file(project, session_id))
+    result = store.delete_session(project, session_id, hard=req.hard)
+    result["export"] = export_path
+    return result
 
 
 @app.get("/")
