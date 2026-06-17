@@ -1,5 +1,35 @@
 "use strict";
 
+// ---- Theme (dark | light | system) -----------------------------------------
+// Applied ASAP to avoid a flash; cycles on button click; persists choice.
+const THEMES = ["dark", "light", "system"];
+const THEME_ICON = { dark: "🌙", light: "☀️", system: "🖥️" };
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem("cc_theme", theme);
+  const btn = document.getElementById("themeBtn");
+  if (btn) {
+    btn.textContent = THEME_ICON[theme];
+    btn.title = `Theme: ${theme} (click to cycle dark / light / system)`;
+  }
+}
+
+function initTheme() {
+  const saved = localStorage.getItem("cc_theme") || "dark";
+  applyTheme(THEMES.includes(saved) ? saved : "dark");
+  const btn = document.getElementById("themeBtn");
+  if (btn) {
+    btn.addEventListener("click", () => {
+      const cur = localStorage.getItem("cc_theme") || "dark";
+      applyTheme(THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length]);
+    });
+  }
+}
+// set the attribute immediately (before DOM/render) to prevent a flash
+document.documentElement.setAttribute(
+  "data-theme", localStorage.getItem("cc_theme") || "dark");
+
 const state = {
   projects: [],
   activeProject: null,
@@ -873,6 +903,7 @@ document.querySelectorAll(".sortbtn").forEach((b) => {
   });
 });
 
+initTheme();
 initLayout();
 initSearch();
 loadProjects().catch((e) => {

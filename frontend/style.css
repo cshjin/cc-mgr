@@ -1,3 +1,7 @@
+/* ---- Theme palettes ----
+   Dark is the default (:root). Light is applied either explicitly via
+   [data-theme="light"] or, when [data-theme="system"], by the OS preference.
+   app.js sets data-theme on <html> to "dark" | "light" | "system". */
 :root {
   --bg: #0f1115;
   --bg-soft: #171a21;
@@ -14,6 +18,38 @@
   --radius: 10px;
   --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Light palette as a reusable declaration block */
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] {
+    --bg: #faf9f7;
+    --bg-soft: #f0eeea;
+    --bg-card: #ffffff;
+    --border: #dcd8d0;
+    --fg: #2a2a2e;
+    --fg-dim: #5c6370;
+    --fg-faint: #8a909c;
+    --accent: #c8603c;
+    --accent-soft: #c8603c1f;
+    --green: #3f9a5c;
+    --amber: #b8861f;
+    --blue: #3f7cb8;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #faf9f7;
+  --bg-soft: #f0eeea;
+  --bg-card: #ffffff;
+  --border: #dcd8d0;
+  --fg: #2a2a2e;
+  --fg-dim: #5c6370;
+  --fg-faint: #8a909c;
+  --accent: #c8603c;
+  --accent-soft: #c8603c1f;
+  --green: #3f9a5c;
+  --amber: #b8861f;
+  --blue: #3f7cb8;
 }
 
 * { box-sizing: border-box; }
@@ -241,9 +277,9 @@ body {
   display: flex; align-items: center; gap: 8px; padding: 8px 11px; cursor: pointer;
   font-size: 12px; user-select: none;
 }
-.turn.user .turn-head { background: #1e2733; }
+.turn.user .turn-head { background: var(--bg-soft); }
 .turn.assistant .turn-head { background: var(--bg-card); }
-.turn.tool .turn-head { background: #181c22; }
+.turn.tool .turn-head { background: var(--bg); }
 .turn-role { font-weight: 600; text-transform: capitalize; }
 .turn.user .turn-role { color: var(--blue); }
 .turn.assistant .turn-role { color: var(--accent); }
