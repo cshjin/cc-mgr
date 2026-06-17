@@ -143,10 +143,11 @@ def api_save_memory(project: str, session_id: str):
 
 
 @app.get("/api/search")
-def api_search(q: str, limit: int = 50):
+def api_search(q: str, limit: int = 50, project: str | None = None):
     if not q.strip():
         return {"query": q, "results": []}
-    return {"query": q, "results": index_db.search(q, limit=limit)}
+    return {"query": q, "project": project,
+            "results": index_db.search(q, limit=limit, project=project)}
 
 
 @app.post("/api/reindex")

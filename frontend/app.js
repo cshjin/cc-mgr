@@ -109,6 +109,11 @@ function renderProjects() {
 }
 
 async function selectProject(name) {
+  // clicking the already-active folder toggles it closed
+  if (name === state.activeProject) {
+    deselectProject();
+    return;
+  }
   state.activeProject = name;
   state.activeProjectMeta = state.projects.find((p) => p.name === name) || null;
   state.activeSession = null;
@@ -116,7 +121,23 @@ async function selectProject(name) {
   closeDetail();
   renderProjects();
   renderProjNav();
+  updateSearchPlaceholder();
   loadProjView();
+}
+
+function deselectProject() {
+  state.activeProject = null;
+  state.activeProjectMeta = null;
+  state.activeSession = null;
+  state.sessions = [];
+  closeDetail();
+  $("#projNav").hidden = true;
+  $("#sessionPane").innerHTML = '<div class="empty">Select a project to view its sessions.</div>';
+  renderProjects();
+  updateSearchPlaceholder();
+  // if scope was set to this folder, revert to all
+  const sc = $("#searchScope");
+  if (sc.value === "project") sc.value = "all";
 }
 
 function renderProjNav() {
@@ -680,7 +701,22 @@ function makeSplitter(splitter, target, storageKey, min, max, fromRight) {
 // Search
 // ---------------------------------------------------------------------------
 let searchTimer = null;
+function updateSearchPlaceholder() {
+  const scope = $("#searchScope").value;
+  const box = $("#searchBox");
+  if (scope === "project" && state.activeProject) {
+    box.placeholder = `Search in ${state.activeProject.slice(0, 28)}…`;
+  } else {
+    box.placeholder = "Search all conversations…";
+  }
+}
+
 function initSearch() {
+  $("#searchScope").addEventListener("change", () => {
+    updateSearchPlaceholder();
+    const q = $("#searchBox").value.trim();
+    if (q) runSearch(q);
+  });
   $("#searchBox").addEventListener("input", (e) => {
     clearTimeout(searchTimer);
     const q = e.target.value.trim();
@@ -704,19 +740,23 @@ function initSearch() {
 
 async function runSearch(q) {
   const el = $("#sessionPane");
-  $("#projNav").hidden = true;
   el.innerHTML = '<div class="loading">searching…</div>';
+  const scopeProject = $("#searchScope").value === "project" && state.activeProject
+    ? state.activeProject : null;
+  let url = `/api/search?q=${encodeURIComponent(q)}&limit=80`;
+  if (scopeProject) url += `&project=${encodeURIComponent(scopeProject)}`;
   try {
-    const data = await api(`/api/search?q=${encodeURIComponent(q)}&limit=80`);
-    renderSearchResults(el, data.results, q);
+    const data = await api(url);
+    renderSearchResults(el, data.results, q, scopeProject);
   } catch (e) {
     el.innerHTML = `<div class="empty">Search failed: ${esc(e.message)}</div>`;
   }
 }
 
-function renderSearchResults(el, results, q) {
+function renderSearchResults(el, results, q, scopeProject) {
+  const scopeLabel = scopeProject ? `in ${esc(scopeProject.slice(0, 30))}` : "across all folders";
   if (!results.length) {
-    el.innerHTML = `<h2 class="pane-title">No matches for “${esc(q)}” — try ↻ index if this is a new session.</h2>`;
+    el.innerHTML = `<h2 class="pane-title">No matches for “${esc(q)}” ${scopeLabel} — try ↻ index if this is a new session.</h2>`;
     return;
   }
   const html = results.map((r) => {
@@ -731,7 +771,7 @@ function renderSearchResults(el, results, q) {
         <div class="sr-snip">${snip}</div>
       </div>`;
   }).join("");
-  el.innerHTML = `<h2 class="pane-title">${results.length} matches for “${esc(q)}”</h2>${html}`;
+  el.innerHTML = `<h2 class="pane-title">${results.length} matches for “${esc(q)}” ${scopeLabel}</h2>${html}`;
   el.querySelectorAll(".searchres").forEach((node) => {
     node.addEventListener("click", async () => {
       const proj = node.dataset.project;

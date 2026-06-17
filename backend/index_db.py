@@ -143,30 +143,50 @@ def reindex(force: bool = False) -> dict[str, Any]:
     return {"indexed": indexed, "skipped": skipped, "turns": total_turns, "fts": fts}
 
 
-def search(query: str, limit: int = 50) -> list[dict[str, Any]]:
-    """Full-text search across all indexed turns. Falls back to LIKE if no FTS5."""
+def search(query: str, limit: int = 50, project: str | None = None) -> list[dict[str, Any]]:
+    """Full-text search across indexed turns, optionally scoped to one project.
+
+    Falls back to LIKE if FTS5 is unavailable.
+    """
     conn = _connect()
     fts = init_db(conn)
     rows: list[sqlite3.Row]
     if fts:
         try:
-            rows = conn.execute(
-                "SELECT session_id, project, seq, role, "
-                "snippet(turns_fts, 0, '[', ']', ' … ', 12) AS snippet "
-                "FROM turns_fts WHERE turns_fts MATCH ? ORDER BY rank LIMIT ?",
-                (query, limit),
-            ).fetchall()
+            if project:
+                rows = conn.execute(
+                    "SELECT session_id, project, seq, role, "
+                    "snippet(turns_fts, 0, '[', ']', ' … ', 12) AS snippet "
+                    "FROM turns_fts WHERE turns_fts MATCH ? AND project = ? "
+                    "ORDER BY rank LIMIT ?",
+                    (query, project, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT session_id, project, seq, role, "
+                    "snippet(turns_fts, 0, '[', ']', ' … ', 12) AS snippet "
+                    "FROM turns_fts WHERE turns_fts MATCH ? ORDER BY rank LIMIT ?",
+                    (query, limit),
+                ).fetchall()
         except sqlite3.OperationalError:
-            rows = _like_search(conn, query, limit)
+            rows = _like_search(conn, query, limit, project)
     else:
-        rows = _like_search(conn, query, limit)
+        rows = _like_search(conn, query, limit, project)
     out = [dict(r) for r in rows]
     conn.close()
     return out
 
 
-def _like_search(conn: sqlite3.Connection, query: str, limit: int) -> list[sqlite3.Row]:
+def _like_search(conn: sqlite3.Connection, query: str, limit: int,
+                 project: str | None = None) -> list[sqlite3.Row]:
     like = f"%{query}%"
+    if project:
+        return conn.execute(
+            "SELECT session_id, project, seq, role, timestamp, "
+            "substr(text, 1, 200) AS snippet FROM turns "
+            "WHERE text LIKE ? AND project = ? LIMIT ?",
+            (like, project, limit),
+        ).fetchall()
     return conn.execute(
         "SELECT session_id, project, seq, role, timestamp, "
         "substr(text, 1, 200) AS snippet FROM turns "

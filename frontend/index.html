@@ -11,7 +11,13 @@
     <button class="iconbtn" id="sidebarToggle" title="Collapse / expand sidebar">☰</button>
     <div class="brand">cc_mgr</div>
     <div class="sub">local Claude project viewer</div>
-    <input type="search" id="searchBox" class="searchbox" placeholder="Search all conversations…" />
+    <div class="searchwrap">
+      <select id="searchScope" class="scopesel" title="Search scope">
+        <option value="all">All folders</option>
+        <option value="project">This folder</option>
+      </select>
+      <input type="search" id="searchBox" class="searchbox" placeholder="Search all conversations…" />
+    </div>
     <button class="dbtn" id="reindexBtn" title="Rebuild the search index">↻ index</button>
     <label class="toggle">
       <input type="checkbox" id="showPrompts" checked />
