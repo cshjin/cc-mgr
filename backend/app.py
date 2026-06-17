@@ -31,11 +31,14 @@ def api_memory(project: str):
 
 
 @app.get("/api/projects/{project}/sessions/{session_id}")
-def api_conversation(project: str, session_id: str):
-    turns = store.get_conversation(project, session_id)
-    if not turns:
+def api_conversation(
+    project: str, session_id: str, offset: int = 0, limit: int = 40
+):
+    result = store.get_conversation(project, session_id, offset=offset, limit=limit)
+    if result["total"] == 0:
         raise HTTPException(status_code=404, detail="session not found or empty")
-    return {"session_id": session_id, "turns": turns}
+    result["session_id"] = session_id
+    return result
 
 
 @app.get("/api/sessions/{session_id}/tasks")

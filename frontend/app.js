@@ -7,7 +7,11 @@ const state = {
   activeSession: null,
   detailTab: "conversation",
   showPrompts: true,
+  convOffset: 0,
+  convTotal: 0,
 };
+
+const CONV_PAGE = 40;
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -174,8 +178,12 @@ async function loadTab() {
   body.innerHTML = '<div class="loading">loading…</div>';
   try {
     if (state.detailTab === "conversation") {
-      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}`);
-      renderConversation(body, data.turns);
+      state.convOffset = 0;
+      state.convTotal = 0;
+      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}?offset=0&limit=${CONV_PAGE}`);
+      state.convTotal = data.total;
+      state.convOffset = data.turns.length;
+      renderConversation(body, data.turns, true);
     } else if (state.detailTab === "tasks") {
       const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
       renderTasks(body, tasks);
@@ -200,30 +208,59 @@ function turnPreview(turn) {
   return "(empty)";
 }
 
-function renderConversation(body, turns) {
-  if (!turns.length) { body.innerHTML = '<div class="empty">No turns.</div>'; return; }
-  const html = turns.map((t, i) => {
-    const roleLabel = t.kind === "tool" ? "tool" : t.role;
-    const toks = t.output_tokens ? `<span class="turn-toks">${fmtTokens(t.output_tokens)}</span>` : "";
-    const skill = t.attribution_skill ? ` · ${esc(t.attribution_skill)}` : "";
-    const blocks = t.blocks.map(renderBlock).join("");
-    // user prompts expanded by default; everything else collapsed
-    const openByDefault = t.role === "user" && t.kind !== "tool";
-    return `
-      <div class="turn ${roleLabel} ${openByDefault ? "open" : ""}" data-idx="${i}">
-        <div class="turn-head">
-          <span class="turn-caret">▶</span>
-          <span class="turn-role">${esc(roleLabel)}${skill}</span>
-          <span class="turn-preview">${esc(turnPreview(t))}</span>
-          ${toks}
-        </div>
-        <div class="turn-body">${blocks}</div>
-      </div>`;
-  }).join("");
-  body.innerHTML = `<div class="turns">${html}</div>`;
-  body.querySelectorAll(".turn-head").forEach((h) => {
+function turnHtml(t) {
+  const roleLabel = t.kind === "tool" ? "tool" : t.role;
+  const toks = t.output_tokens ? `<span class="turn-toks">${fmtTokens(t.output_tokens)}</span>` : "";
+  const skill = t.attribution_skill ? ` · ${esc(t.attribution_skill)}` : "";
+  const blocks = t.blocks.map(renderBlock).join("");
+  const openByDefault = t.role === "user" && t.kind !== "tool";
+  return `
+    <div class="turn ${roleLabel} ${openByDefault ? "open" : ""}">
+      <div class="turn-head">
+        <span class="turn-caret">▶</span>
+        <span class="turn-role">${esc(roleLabel)}${skill}</span>
+        <span class="turn-preview">${esc(turnPreview(t))}</span>
+        ${toks}
+      </div>
+      <div class="turn-body">${blocks}</div>
+    </div>`;
+}
+
+function wireTurns(scope) {
+  scope.querySelectorAll(".turn-head").forEach((h) => {
+    if (h.dataset.wired) return;
+    h.dataset.wired = "1";
     h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
   });
+}
+
+function loadMoreBar() {
+  const remaining = state.convTotal - state.convOffset;
+  if (remaining <= 0) return "";
+  return `<button class="loadmore" id="loadMore">Load more — ${remaining} of ${state.convTotal} remaining</button>`;
+}
+
+function renderConversation(body, turns, fresh) {
+  if (fresh && !turns.length) { body.innerHTML = '<div class="empty">No turns.</div>'; return; }
+  const turnsHtml = turns.map(turnHtml).join("");
+  if (fresh) {
+    body.innerHTML = `<div class="turns" id="turnsWrap">${turnsHtml}</div><div id="loadMoreWrap">${loadMoreBar()}</div>`;
+  } else {
+    $("#turnsWrap").insertAdjacentHTML("beforeend", turnsHtml);
+    $("#loadMoreWrap").innerHTML = loadMoreBar();
+  }
+  wireTurns(body);
+  const btn = $("#loadMore");
+  if (btn) btn.addEventListener("click", loadMoreTurns);
+}
+
+async function loadMoreTurns() {
+  const btn = $("#loadMore");
+  if (btn) btn.textContent = "loading…";
+  const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}?offset=${state.convOffset}&limit=${CONV_PAGE}`);
+  state.convTotal = data.total;
+  state.convOffset += data.turns.length;
+  renderConversation($("#tabBody"), data.turns, false);
 }
 
 function renderBlock(b) {

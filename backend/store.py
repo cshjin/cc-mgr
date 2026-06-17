@@ -250,24 +250,29 @@ def get_memory(project: str) -> dict[str, Any]:
     return {"index": index, "files": files}
 
 
-def get_conversation(project: str, session_id: str) -> list[dict[str, Any]]:
-    """Return ordered conversation turns with structured content blocks.
+def get_conversation(
+    project: str,
+    session_id: str,
+    offset: int = 0,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Return a window of conversation turns with structured content blocks.
 
-    Tool-result-only user records are merged as metadata rather than turns,
-    keeping the viewer focused on prompts and responses.
+    Tool-result-only user records are classified as 'tool' turns rather than
+    prompts, keeping the viewer focused on prompts and responses. Returns
+    {total, offset, limit, turns} so the UI can lazily page huge sessions.
     """
     path = projects_dir() / project / f"{session_id}.jsonl"
     if not path.is_file():
-        return []
+        return {"total": 0, "offset": offset, "limit": limit, "turns": []}
+
     turns: list[dict[str, Any]] = []
     for rec in _iter_jsonl(path):
         rtype = rec.get("type")
         if rtype not in ("user", "assistant"):
             continue
         msg = rec.get("message", {})
-        content = msg.get("content")
-        blocks = _structured_blocks(content)
-        # Classify: a user record whose only blocks are tool_results is a tool turn
+        blocks = _structured_blocks(msg.get("content"))
         is_tool_only = (
             rtype == "user"
             and blocks
@@ -285,7 +290,11 @@ def get_conversation(project: str, session_id: str) -> list[dict[str, Any]]:
             "attribution_plugin": rec.get("attributionPlugin"),
             "output_tokens": usage.get("output_tokens", 0),
         })
-    return turns
+
+    total = len(turns)
+    end = total if limit is None else min(total, offset + limit)
+    window = turns[offset:end]
+    return {"total": total, "offset": offset, "limit": limit, "turns": window}
 
 
 def _structured_blocks(content: Any) -> list[dict[str, Any]]:
