@@ -34,12 +34,17 @@ Three layers, all under `backend/` + `frontend/`:
   plus the only mutating ops (`update_task_status`, `save_claude_md`,
   `save_memory_file`, `export_session_*`, `save_session_as_memory`,
   `delete_session`).
-- **`backend/index_db.py`** — SQLite + FTS5 full-text index over every turn. This is
-  a **rebuildable cache** at `data/cc_mgr.db`; it can always be regenerated from the
-  JSONL transcripts. `reindex()` is incremental (skips sessions whose mtime+size are
-  unchanged). The FTS table is standalone (not external-content) so per-session
-  deletes are a plain `DELETE` — do not switch it to `content=` without rethinking
-  the delete path (a past attempt corrupted the index).
+- **`backend/index_db.py`** — SQLite + FTS5 full-text index over every conversation
+  turn (`turns`/`turns_fts`) **and** every project's memory files + CLAUDE.md
+  (`docs`/`docs_fts`). A **rebuildable cache** at `data/cc_mgr.db`, regenerable from
+  source. `reindex()` is incremental for sessions (skips unchanged mtime+size) and
+  fully refreshes docs each run (they're tiny). Search results carry a `source`
+  field (`conversation` | `memory` | `claude_md`); conversation hits include `seq`
+  (absolute turn index, matching `get_conversation`'s order) so the UI can page to
+  and highlight the exact turn. FTS tables are standalone (not external-content) so
+  deletes are a plain `DELETE` — do not switch to `content=` (a past attempt
+  corrupted the index). Bump `SCHEMA_VERSION` on any schema change; `init_db` drops
+  and rebuilds on mismatch (`PRAGMA user_version`).
 - **`backend/app.py`** — thin FastAPI layer: routes call `store`/`index_db` and
   serve `frontend/` statically. Pydantic models guard request bodies.
 - **`frontend/{index.html,style.css,app.js}`** — no-build, no-CDN vanilla JS. `app.js`
@@ -66,10 +71,13 @@ Three layers, all under `backend/` + `frontend/`:
 
 ## Conventions and gotchas specific to this codebase
 
-- **Context window tiers**: model IDs (`claude-opus-4-7`, etc.) do **not** encode the
-  1M-context (`[1m]`) variant — that's harness display only. The tier is inferred
-  from observed token usage via `store.context_limit_for` (200k / 1M). Don't key
-  context limits off the model string.
+- **Context window is NOT recorded per session**: transcripts store only the
+  resolved API model id (`claude-opus-4-8`), never the `[1m]` alias or a window
+  size. The `[1m]` alias lives only in `settings.json` (the *current* default, not
+  what a past session used). So the window is only *provable* when usage exceeded
+  200k (then it must be the 1M tier). `store.context_limit_for` returns
+  `{limit, known}`; `known` is False below 200k and the UI must show "window
+  unknown" rather than claiming a tier. Never key the window off the model string.
 - **Git info** is read directly from `<cwd>/.git/HEAD` (`store.read_git_info`), no
   `git` binary invoked; it also handles the worktree case where `.git` is a file.
 - **Deletion is soft by default**: `delete_session` moves artifacts to

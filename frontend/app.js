@@ -313,10 +313,11 @@ function renderClaudeMd(el, cm) {
 // ---------------------------------------------------------------------------
 // Detail pane (per-session: conversation / tasks / memory)
 // ---------------------------------------------------------------------------
-async function openSession(id) {
+async function openSession(id, targetSeq) {
   state.activeSession = id;
   state.detailTab = "conversation";
-  renderSessions();
+  state.targetSeq = (typeof targetSeq === "number") ? targetSeq : null;
+  if (state.projView === "sessions") renderSessions();
   $("#layout").classList.add("detail-open");
   $("#splitter2").hidden = false;
   const pane = $("#detailPane");
@@ -437,10 +438,17 @@ async function loadTab() {
     if (state.detailTab === "conversation") {
       state.convOffset = 0;
       state.convTotal = 0;
-      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}?offset=0&limit=${CONV_PAGE}`);
+      // If navigating to a specific turn, load enough to include it in one go.
+      const need = (typeof state.targetSeq === "number")
+        ? Math.max(CONV_PAGE, state.targetSeq + 5) : CONV_PAGE;
+      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}?offset=0&limit=${need}`);
       state.convTotal = data.total;
       state.convOffset = data.turns.length;
       renderConversation(body, data.turns, true);
+      if (typeof state.targetSeq === "number") {
+        scrollToTurn(state.targetSeq);
+        state.targetSeq = null;
+      }
     } else if (state.detailTab === "tasks") {
       const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
       renderTasks(body, tasks);
@@ -463,14 +471,14 @@ function turnPreview(turn) {
   return "(empty)";
 }
 
-function turnHtml(t) {
+function turnHtml(t, seq) {
   const roleLabel = t.kind === "tool" ? "tool" : t.role;
   const toks = t.output_tokens ? `<span class="turn-toks">${fmtTokens(t.output_tokens)}</span>` : "";
   const skill = t.attribution_skill ? ` · ${esc(t.attribution_skill)}` : "";
   const blocks = t.blocks.map(renderBlock).join("");
   const openByDefault = t.role === "user" && t.kind !== "tool";
   return `
-    <div class="turn ${roleLabel} ${openByDefault ? "open" : ""}">
+    <div class="turn ${roleLabel} ${openByDefault ? "open" : ""}" data-seq="${seq}">
       <div class="turn-head">
         <span class="turn-caret">▶</span>
         <span class="turn-role">${esc(roleLabel)}${skill}</span>
@@ -479,6 +487,14 @@ function turnHtml(t) {
       </div>
       <div class="turn-body">${blocks}</div>
     </div>`;
+}
+
+function scrollToTurn(seq) {
+  const node = document.querySelector(`.turn[data-seq="${seq}"]`);
+  if (!node) return;
+  node.classList.add("open", "turn-highlight");
+  node.scrollIntoView({ behavior: "smooth", block: "center" });
+  setTimeout(() => node.classList.remove("turn-highlight"), 2600);
 }
 
 function wireTurns(scope) {
@@ -497,7 +513,9 @@ function loadMoreBar() {
 
 function renderConversation(body, turns, fresh) {
   if (fresh && !turns.length) { body.innerHTML = '<div class="empty">No turns.</div>'; return; }
-  const turnsHtml = turns.map(turnHtml).join("");
+  // seq is the absolute index; on append, it starts after already-rendered turns.
+  const base = fresh ? 0 : (state.convOffset - turns.length);
+  const turnsHtml = turns.map((t, i) => turnHtml(t, base + i)).join("");
   if (fresh) {
     body.innerHTML = `<div class="turns" id="turnsWrap">${turnsHtml}</div><div id="loadMoreWrap">${loadMoreBar()}</div>`;
   } else {
@@ -753,7 +771,7 @@ function initSearch() {
     try {
       const r = await fetch("/api/reindex", { method: "POST" });
       const res = await r.json();
-      flash(`Index updated: ${res.indexed} indexed, ${res.skipped} unchanged, ${res.turns} turns.`);
+      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs (memory + CLAUDE.md).`);
     } catch (e) {
       flash("Reindex failed: " + e.message);
     } finally {
@@ -783,26 +801,60 @@ function renderSearchResults(el, results, q, scopeProject) {
     el.innerHTML = `<h2 class="pane-title">No matches for “${esc(q)}” ${scopeLabel} — try ↻ index if this is a new session.</h2>`;
     return;
   }
-  const html = results.map((r) => {
+  const html = results.map((r, i) => {
     const snip = esc(r.snippet).replace(/\[/g, '<mark>').replace(/\]/g, '</mark>');
+    if (r.source === "conversation") {
+      return `
+        <div class="searchres" data-i="${i}">
+          <div class="sr-head">
+            <span class="sr-role ${esc(r.role)}">${esc(r.role)}</span>
+            <span class="sr-proj">${esc(r.project)}</span>
+            <span class="sr-sid">${esc(r.session_id.slice(0,8))} · #${r.seq}</span>
+          </div>
+          <div class="sr-snip">${snip}</div>
+        </div>`;
+    }
+    // memory / claude_md doc hit
+    const tag = r.source === "claude_md" ? "CLAUDE.md" : "memory";
     return `
-      <div class="searchres" data-project="${esc(r.project)}" data-id="${esc(r.session_id)}">
+      <div class="searchres doc" data-i="${i}">
         <div class="sr-head">
-          <span class="sr-role ${esc(r.role)}">${esc(r.role)}</span>
+          <span class="sr-role doc">${esc(tag)}</span>
           <span class="sr-proj">${esc(r.project)}</span>
-          <span class="sr-sid">${esc(r.session_id.slice(0,8))}</span>
+          <span class="sr-sid">${esc(r.ref || "")}</span>
         </div>
         <div class="sr-snip">${snip}</div>
       </div>`;
   }).join("");
   el.innerHTML = `<h2 class="pane-title">${results.length} matches for “${esc(q)}” ${scopeLabel}</h2>${html}`;
   el.querySelectorAll(".searchres").forEach((node) => {
-    node.addEventListener("click", async () => {
-      const proj = node.dataset.project;
-      if (proj !== state.activeProject) await selectProject(proj);
-      openSession(node.dataset.id);
-    });
+    node.addEventListener("click", () => openSearchResult(results[+node.dataset.i]));
   });
+}
+
+async function openSearchResult(r) {
+  if (!r) return;
+  if (r.project !== state.activeProject) await selectProject(r.project);
+  if (r.source === "conversation") {
+    openSession(r.session_id, typeof r.seq === "number" ? r.seq : null);
+  } else if (r.source === "claude_md") {
+    state.projView = "claude";
+    renderProjNav();
+    loadProjView();
+  } else {
+    // memory: open the project Memory view (editable) and scroll to the file
+    state.projView = "memory";
+    renderProjNav();
+    await loadProjView();
+    if (r.ref) {
+      const blk = document.querySelector(`.mem-file[data-name="${CSS.escape(r.ref)}"]`);
+      if (blk) {
+        blk.classList.add("turn-highlight");
+        blk.scrollIntoView({ behavior: "smooth", block: "center" });
+        setTimeout(() => blk.classList.remove("turn-highlight"), 2600);
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

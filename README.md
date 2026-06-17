@@ -30,8 +30,11 @@ Reads (read-only) from `~/.claude/projects/`, `~/.claude/tasks/`, and per-projec
   export-first prompt. Delete is a soft-delete (moved to `.cc_mgr_trash/`,
   reversible) unless you opt into permanent removal.
 - **Full-text search (local knowledge base)** — a SQLite + FTS5 index over every
-  turn in every session. Search across all conversations from the top bar; click
-  a result to jump to its session. Click "↻ index" to (re)build incrementally.
+  turn in every session **plus** every project's memory files and CLAUDE.md.
+  Search all folders or scope to the current one. Each result is tagged by source
+  (conversation / memory / CLAUDE.md); clicking a conversation hit opens the
+  session and scrolls to/highlights the exact turn, while a memory/CLAUDE.md hit
+  opens that editor. Click "↻ index" to (re)build incrementally.
 
 ## Quick start
 
