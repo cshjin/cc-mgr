@@ -15,6 +15,9 @@ data/
 # Exports produced by the tool
 exports/
 
+# Claude Code harness-local config
+.claude/
+
 # OS / editor
 .DS_Store
 Thumbs.db
