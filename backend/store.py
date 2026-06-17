@@ -232,6 +232,20 @@ def get_tasks(session_id: str) -> list[dict[str, Any]]:
     return tasks
 
 
+def update_task_status(session_id: str, task_id: str, status: str) -> dict[str, Any]:
+    """Patch a single task's status in its JSON file. Returns the updated task."""
+    valid = {"pending", "in_progress", "completed", "deleted"}
+    if status not in valid:
+        raise ValueError(f"invalid status: {status}")
+    jf = tasks_dir() / session_id / f"{task_id}.json"
+    if not jf.is_file():
+        raise FileNotFoundError(f"task {task_id} not found for session {session_id}")
+    data = json.loads(jf.read_text(encoding="utf-8"))
+    data["status"] = status
+    jf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return data
+
+
 def get_memory(project: str) -> dict[str, Any]:
     mem_dir = projects_dir() / project / "memory"
     if not mem_dir.is_dir():

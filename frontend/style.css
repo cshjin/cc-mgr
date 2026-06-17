@@ -190,10 +190,16 @@ body {
 
 .kanban { display: flex; gap: 12px; padding: 14px; overflow-x: auto; }
 .kcol { min-width: 200px; flex: 1; }
-.kcol h4 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--fg-dim); margin: 0 0 8px; }
-.kcard { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; margin-bottom: 8px; font-size: 12px; }
+.kcol h4 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--fg-dim); margin: 0 0 8px; display: flex; align-items: center; gap: 6px; }
+.kcount { background: var(--bg-soft); border-radius: 10px; padding: 0 7px; font-size: 10px; color: var(--fg-dim); }
+.kdrop { min-height: 60px; border-radius: 8px; padding: 2px; transition: background 0.12s; }
+.kdrop.over { background: var(--accent-soft); outline: 1px dashed var(--accent); }
+.kcard { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; margin-bottom: 8px; font-size: 12px; cursor: grab; }
+.kcard:active { cursor: grabbing; }
+.kcard.dragging { opacity: 0.4; }
 .kcard .ksub { font-weight: 600; }
 .kcard .kowner { color: var(--fg-faint); font-size: 10.5px; margin-top: 4px; }
+.khint { padding: 0 14px 14px; color: var(--fg-faint); font-size: 11px; }
 
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }

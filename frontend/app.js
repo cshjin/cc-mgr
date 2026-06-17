@@ -354,27 +354,73 @@ function renderBlock(b) {
   return "";
 }
 
+const KCOLS = [
+  { key: "pending", title: "Pending" },
+  { key: "in_progress", title: "In Progress" },
+  { key: "completed", title: "Completed" },
+];
+
 function renderTasks(body, tasks) {
   if (!tasks.length) { body.innerHTML = '<div class="empty">No tasks for this session.</div>'; return; }
-  const cols = {
-    pending: { title: "Pending", items: [] },
-    in_progress: { title: "In Progress", items: [] },
-    completed: { title: "Completed", items: [] },
-  };
+  const byCol = { pending: [], in_progress: [], completed: [] };
   for (const t of tasks) {
-    const key = cols[t.status] ? t.status : "pending";
-    cols[key].items.push(t);
+    (byCol[t.status] || byCol.pending).push(t);
   }
-  const colHtml = Object.values(cols).map((c) => `
-    <div class="kcol">
-      <h4>${c.title} (${c.items.length})</h4>
-      ${c.items.map((t) => `
-        <div class="kcard">
-          <div class="ksub">${esc(t.subject || "(untitled)")}</div>
-          ${t.owner ? `<div class="kowner">@${esc(t.owner)}</div>` : ""}
-        </div>`).join("")}
+  const colHtml = KCOLS.map((c) => `
+    <div class="kcol" data-status="${c.key}">
+      <h4>${c.title} <span class="kcount">${byCol[c.key].length}</span></h4>
+      <div class="kdrop" data-status="${c.key}">
+        ${byCol[c.key].map((t) => `
+          <div class="kcard" draggable="true" data-id="${esc(t.id)}">
+            <div class="ksub">${esc(t.subject || "(untitled)")}</div>
+            ${t.owner ? `<div class="kowner">@${esc(t.owner)}</div>` : ""}
+          </div>`).join("")}
+      </div>
     </div>`).join("");
-  body.innerHTML = `<div class="kanban">${colHtml}</div>`;
+  body.innerHTML = `<div class="kanban">${colHtml}</div><div class="khint">Drag cards between columns to update status — writes back to the task file.</div>`;
+  wireKanban(body);
+}
+
+function wireKanban(scope) {
+  let dragId = null;
+  scope.querySelectorAll(".kcard").forEach((card) => {
+    card.addEventListener("dragstart", (e) => {
+      dragId = card.dataset.id;
+      card.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+    });
+    card.addEventListener("dragend", () => card.classList.remove("dragging"));
+  });
+  scope.querySelectorAll(".kdrop").forEach((drop) => {
+    drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+    drop.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      drop.classList.remove("over");
+      const newStatus = drop.dataset.status;
+      if (!dragId) return;
+      const card = scope.querySelector(`.kcard[data-id="${CSS.escape(dragId)}"]`);
+      if (card && card.parentElement !== drop) {
+        drop.appendChild(card); // optimistic move
+        try {
+          const r = await fetch(`/api/sessions/${state.activeSession}/tasks/${encodeURIComponent(dragId)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: newStatus }),
+          });
+          if (!r.ok) throw new Error(`${r.status}`);
+          // refresh counts
+          const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
+          renderTasks($("#tabBody"), tasks);
+        } catch (err) {
+          flash("Failed to update task: " + err.message);
+          const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
+          renderTasks($("#tabBody"), tasks);
+        }
+      }
+      dragId = null;
+    });
+  });
 }
 
 function renderMemory(body, mem) {

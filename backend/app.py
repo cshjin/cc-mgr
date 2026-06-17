@@ -47,6 +47,20 @@ def api_tasks(session_id: str):
     return store.get_tasks(session_id)
 
 
+class TaskStatusRequest(BaseModel):
+    status: str
+
+
+@app.patch("/api/sessions/{session_id}/tasks/{task_id}")
+def api_update_task(session_id: str, task_id: str, req: TaskStatusRequest):
+    try:
+        return store.update_task_status(session_id, task_id, req.status)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="task not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get("/api/projects/{project}/sessions/{session_id}/export", response_class=PlainTextResponse)
 def api_export_inline(project: str, session_id: str):
     """Return the session as Markdown text (for in-browser preview/download)."""

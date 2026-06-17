@@ -12,8 +12,9 @@ env/
 *.sqlite3
 data/
 
-# Exports produced by the tool
+# Exports + trash produced by the tool
 exports/
+.cc_mgr_trash/
 
 # Claude Code harness-local config
 .claude/
