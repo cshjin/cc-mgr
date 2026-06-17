@@ -5,16 +5,24 @@ A lightweight, portable web UI for viewing your local Claude Code projects.
 Reads (read-only) from `~/.claude/projects/`, `~/.claude/tasks/`, and per-project
 `memory/` — no Claude account or network access required.
 
-## Features (v0.1 — read-only viewer)
+## Features
 
 - **Projects list** sorted by recency.
 - **Sessions by time** with last-prompt preview (toggleable) and a context-size bar.
 - **Per-session badges**: turn counts, model, memory presence, open/total tasks.
 - **Collapsible conversation viewer** — prompts expanded, responses/tool calls
   collapse-by-default; click any turn to expand. Thinking, tool_use, and
-  tool_result blocks are shown distinctly.
-- **Tasks tab** — kanban-style columns (pending / in progress / completed).
+  tool_result blocks are shown distinctly. Large sessions load lazily (40 turns
+  per page with a "Load more" button).
+- **Draggable kanban tasks tab** — drag cards between pending / in progress /
+  completed; the new status is written back to the task JSON.
 - **Memory tab** — renders `MEMORY.md` and all memory files for the project.
+- **Session export + delete** — export any session to Markdown; delete with an
+  export-first prompt. Delete is a soft-delete (moved to `.cc_mgr_trash/`,
+  reversible) unless you opt into permanent removal.
+- **Full-text search (local knowledge base)** — a SQLite + FTS5 index over every
+  turn in every session. Search across all conversations from the top bar; click
+  a result to jump to its session. Click "↻ index" to (re)build incrementally.
 
 ## Quick start
 
@@ -31,15 +39,19 @@ CLAUDE_HOME=/path/to/.claude python run.py --host 0.0.0.0 --port 8765
 
 ## Stack
 
-- Backend: FastAPI + Uvicorn (stdlib JSON parsing; no DB yet).
+- Backend: FastAPI + Uvicorn; stdlib `json` for transcripts, stdlib `sqlite3`
+  (FTS5) for the search index. The DB lives in `data/cc_mgr.db` and is a
+  rebuildable cache — delete it anytime and click "↻ index".
 - Frontend: vanilla HTML/CSS/JS, **no build step**, no CDN — fully self-contained.
 
 ## Roadmap
 
-- [ ] Session delete with export-or-memory prompt before removal.
-- [ ] Lazy/paginated conversation loading for very large sessions.
-- [ ] Draggable kanban that writes back to task JSON.
-- [ ] SQLite index + full-text search → local knowledge base from conversations.
+- [x] Lazy/paginated conversation loading for very large sessions.
+- [x] Session delete with export-first prompt before removal.
+- [x] Draggable kanban that writes back to task JSON.
+- [x] SQLite index + full-text search → local knowledge base from conversations.
+- [ ] "Save session as memory" option in the delete dialog.
+- [ ] Auto-reindex on a timer / file-watch instead of manual button.
 - [ ] Packaging (`pip install cc-mgr` / single-file launch).
 
 ## Data model notes

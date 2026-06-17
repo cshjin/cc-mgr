@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import store
+from . import index_db, store
 
 app = FastAPI(title="cc_mgr", version="0.1.0")
 
@@ -86,6 +86,23 @@ def api_delete(project: str, session_id: str, req: DeleteRequest):
     result = store.delete_session(project, session_id, hard=req.hard)
     result["export"] = export_path
     return result
+
+
+@app.get("/api/search")
+def api_search(q: str, limit: int = 50):
+    if not q.strip():
+        return {"query": q, "results": []}
+    return {"query": q, "results": index_db.search(q, limit=limit)}
+
+
+@app.post("/api/reindex")
+def api_reindex(force: bool = False):
+    return index_db.reindex(force=force)
+
+
+@app.get("/api/index/stats")
+def api_index_stats():
+    return index_db.stats()
 
 
 @app.get("/")

@@ -442,6 +442,68 @@ $("#showPrompts").addEventListener("change", (e) => {
   document.querySelectorAll(".session-prompt").forEach((p) => p.classList.toggle("hidden", !state.showPrompts));
 });
 
+let searchTimer = null;
+$("#searchBox").addEventListener("input", (e) => {
+  clearTimeout(searchTimer);
+  const q = e.target.value.trim();
+  if (!q) { renderSessions(); return; }
+  searchTimer = setTimeout(() => runSearch(q), 300);
+});
+
+$("#reindexBtn").addEventListener("click", async () => {
+  const btn = $("#reindexBtn");
+  btn.textContent = "indexing…";
+  try {
+    const r = await fetch("/api/reindex", { method: "POST" });
+    const res = await r.json();
+    flash(`Index updated: ${res.indexed} indexed, ${res.skipped} unchanged, ${res.turns} turns.`);
+  } catch (e) {
+    flash("Reindex failed: " + e.message);
+  } finally {
+    btn.textContent = "↻ index";
+  }
+});
+
+async function runSearch(q) {
+  const el = $("#sessionPane");
+  el.innerHTML = '<div class="loading">searching…</div>';
+  try {
+    const data = await api(`/api/search?q=${encodeURIComponent(q)}&limit=80`);
+    renderSearchResults(el, data.results, q);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Search failed: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderSearchResults(el, results, q) {
+  if (!results.length) {
+    el.innerHTML = `<h2 class="pane-title">No matches for “${esc(q)}” — try ↻ index if this is a new session.</h2>`;
+    return;
+  }
+  const html = results.map((r) => {
+    const snip = esc(r.snippet).replace(/\[/g, '<mark>').replace(/\]/g, '</mark>');
+    return `
+      <div class="searchres" data-project="${esc(r.project)}" data-id="${esc(r.session_id)}">
+        <div class="sr-head">
+          <span class="sr-role ${esc(r.role)}">${esc(r.role)}</span>
+          <span class="sr-proj">${esc(r.project)}</span>
+          <span class="sr-sid">${esc(r.session_id.slice(0,8))}</span>
+        </div>
+        <div class="sr-snip">${snip}</div>
+      </div>`;
+  }).join("");
+  el.innerHTML = `<h2 class="pane-title">${results.length} matches for “${esc(q)}”</h2>${html}`;
+  el.querySelectorAll(".searchres").forEach((node) => {
+    node.addEventListener("click", async () => {
+      const proj = node.dataset.project;
+      if (proj !== state.activeProject) {
+        await selectProject(proj);
+      }
+      openSession(node.dataset.id);
+    });
+  });
+}
+
 loadProjects().catch((e) => {
   $("#projectList").innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
 });
