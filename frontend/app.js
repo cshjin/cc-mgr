@@ -191,6 +191,30 @@ function ctxPct(s) {
   return Math.min(100, (s.context_tokens / limit) * 100);
 }
 
+// The transcript records only the API model id (e.g. claude-opus-4-8), never the
+// [1m] alias or the window size. So the window is only *known* when usage crossed
+// 200k (then it must be the 1M tier). Otherwise we show tokens without claiming a
+// window, to avoid presenting a guess as fact.
+function ctxLabel(s) {
+  const tokens = s.context_tokens || 0;
+  if (s.context_limit_known) {
+    const win = s.context_limit >= 1000000 ? "1M" : (s.context_limit / 1000) + "k";
+    const pct = Math.min(100, (tokens / s.context_limit) * 100);
+    return {
+      known: true,
+      windowLabel: `${win} window`,
+      pctLabel: ` (${pct.toFixed(0)}%)`,
+      title: `Peak observed context ${fmtTokens(tokens)} tokens. Window ${win} (proven: usage exceeded the 200k standard window).`,
+    };
+  }
+  return {
+    known: false,
+    windowLabel: "window unknown",
+    pctLabel: "",
+    title: `Peak observed context ${fmtTokens(tokens)} tokens. The transcript does not record the model's context window; usage stayed under 200k so the window can't be determined (could be 200k or 1M).`,
+  };
+}
+
 function renderSessions() {
   const el = $("#sessionPane");
   if (!state.sessions.length) {
@@ -199,7 +223,7 @@ function renderSessions() {
   }
   const rows = state.sessions.map((s) => {
     const pct = ctxPct(s);
-    const limLabel = (s.context_limit || 200000) >= 1000000 ? "1M" : "200k";
+    const ctx = ctxLabel(s);
     const taskBadge = s.total_tasks
       ? (s.open_tasks
           ? `<span class="badge task-open">⏳ ${s.open_tasks}/${s.total_tasks} tasks</span>`
@@ -215,8 +239,8 @@ function renderSessions() {
         </div>
         <div class="session-prompt ${state.showPrompts ? "" : "hidden"}">${esc(s.last_prompt || s.first_prompt || "(no prompt)")}</div>
         <div class="ctxbar">
-          <div class="label"><span>context · ${limLabel} window</span><span>${fmtTokens(s.context_tokens)} (${pct.toFixed(0)}%)</span></div>
-          <div class="track"><div class="fill" style="width:${pct}%"></div></div>
+          <div class="label" title="${esc(ctx.title)}"><span>context · ${ctx.windowLabel}</span><span>${fmtTokens(s.context_tokens)}${ctx.pctLabel}</span></div>
+          <div class="track ${ctx.known ? "" : "unknown"}"><div class="fill" style="width:${pct}%"></div></div>
         </div>
         <div class="badges">
           <span class="badge">${s.user_turns}↗ ${s.assistant_turns}↙</span>

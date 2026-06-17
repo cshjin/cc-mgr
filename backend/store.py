@@ -50,17 +50,26 @@ def unmangle_path(folder_name: str) -> str:
     return name.replace("-", "/") if False else folder_name
 
 
-# Context-window tiers (tokens). Model IDs don't encode the 1M-context variant,
-# so we infer the tier from observed usage and bump up as needed.
+# Context-window tiers (tokens). Transcripts record only the resolved API model
+# id (e.g. "claude-opus-4-8") — never the 1M-context "[1m]" alias and never an
+# explicit window size. So the true window is genuinely NOT stored per session.
+# The only thing we can assert from a transcript is a *lower bound*: if observed
+# usage crossed 200k, the window must be the 1M tier. Below 200k it's ambiguous
+# (could be a 200k model, or a 1M model that simply didn't fill up).
 CTX_TIERS = (200_000, 1_000_000)
+STD_WINDOW = 200_000
 
 
-def context_limit_for(observed_tokens: int) -> int:
-    """Smallest tier that comfortably contains the observed context."""
-    for tier in CTX_TIERS:
-        if observed_tokens <= tier * 0.98:
-            return tier
-    return CTX_TIERS[-1]
+def context_limit_for(observed_tokens: int) -> dict[str, Any]:
+    """Best-effort window for a session given its peak observed usage.
+
+    Returns {limit, known}. `known` is True only when usage proves the tier
+    (i.e. it exceeded the standard 200k window, so it must be the 1M variant).
+    When False, `limit` is an assumed default (200k) for display, NOT a fact.
+    """
+    if observed_tokens > STD_WINDOW * 0.98:
+        return {"limit": 1_000_000, "known": True}
+    return {"limit": STD_WINDOW, "known": False}
 
 
 def read_git_info(cwd: str | None) -> dict[str, Any] | None:
@@ -178,8 +187,9 @@ class SessionSummary:
     message_count: int = 0
     user_turns: int = 0
     assistant_turns: int = 0
-    context_tokens: int = 0  # best estimate of live context window size
-    context_limit: int = 200_000  # inferred context-window tier
+    context_tokens: int = 0  # peak observed context (input+cache+output) of last turn
+    context_limit: int = 200_000  # window size; assumed default unless context_limit_known
+    context_limit_known: bool = False  # True only when usage proves the tier
     total_output_tokens: int = 0
     model: str = ""
     git_branch: str = ""
@@ -293,7 +303,9 @@ def _scan_session(path: Path, project: str) -> SessionSummary:
             if ctx:
                 last_assistant_context = ctx
     summ.context_tokens = last_assistant_context
-    summ.context_limit = context_limit_for(last_assistant_context)
+    win = context_limit_for(last_assistant_context)
+    summ.context_limit = win["limit"]
+    summ.context_limit_known = win["known"]
     return summ
 
 

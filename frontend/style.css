@@ -190,6 +190,9 @@ body {
 .ctxbar .label { font-size: 10.5px; color: var(--fg-faint); margin-bottom: 3px; display: flex; justify-content: space-between; }
 .ctxbar .track { height: 6px; background: var(--bg-soft); border-radius: 4px; overflow: hidden; }
 .ctxbar .fill { height: 100%; background: linear-gradient(90deg, var(--green), var(--amber), var(--accent)); }
+/* window size unknown: muted fill + dashed outline signal "not a known scale" */
+.ctxbar .track.unknown { border: 1px dashed var(--border); }
+.ctxbar .track.unknown .fill { background: var(--fg-faint); opacity: 0.5; }
 
 /* detail / conversation */
 .detail-head { padding: 14px 16px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg-soft); z-index: 5; }
