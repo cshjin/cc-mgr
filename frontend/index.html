@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cc_mgr — Claude project viewer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">cc_mgr</div>
+    <div class="sub">local Claude project viewer</div>
+    <label class="toggle">
+      <input type="checkbox" id="showPrompts" checked />
+      <span>show last prompt</span>
+    </label>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" id="projectList">
+      <div class="loading">loading projects…</div>
+    </aside>
+
+    <main class="content">
+      <section id="sessionPane" class="pane">
+        <div class="empty">Select a project to view its sessions.</div>
+      </section>
+    </main>
+
+    <aside class="detail" id="detailPane" hidden></aside>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
