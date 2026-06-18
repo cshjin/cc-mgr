@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""cc_mgr — single-file launcher for the local Claude project viewer.
+
+Usage:
+    python cc-mgr.py run [--host H] [--port P] [--reload] [--background]
+    python cc-mgr.py stop [--port P]
+    python cc-mgr.py status [--port P]
+
+`run` serves the app (foreground; Ctrl+C to stop). Add --background to detach
+the server and return to the shell. `stop` terminates a server previously
+started by this script. Cross-platform (Windows + Linux).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PID_FILE = HERE / "data" / "cc_mgr.pid"
+LOG_FILE = HERE / "data" / "cc_mgr.log"
+IS_WINDOWS = os.name == "nt"
+
+
+# ---------------------------------------------------------------------------
+# PID-file helpers
+# ---------------------------------------------------------------------------
+
+def _write_pidfile(pid: int, host: str, port: int) -> None:
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(
+        json.dumps({"pid": pid, "host": host, "port": port}), encoding="utf-8"
+    )
+
+
+def _read_pidfile() -> dict | None:
+    if not PID_FILE.is_file():
+        return None
+    try:
+        return json.loads(PID_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _clear_pidfile() -> None:
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists. Must NOT kill it as a side effect.
+
+    Note: on Windows, os.kill(pid, 0) would call TerminateProcess(exit 0) and
+    actually kill the process — so we use tasklist there instead.
+    """
+    if IS_WINDOWS:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True,
+        )
+        return str(pid) in out.stdout
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate(pid: int) -> None:
+    """Terminate a process (and its children, e.g. uvicorn --reload workers)."""
+    if IS_WINDOWS:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+        )
+        return
+    # POSIX: the server is started in its own session, so kill the whole group.
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def _serve(host: str, port: int, reload: bool) -> None:
+    """Run uvicorn in the foreground (blocking). Manages the pidfile."""
+    # Ensure imports + data paths resolve regardless of the caller's cwd.
+    os.chdir(HERE)
+    sys.path.insert(0, str(HERE))
+    import uvicorn  # lazy: `stop`/`status` don't need it
+
+    _write_pidfile(os.getpid(), host, port)
+    print(f"cc_mgr serving on http://{host}:{port}  (pid {os.getpid()})")
+    print("Press Ctrl+C to stop." if sys.stdout.isatty() else "")
+    try:
+        uvicorn.run("backend.app:app", host=host, port=port, reload=reload)
+    finally:
+        _clear_pidfile()
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    existing = _read_pidfile()
+    if existing and _pid_alive(existing["pid"]):
+        print(f"cc_mgr already running (pid {existing['pid']} on "
+              f"http://{existing['host']}:{existing['port']}). Use `stop` first.")
+        return 1
+    if existing:
+        _clear_pidfile()  # stale
+
+    if not args.background:
+        _serve(args.host, args.port, args.reload)
+        return 0
+
+    # --- background: spawn a detached copy running in the foreground ---
+    cmd = [sys.executable, str(Path(__file__).resolve()), "run",
+           "--host", args.host, "--port", str(args.port)]
+    if args.reload:
+        cmd.append("--reload")
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    logf = open(LOG_FILE, "ab")
+    if IS_WINDOWS:
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf,
+                                stdin=subprocess.DEVNULL, creationflags=flags,
+                                close_fds=True, cwd=str(HERE))
+    else:
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf,
+                                stdin=subprocess.DEVNULL, start_new_session=True,
+                                close_fds=True, cwd=str(HERE))
+    # The child writes its own pidfile at startup; give it a moment, then verify.
+    time.sleep(1.5)
+    info = _read_pidfile()
+    if info and _pid_alive(info["pid"]):
+        print(f"cc_mgr started in background (pid {info['pid']}) on "
+              f"http://{args.host}:{args.port}")
+        print(f"Logs: {LOG_FILE}")
+        print("Stop it with:  python cc-mgr.py stop")
+        return 0
+    print(f"Failed to start in background. Check {LOG_FILE}.")
+    return 1
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    info = _read_pidfile()
+    if not info:
+        print("No cc_mgr pidfile found — nothing to stop "
+              "(was it started by this script?).")
+        return 1
+    pid = info["pid"]
+    if not _pid_alive(pid):
+        print(f"cc_mgr not running (stale pidfile for pid {pid}); cleaning up.")
+        _clear_pidfile()
+        return 0
+    print(f"Stopping cc_mgr (pid {pid})…")
+    _terminate(pid)
+    # wait briefly for it to die
+    for _ in range(20):
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.1)
+    if _pid_alive(pid):
+        print(f"Process {pid} did not exit; you may need to kill it manually.")
+        return 1
+    _clear_pidfile()
+    print("Stopped.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    info = _read_pidfile()
+    if info and _pid_alive(info["pid"]):
+        print(f"cc_mgr running (pid {info['pid']}) on "
+              f"http://{info['host']}:{info['port']}")
+        return 0
+    if info:
+        print("cc_mgr not running (stale pidfile present).")
+    else:
+        print("cc_mgr not running.")
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="cc-mgr.py", description="cc_mgr — local Claude project viewer")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p_run = sub.add_parser("run", help="start the server")
+    p_run.add_argument("--host", default="127.0.0.1")
+    p_run.add_argument("--port", type=int, default=8765)
+    p_run.add_argument("--reload", action="store_true", help="dev autoreload")
+    p_run.add_argument("--background", "-b", action="store_true",
+                       help="detach and run in the background")
+    p_run.set_defaults(func=cmd_run)
+
+    p_stop = sub.add_parser("stop", help="stop a server started by this script")
+    p_stop.add_argument("--port", type=int, default=8765,
+                        help="(informational; pidfile is authoritative)")
+    p_stop.set_defaults(func=cmd_stop)
+
+    p_status = sub.add_parser("status", help="show whether the server is running")
+    p_status.add_argument("--port", type=int, default=8765)
+    p_status.set_defaults(func=cmd_status)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

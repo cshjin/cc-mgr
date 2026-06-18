@@ -40,14 +40,26 @@ Reads (read-only) from `~/.claude/projects/`, `~/.claude/tasks/`, and per-projec
 
 ```bash
 pip install -r requirements.txt
-python run.py            # http://127.0.0.1:8765
+python cc-mgr.py run             # serve http://127.0.0.1:8765 (Ctrl+C to stop)
+```
+
+One file manages the whole lifecycle (works on Windows and Linux):
+
+```bash
+python cc-mgr.py run                 # foreground; Ctrl+C to stop
+python cc-mgr.py run --background    # detach, return to shell
+python cc-mgr.py status              # is it running?
+python cc-mgr.py stop                # stop a server started by this script
 ```
 
 For a remote server, bind all interfaces and/or point at a different data root:
 
 ```bash
-CLAUDE_HOME=/path/to/.claude python run.py --host 0.0.0.0 --port 8765
+CLAUDE_HOME=/path/to/.claude python cc-mgr.py run --host 0.0.0.0 --port 8765
 ```
+
+`--background` writes a pidfile (`data/cc_mgr.pid`) and logs to `data/cc_mgr.log`;
+`stop` uses that pidfile to terminate the server (and any `--reload` workers).
 
 ## Stack
 

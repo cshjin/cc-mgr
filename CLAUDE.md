@@ -12,11 +12,20 @@ CLAUDE.md/memory edits, session export/delete). No Claude account or network acc
 ## Commands
 
 ```bash
-pip install -r requirements.txt          # FastAPI + uvicorn
-python run.py                            # serve http://127.0.0.1:8765
-python run.py --host 0.0.0.0 --port 8765 --reload   # remote / dev autoreload
-CLAUDE_HOME=/path/to/.claude python run.py          # point at a different data root
+pip install -r requirements.txt                     # FastAPI + uvicorn
+python cc-mgr.py run                                 # serve http://127.0.0.1:8765 (Ctrl+C to stop)
+python cc-mgr.py run --background                    # detached; stop with `python cc-mgr.py stop`
+python cc-mgr.py run --host 0.0.0.0 --port 8765 --reload   # remote / dev autoreload
+python cc-mgr.py stop                                # stop a server this script started
+python cc-mgr.py status                              # running?  (reads data/cc_mgr.pid)
+CLAUDE_HOME=/path/to/.claude python cc-mgr.py run    # point at a different data root
 ```
+
+`cc-mgr.py` is the single entry point (`run`/`stop`/`status`). `run --background`
+writes `data/cc_mgr.pid` and logs to `data/cc_mgr.log`; `stop` reads that pidfile
+and kills the process group (Windows: `taskkill /T`, POSIX: `killpg`). Note
+`_pid_alive` uses `tasklist` on Windows — never `os.kill(pid, 0)`, which would
+terminate the process there.
 
 There is **no build step** (vanilla JS frontend) and **no test framework** wired up.
 Tests during development are done as throwaway scripts run against a temporary
