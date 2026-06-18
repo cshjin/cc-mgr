@@ -13,7 +13,7 @@ CLAUDE.md/memory edits, session export/delete). No Claude account or network acc
 
 ```bash
 pip install -r requirements.txt                     # FastAPI + uvicorn
-python cc-mgr.py run                                 # serve http://127.0.0.1:8765 (Ctrl+C to stop)
+python cc-mgr.py run                                 # serve on localhost:8765 — binds both 127.0.0.1 and ::1 (Ctrl+C to stop)
 python cc-mgr.py run --background                    # detached; stop with `python cc-mgr.py stop`
 python cc-mgr.py run --host 0.0.0.0 --port 8765 --reload   # remote / dev autoreload
 python cc-mgr.py stop                                # stop a server this script started

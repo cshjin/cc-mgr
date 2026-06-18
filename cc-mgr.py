@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -25,6 +26,15 @@ HERE = Path(__file__).resolve().parent
 PID_FILE = HERE / "data" / "cc_mgr.pid"
 LOG_FILE = HERE / "data" / "cc_mgr.log"
 IS_WINDOWS = os.name == "nt"
+
+# Sentinel default for --host: bind both loopback addresses (IPv4 127.0.0.1 and
+# IPv6 ::1) so both `localhost` and `127.0.0.1` work regardless of how the OS
+# resolves `localhost`, while staying loopback-only (not exposed to the network).
+LOOPBACK = "loopback"
+
+
+def _display_host(host: str) -> str:
+    return "localhost" if host == LOOPBACK else host
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +107,33 @@ def _terminate(pid: int) -> None:
 # Commands
 # ---------------------------------------------------------------------------
 
+def _loopback_sockets(port: int) -> list[socket.socket]:
+    """Bind both IPv4 (127.0.0.1) and IPv6 (::1) loopback on `port`.
+
+    Two separate sockets are needed because a single uvicorn host binds only one
+    address family; this is what lets `localhost` work whether the OS resolves it
+    to 127.0.0.1 or ::1. Stays loopback-only (never exposed to other interfaces).
+    """
+    socks: list[socket.socket] = []
+    specs = [(socket.AF_INET, "127.0.0.1")]
+    if socket.has_ipv6:
+        specs.append((socket.AF_INET6, "::1"))
+    for family, addr in specs:
+        try:
+            s = socket.socket(family, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s.bind((addr, port))
+            s.listen(128)  # uvicorn expects sockets already listening
+            socks.append(s)
+        except OSError:
+            # e.g. IPv6 unavailable on this host — skip it, keep IPv4.
+            if family == socket.AF_INET:
+                raise
+    return socks
+
+
 def _serve(host: str, port: int, reload: bool) -> None:
     """Run uvicorn in the foreground (blocking). Manages the pidfile."""
     # Ensure imports + data paths resolve regardless of the caller's cwd.
@@ -105,10 +142,21 @@ def _serve(host: str, port: int, reload: bool) -> None:
     import uvicorn  # lazy: `stop`/`status` don't need it
 
     _write_pidfile(os.getpid(), host, port)
-    print(f"cc_mgr serving on http://{host}:{port}  (pid {os.getpid()})")
+    print(f"cc_mgr serving on http://{_display_host(host)}:{port}  "
+          f"(pid {os.getpid()})")
     print("Press Ctrl+C to stop." if sys.stdout.isatty() else "")
     try:
-        uvicorn.run("backend.app:app", host=host, port=port, reload=reload)
+        # The dual-loopback default needs two listening sockets, which the
+        # uvicorn.run() convenience can't express — drive a Server directly.
+        # (--reload spawns a subprocess and can't inherit our sockets, so it
+        # falls back to a single IPv4 bind.)
+        if host == LOOPBACK and not reload:
+            config = uvicorn.Config("backend.app:app")
+            server = uvicorn.Server(config)
+            server.run(sockets=_loopback_sockets(port))
+        else:
+            bind = "127.0.0.1" if host == LOOPBACK else host
+            uvicorn.run("backend.app:app", host=bind, port=port, reload=reload)
     finally:
         _clear_pidfile()
 
@@ -117,7 +165,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     existing = _read_pidfile()
     if existing and _pid_alive(existing["pid"]):
         print(f"cc_mgr already running (pid {existing['pid']} on "
-              f"http://{existing['host']}:{existing['port']}). Use `stop` first.")
+              f"http://{_display_host(existing['host'])}:{existing['port']}). "
+              f"Use `stop` first.")
         return 1
     if existing:
         _clear_pidfile()  # stale
@@ -147,7 +196,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     info = _read_pidfile()
     if info and _pid_alive(info["pid"]):
         print(f"cc_mgr started in background (pid {info['pid']}) on "
-              f"http://{args.host}:{args.port}")
+              f"http://{_display_host(args.host)}:{args.port}")
         print(f"Logs: {LOG_FILE}")
         print("Stop it with:  python cc-mgr.py stop")
         return 0
@@ -185,7 +234,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     info = _read_pidfile()
     if info and _pid_alive(info["pid"]):
         print(f"cc_mgr running (pid {info['pid']}) on "
-              f"http://{info['host']}:{info['port']}")
+              f"http://{_display_host(info['host'])}:{info['port']}")
         return 0
     if info:
         print("cc_mgr not running (stale pidfile present).")
@@ -200,8 +249,12 @@ def main() -> int:
     sub = ap.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="start the server")
-    p_run.add_argument("--host", default="127.0.0.1")
-    p_run.add_argument("--port", type=int, default=8765)
+    p_run.add_argument(
+        "--host", default=LOOPBACK,
+        help="bind address; default binds both 127.0.0.1 and ::1 so localhost "
+             "and 127.0.0.1 both work. Pass 0.0.0.0 to expose on the network.")
+    p_run.add_argument("--port", type=int, default=8765,
+                       help="port to serve on (default 8765)")
     p_run.add_argument("--reload", action="store_true", help="dev autoreload")
     p_run.add_argument("--background", "-b", action="store_true",
                        help="detach and run in the background")
