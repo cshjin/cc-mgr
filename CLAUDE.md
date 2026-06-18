@@ -94,7 +94,11 @@ Three layers, all under `backend/` + `frontend/`:
   removes the transcript, the `<session-uuid>/` sidecar dir, and the tasks dir.
 - **Mutating writes are path-guarded**: `save_memory_file` rejects path components /
   non-`.md` names; keep that guard intact for any new write endpoint.
-- **`CLAUDE_HOME`** overrides the data root everywhere (via `store.claude_home()`);
-  this is the seam used for remote deployment and for isolated tests.
+- **Data root is `~/.claude` on every platform** (Windows, macOS, Linux — no
+  `%APPDATA%`/XDG split; `Path.home()` resolves `~` on all three). Overrides, in
+  precedence order: `CLAUDE_HOME` (cc_mgr's own seam for remote deployment /
+  isolated tests) then `CLAUDE_CONFIG_DIR` (Claude Code's official override for
+  relocated/multi-account config dirs). Both `expanduser()`. All resolution goes
+  through `store.claude_home()`.
 - The running server does **not** hot-reload unless `--reload` is passed; restart it
   to pick up backend changes, and hard-refresh the browser for frontend changes.

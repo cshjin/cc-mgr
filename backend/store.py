@@ -21,10 +21,19 @@ from typing import Any, Iterator
 
 
 def claude_home() -> Path:
-    """Root of the Claude Code data dir, overridable for remote/testing."""
-    env = os.environ.get("CLAUDE_HOME")
-    if env:
-        return Path(env)
+    """Root of the Claude Code data dir, overridable for remote/testing.
+
+    Claude Code uses a single ``~/.claude`` directory on every platform
+    (Windows, macOS, Linux) — there is no %APPDATA% / XDG split — and ``~``
+    resolves correctly on all three via ``Path.home()``. Overrides, in order of
+    precedence: ``CLAUDE_HOME`` (cc_mgr's own seam, used for remote/testing) then
+    ``CLAUDE_CONFIG_DIR`` (Claude Code's official override for multi-account /
+    relocated config dirs). ``expanduser`` so ``~``-based values work too.
+    """
+    for var in ("CLAUDE_HOME", "CLAUDE_CONFIG_DIR"):
+        env = os.environ.get(var)
+        if env:
+            return Path(env).expanduser()
     return Path.home() / ".claude"
 
 
@@ -94,7 +103,11 @@ def read_git_info(cwd: str | None) -> dict[str, Any] | None:
         try:
             content = git.read_text(encoding="utf-8", errors="replace").strip()
             if content.startswith("gitdir:"):
-                head_file = Path(content.split(":", 1)[1].strip()) / "HEAD"
+                gitdir = Path(content.split(":", 1)[1].strip())
+                # The gitdir may be relative to the .git file's own directory.
+                if not gitdir.is_absolute():
+                    gitdir = (git.parent / gitdir).resolve()
+                head_file = gitdir / "HEAD"
         except OSError:
             head_file = None
     if head_file and head_file.is_file():
