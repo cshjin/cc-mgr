@@ -49,15 +49,24 @@ def gemini_home(tmp_path, monkeypatch):
     (proj / "chats").mkdir(parents=True)
     (proj / ".project_root").write_text(str(cwd), encoding="utf-8")
     sess = proj / "chats" / "session-2026-06-03T23-38-ab4cc0f2.jsonl"
+    # Mirrors the REAL on-disk format: line0 meta, line1 $set prelude (synthetic
+    # <session_context>, excluded from display), then bare top-level turn records
+    # one per line. content is polymorphic; gemini answers are plain strings.
     sess.write_text("\n".join([
-        json.dumps({"sessionId": "ab4cc0f2", "startTime": "2026-06-03T23:38:00Z",
+        json.dumps({"sessionId": "ab4cc0f2", "projectHash": "abc",
+                    "startTime": "2026-06-03T23:38:00Z",
                     "lastUpdated": "2026-06-03T23:38:10Z", "kind": "main"}),
         json.dumps({"$set": {"messages": [
-            {"id": "m1", "timestamp": "2026-06-03T23:38:03Z", "type": "user",
-             "content": [{"text": "hello gemini"}]},
-            {"id": "m2", "timestamp": "2026-06-03T23:38:05Z", "type": "gemini",
-             "content": [{"text": "hello from gemini"}]},
-        ]}}),
+            {"id": "p0", "timestamp": "2026-06-03T23:38:00Z", "type": "user",
+             "content": [{"text": "<session_context>\nThis is the Gemini CLI..."}]},
+        ], "lastUpdated": "2026-06-03T23:38:00Z"}}),
+        json.dumps({"id": "m1", "timestamp": "2026-06-03T23:38:03Z", "type": "user",
+                    "content": [{"text": "hello gemini"}]}),
+        json.dumps({"$set": {"lastUpdated": "2026-06-03T23:38:04Z"}}),
+        json.dumps({"id": "m2", "timestamp": "2026-06-03T23:38:05Z", "type": "gemini",
+                    "content": "hello from gemini", "model": "gemini-3-flash-preview",
+                    "tokens": {"input": 100, "output": 7, "cached": 0, "total": 107}}),
+        json.dumps({"$set": {"lastUpdated": "2026-06-03T23:38:06Z"}}),
     ]), encoding="utf-8")
     # history fallback for empty tmp .project_root case
     histroot = home / "history" / "repo_gemini"

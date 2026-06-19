@@ -1,9 +1,22 @@
 """GeminiAdapter — ~/.gemini/tmp/<project>/chats/session-*.jsonl.
 
-Transcript is event-sourced: line 1 is session meta; subsequent lines are
-{"$set": {"messages": [...]}}. We fold to the LAST messages[] array. Each
-message is {type, content:[{text}]} where type is 'user' for the human and
-something else (e.g. 'gemini') for the model — normalized to user/assistant.
+Real on-disk format (verified against live data, NOT the original spec guess):
+
+  line 0: session meta {sessionId, projectHash, startTime, lastUpdated, kind}
+  line 1: ONE {"$set": {"messages": [<session_context prelude>]}} — a single
+          synthetic user turn; never the real conversation.
+  later:  a mix of {"$set": {"lastUpdated": ...}} bookkeeping lines AND the real
+          conversation as BARE TOP-LEVEL turn records appended one per line:
+            {id, timestamp, type, content, thoughts?, tokens?, model?, toolCalls?}
+
+Turn records: `type` is "user" or "gemini" (model). `content` is polymorphic —
+a plain string (gemini answers), [{"text": ...}] (user prompts), or
+[{"functionResponse": {...}}] (tool results, themselves type "user"). gemini
+turns may also carry `toolCalls` and `tokens` ({input,output,cached,total}).
+
+We surface bare turn records as the conversation; the line-1 `$set` prelude is
+parsed but excluded from display (it's the synthetic context block). type
+"gemini" normalizes to "assistant".
 """
 from __future__ import annotations
 
@@ -34,34 +47,86 @@ def _project_cwd(home: Path, project: str) -> str:
     return ""
 
 
-def _fold_messages(path: Path) -> tuple[dict, list[dict]]:
-    """Return (session_meta, latest messages[]) from an event-sourced file."""
-    meta: dict[str, Any] = {}
-    messages: list[dict] = []
+def _is_turn(rec: dict) -> bool:
+    """A bare top-level conversation turn (not a $set/meta line)."""
+    return (isinstance(rec, dict) and "$set" not in rec
+            and "id" in rec and "type" in rec and "content" in rec)
+
+
+def _read_turns(path: Path) -> list[dict]:
+    """Real conversation turns in file order.
+
+    Reads bare top-level turn records. Also pulls the line-1 $set.messages
+    prelude turn(s) and prepends them, tagged so they can be skipped from
+    display — they carry the synthetic <session_context> block.
+    """
+    prelude: list[dict] = []
+    turns: list[dict] = []
     for rec in iter_jsonl(path):
+        if not isinstance(rec, dict):
+            continue
         if "$set" in rec and isinstance(rec["$set"], dict):
-            m = rec["$set"].get("messages")
-            if isinstance(m, list):
-                messages = m
-        elif "sessionId" in rec and not meta:
-            meta = rec
-        elif "$append" in rec and isinstance(rec["$append"], dict):
-            m = rec["$append"].get("messages")
-            if isinstance(m, list):
-                messages.extend(m)
-    return meta, messages
+            msgs = rec["$set"].get("messages")
+            if isinstance(msgs, list):
+                for m in msgs:
+                    if isinstance(m, dict):
+                        m = dict(m)
+                        m["_prelude"] = True
+                        prelude.append(m)
+            continue
+        if _is_turn(rec):
+            turns.append(rec)
+    return prelude + turns
 
 
 def _norm_role(mtype: str) -> str:
     return "user" if mtype == "user" else "assistant"
 
 
-def _msg_blocks(msg: dict) -> list[dict]:
-    out = []
-    for part in msg.get("content", []) or []:
-        if isinstance(part, dict) and part.get("text"):
-            out.append({"type": "text", "text": part["text"]})
+def _turn_blocks(turn: dict) -> list[dict]:
+    """Normalize a Gemini turn's polymorphic content into typed blocks.
+
+    Handles: plain string, [{"text": ...}], [{"functionResponse": {...}}], plus
+    a gemini turn's `toolCalls` (surfaced as tool_use blocks).
+    """
+    out: list[dict] = []
+    content = turn.get("content")
+    if isinstance(content, str):
+        if content:
+            out.append({"type": "text", "text": content})
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("text"):
+                out.append({"type": "text", "text": part["text"]})
+            elif "functionResponse" in part:
+                fr = part["functionResponse"] or {}
+                resp = fr.get("response", {})
+                txt = resp.get("output") if isinstance(resp, dict) else None
+                out.append({"type": "tool_result",
+                            "text": txt if isinstance(txt, str) else _safe_str(fr)})
+    for call in turn.get("toolCalls", []) or []:
+        if isinstance(call, dict):
+            out.append({"type": "tool_use", "name": call.get("name", ""),
+                        "input": call.get("args", {})})
     return out
+
+
+def _safe_str(obj: Any) -> str:
+    try:
+        import json as _json
+        return _json.dumps(obj, ensure_ascii=False)[:2000]
+    except (TypeError, ValueError):
+        return str(obj)[:2000]
+
+
+def _turn_text_preview(turn: dict) -> str:
+    """First displayable text of a turn, for session summaries."""
+    for b in _turn_blocks(turn):
+        if b["type"] == "text" and b.get("text"):
+            return b["text"]
+    return ""
 
 
 class GeminiAdapter(AgentAdapter):
@@ -111,7 +176,7 @@ class GeminiAdapter(AgentAdapter):
         if not chats.is_dir():
             return None
         for s in chats.glob("session-*.jsonl"):
-            if s.stem == session_id or session_id in s.stem:
+            if s.stem == session_id:
                 return s
         return None
 
@@ -125,25 +190,39 @@ class GeminiAdapter(AgentAdapter):
         out = []
         for s in chats.glob("session-*.jsonl"):
             st = s.stat()
-            meta, messages = _fold_messages(s)
-            user_turns = sum(1 for m in messages if m.get("type") == "user")
-            asst_turns = len(messages) - user_turns
-            first = next((m for m in messages if m.get("type") == "user"), None)
-            last = next((m for m in reversed(messages) if m.get("type") == "user"), None)
-            def _txt(m):
-                if not m:
+            turns = [t for t in _read_turns(s) if not t.get("_prelude")]
+            user_turns = sum(1 for t in turns if t.get("type") == "user")
+            asst_turns = len(turns) - user_turns
+            # first/last *displayable* user prompt (skip tool-result-only turns)
+            def _user_text(t):
+                if t.get("type") != "user":
                     return ""
-                b = _msg_blocks(m)
-                return b[0]["text"][:500] if b else ""
+                txt = _turn_text_preview(t)
+                return txt[:500] if txt else ""
+            first = ""
+            last = ""
+            total_output = 0
+            last_total_ctx = 0
+            for t in turns:
+                ut = _user_text(t)
+                if ut:
+                    if not first:
+                        first = ut
+                    last = ut
+                tok = t.get("tokens") or {}
+                total_output += tok.get("output", 0) or 0
+                if tok.get("total"):
+                    last_total_ctx = tok["total"]
             summ = SessionSummary(
                 session_id=s.stem, project=project, file=str(s),
                 size_bytes=st.st_size, mtime=st.st_mtime,
-                first_prompt=_txt(first), last_prompt=_txt(last),
-                message_count=len(messages), user_turns=user_turns,
+                first_prompt=first, last_prompt=last,
+                message_count=len(turns), user_turns=user_turns,
                 assistant_turns=asst_turns, cwd=cwd, git_branch=branch,
+                total_output_tokens=total_output, context_tokens=last_total_ctx,
                 agent="gemini",
             )
-            win = context_limit_for(0)
+            win = context_limit_for(last_total_ctx)
             summ.context_limit = win["limit"]
             summ.context_limit_known = win["known"]
             out.append(summ)
@@ -154,21 +233,24 @@ class GeminiAdapter(AgentAdapter):
         path = self._session_path(project, session_id)
         if not path or not path.is_file():
             return {"total": 0, "offset": offset, "limit": limit, "turns": []}
-        _, messages = _fold_messages(path)
+        records = [t for t in _read_turns(path) if not t.get("_prelude")]
         turns = []
-        for m in messages:
-            blocks = _msg_blocks(m)
+        for m in records:
+            blocks = _turn_blocks(m)
             role = _norm_role(m.get("type", ""))
+            is_tool_only = (role == "user" and blocks
+                            and all(b["type"] == "tool_result" for b in blocks))
+            tok = m.get("tokens") or {}
             turns.append({
                 "uuid": m.get("id"),
                 "role": role,
-                "kind": role,
+                "kind": "tool" if is_tool_only else role,
                 "timestamp": m.get("timestamp"),
-                "model": "",
+                "model": m.get("model", ""),
                 "blocks": blocks,
                 "attribution_skill": None,
                 "attribution_plugin": None,
-                "output_tokens": 0,
+                "output_tokens": tok.get("output", 0) or 0,
             })
         total = len(turns)
         end = total if limit is None else min(total, offset + limit)
