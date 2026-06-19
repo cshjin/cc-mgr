@@ -163,7 +163,8 @@ function renderProjects() {
       ? `<span class="pchip git" title="git repository">⎇ ${esc(p.git.branch || p.git.repo)}</span>`
       : "";
     const mem = p.has_memory ? '<span class="pchip mem">◆ mem</span>' : "";
-    const cmd = p.has_claude_md ? '<span class="pchip cmd">CLAUDE.md</span>' : "";
+    const docName = (state.caps && state.caps.doc_filename) || "CLAUDE.md";
+    const cmd = p.has_claude_md ? `<span class="pchip cmd">${esc(docName)}</span>` : "";
     let task = "";
     let prog = "";
     if (p.total_tasks) {
@@ -419,6 +420,12 @@ async function openSession(id, targetSeq) {
 
 function renderDetailShell() {
   const s = state.sessions.find((x) => x.session_id === state.activeSession);
+  const caps = state.caps || {};
+  // if the active tab isn't supported by this agent, fall back to conversation
+  if ((state.detailTab === "tasks" && !caps.has_tasks) ||
+      (state.detailTab === "memory" && !caps.has_memory)) {
+    state.detailTab = "conversation";
+  }
   const pane = $("#detailPane");
   pane.innerHTML = `
     <div class="detail-head">
@@ -426,19 +433,21 @@ function renderDetailShell() {
       <div class="dtitle">${esc(s ? s.session_id.slice(0, 8) : "")}</div>
       <div class="dmeta">${esc(s ? (s.git_branch || "") : "")} ${s ? fmtTokens(s.context_tokens) + " tok" : ""}</div>
       <div class="dactions">
-        <button class="dbtn" id="exportBtn">⬇ Export .md</button>
-        <button class="dbtn danger" id="deleteBtn">🗑 Delete</button>
+        ${caps.can_export ? '<button class="dbtn" id="exportBtn">⬇ Export .md</button>' : ""}
+        ${caps.can_delete ? '<button class="dbtn danger" id="deleteBtn">🗑 Delete</button>' : ""}
       </div>
     </div>
     <div class="tabs">
       <div class="tab ${state.detailTab === "conversation" ? "active" : ""}" data-tab="conversation">Conversation</div>
-      <div class="tab ${state.detailTab === "tasks" ? "active" : ""}" data-tab="tasks">Tasks${s && s.total_tasks ? ` (${s.total_tasks})` : ""}</div>
-      <div class="tab ${state.detailTab === "memory" ? "active" : ""}" data-tab="memory">Memory</div>
+      ${caps.has_tasks ? `<div class="tab ${state.detailTab === "tasks" ? "active" : ""}" data-tab="tasks">Tasks${s && s.total_tasks ? ` (${s.total_tasks})` : ""}</div>` : ""}
+      ${caps.has_memory ? `<div class="tab ${state.detailTab === "memory" ? "active" : ""}" data-tab="memory">Memory</div>` : ""}
     </div>
     <div id="tabBody"></div>`;
   $("#dclose").addEventListener("click", closeDetail);
-  $("#exportBtn").addEventListener("click", exportSession);
-  $("#deleteBtn").addEventListener("click", openDeleteModal);
+  const exportBtn = $("#exportBtn");
+  if (exportBtn) exportBtn.addEventListener("click", exportSession);
+  const deleteBtn = $("#deleteBtn");
+  if (deleteBtn) deleteBtn.addEventListener("click", openDeleteModal);
   pane.querySelectorAll(".tab").forEach((t) => {
     t.addEventListener("click", () => { state.detailTab = t.dataset.tab; renderDetailShell(); loadTab(); });
   });
@@ -870,7 +879,7 @@ function initSearch() {
     try {
       const r = await fetch("/api/reindex", { method: "POST" });
       const res = await r.json();
-      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs (memory + CLAUDE.md).`);
+      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs across all agents.`);
     } catch (e) {
       flash("Reindex failed: " + e.message);
     } finally {

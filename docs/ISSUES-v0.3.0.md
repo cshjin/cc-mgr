@@ -86,6 +86,22 @@ this machine. Its adapter remains "empty-but-valid" (agreed v0.3.0 scope). If re
 Copilot history appears, validate/rewrite the same way (it likely has its own
 envelope, NOT the Claude shape currently assumed).
 
+## 4. Known limits / scaling notes (not bugs)
+
+- **Turn counts are post-filter, not raw line counts.** Both Gemini and Codex drop
+  whitespace-only turns, and Codex drops the `developer` prelude. The `message_count`
+  shown (and the index `turns` count) reflects displayable turns, not raw records.
+- **Codex re-scans `$CODEX_HOME/sessions` per request.** `_project_map()` rglobs all
+  rollout files and reads each one's `session_meta` on every `list_projects` /
+  `get_conversation` / `list_sessions` call. Fine for a handful of sessions; add a
+  per-request cache if codex histories grow large.
+- **Codex sessions with no recoverable cwd** collapse into a synthetic `"unknown"`
+  project; doc read/edit there is a no-op (cwd is empty).
+- **Gemini projects are discovered only under `tmp/`.** A project present only in
+  `history/` (no `tmp/<p>/chats/`) won't be listed, even though `_project_cwd` reads
+  `history/<p>/.project_root` as a cwd fallback. Matches intended scope (live chats
+  live in `tmp/`), noted for completeness.
+
 ## 3. Gemini `<session_context>` prelude is noisy as a "first prompt"
 
 Minor. The first real record is a large synthetic `<session_context>` block. The
