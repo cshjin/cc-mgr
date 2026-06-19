@@ -11,6 +11,11 @@ CLAUDE.md/memory edits, session export/delete). No Claude account or network acc
 
 ## Commands
 
+Use the following conda env
+```
+conda activate $SCRATCH/envs/gridai
+```
+
 ```bash
 pip install -r requirements.txt                     # FastAPI + uvicorn
 python cc-mgr.py run                                 # serve on localhost:8765 — binds both 127.0.0.1 and ::1 (Ctrl+C to stop)
