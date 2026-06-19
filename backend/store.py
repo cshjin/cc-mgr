@@ -279,6 +279,7 @@ def _scan_session(path: Path, project: str) -> SessionSummary:
         mtime=stat.st_mtime,
     )
     last_assistant_context = 0
+    peak_assistant_context = 0
     first_user_seen = False
     for rec in _iter_jsonl(path):
         rtype = rec.get("type")
@@ -315,8 +316,13 @@ def _scan_session(path: Path, project: str) -> SessionSummary:
             )
             if ctx:
                 last_assistant_context = ctx
+                if ctx > peak_assistant_context:
+                    peak_assistant_context = ctx
     summ.context_tokens = last_assistant_context
-    win = context_limit_for(last_assistant_context)
+    # Tier is proven by the PEAK context ever reached, not the last turn: a
+    # `compact` drops the live context below 200k, but if usage ever crossed
+    # 200k the window must be the 1M tier — that fact must not be forgotten.
+    win = context_limit_for(peak_assistant_context)
     summ.context_limit = win["limit"]
     summ.context_limit_known = win["known"]
     return summ
