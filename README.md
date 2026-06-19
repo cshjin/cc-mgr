@@ -1,9 +1,18 @@
 # cc_mgr
 
-A lightweight, portable web UI for viewing your local Claude Code projects.
+A lightweight, portable web UI for viewing your local **coding-agent** projects —
+Claude Code, Gemini CLI, Codex, and Copilot — selectable from a dropdown next to
+the title.
 
-Reads (read-only) from `~/.claude/projects/`, `~/.claude/tasks/`, and per-project
-`memory/` — no Claude account or network access required.
+Reads (read-only) from each agent's on-disk data — Claude's `~/.claude/projects/`,
+`~/.claude/tasks/`, per-project `memory/`; Gemini's `~/.gemini/tmp/*/chats/`;
+Codex's `$CODEX_HOME/sessions/`; Copilot's `~/.copilot/` — with no account or
+network access required. The active agent scopes the whole UI and search. Non-Claude
+agents support browsing, search, and editing their root doc (`GEMINI.md` /
+`AGENTS.md`); tasks/memory/export/delete remain Claude-only.
+
+Each agent's data root can be relocated via an env var: `CLAUDE_HOME` /
+`CLAUDE_CONFIG_DIR`, `GEMINI_HOME`, `CODEX_HOME`, `COPILOT_HOME`.
 
 ## Features
 

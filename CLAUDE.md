@@ -48,23 +48,45 @@ Three layers, all under `backend/` + `frontend/`:
   plus the only mutating ops (`update_task_status`, `save_claude_md`,
   `save_memory_file`, `export_session_*`, `save_session_as_memory`,
   `delete_session`).
+- **`backend/agents/`** — the multi-agent layer (v0.3.0). `AgentAdapter` (ABC) +
+  `Capabilities` + a registry in `__init__.py`; `common.py` holds agent-neutral
+  helpers (`SessionSummary`, jsonl iter, context tiers, git info, path-guarded doc
+  read/write). One adapter per agent: `claude.py` (delegates to `store.py`, full
+  features), `gemini.py`, `codex.py`, `copilot.py`. `get_adapter(agent_id)` returns
+  the adapter (defaults to claude); `all_adapters()` / `list_agents()` enumerate.
+  **Only the transcript parser truly differs per agent** — paths, doc filename, and
+  capability flags are data on each adapter. Non-Claude adapters implement only
+  read + `get_doc`/`save_doc`; the base raises `UnsupportedCapability` for
+  tasks/memory/export/delete (mapped to HTTP 404 in `app.py`). The real on-disk
+  formats are documented in `docs/ISSUES-v0.3.0.md` — **Gemini and Codex are NOT
+  Claude-shaped** (Gemini = bare top-level turn records + a `$set` prelude; Codex =
+  `{type,payload}` envelopes with `response_item`/`message` + `function_call*`).
 - **`backend/index_db.py`** — SQLite + FTS5 full-text index over every conversation
-  turn (`turns`/`turns_fts`) **and** every project's memory files + CLAUDE.md
-  (`docs`/`docs_fts`). A **rebuildable cache** at `data/cc_mgr.db`, regenerable from
-  source. `reindex()` is incremental for sessions (skips unchanged mtime+size) and
-  fully refreshes docs each run (they're tiny). Search results carry a `source`
-  field (`conversation` | `memory` | `claude_md`); conversation hits include `seq`
-  (absolute turn index, matching `get_conversation`'s order) so the UI can page to
-  and highlight the exact turn. FTS tables are standalone (not external-content) so
+  turn (`turns`/`turns_fts`) **and** every project's memory files + root doc
+  (`docs`/`docs_fts`), across **all agents**. A **rebuildable cache** at
+  `data/cc_mgr.db`. `reindex()` loops the adapter registry, stamping each row with
+  `agent`; incremental for sessions (skips unchanged mtime+size), fully refreshes
+  docs each run. Search results carry `agent` + a `source` field (`conversation` |
+  `memory` | `claude_md` | `agent_doc`); conversation hits include `seq` (absolute
+  turn index) so the UI can page to and highlight the exact turn. `search(...)`
+  takes an `agent=` filter. FTS tables are standalone (not external-content) so
   deletes are a plain `DELETE` — do not switch to `content=` (a past attempt
   corrupted the index). Bump `SCHEMA_VERSION` on any schema change; `init_db` drops
-  and rebuilds on mismatch (`PRAGMA user_version`).
-- **`backend/app.py`** — thin FastAPI layer: routes call `store`/`index_db` and
-  serve `frontend/` statically. Pydantic models guard request bodies.
+  and rebuilds on mismatch (`PRAGMA user_version`). Currently `SCHEMA_VERSION = 3`
+  (the `agent` column).
+- **`backend/app.py`** — thin FastAPI layer: every route takes an `?agent=` query
+  param, resolves the adapter via `get_adapter`, and calls it (defaults to claude).
+  `GET /api/agents` returns capabilities; `GET|PUT /api/projects/{p}/doc` is the
+  agent-agnostic root-doc endpoint (`/claude-md` kept as an alias). Pydantic models
+  guard request bodies.
 - **`frontend/{index.html,style.css,app.js}`** — no-build, no-CDN vanilla JS. `app.js`
-  is a single module with a global `state` object; rendering is string-template +
-  `innerHTML` + event wiring. Three-pane layout (projects / sessions / detail) with
-  draggable splitters and a collapsible sidebar; widths persist in `localStorage`.
+  is a single module with a global `state` object (incl. `state.agent` + cached
+  `state.caps`); the single `api()` helper appends `agent=state.agent` to every
+  request, so the agent dropdown next to the brand re-scopes the whole UI. Nav
+  buttons (Tasks/Memory/doc label) are gated by the active agent's `capabilities`.
+  Rendering is string-template + `innerHTML` + event wiring. Three-pane layout
+  (projects / sessions / detail) with draggable splitters and a collapsible sidebar;
+  widths + active agent persist in `localStorage`.
 
 ## On-disk data model (what `store.py` reads — verified, not assumed)
 
@@ -82,6 +104,26 @@ Three layers, all under `backend/` + `frontend/`:
   shared by all sessions in that folder.** Session deletion must never touch it.
 - `~/.claude/tasks/<session-uuid>/N.json` — tasks `{id, subject, status, blocks,
   blockedBy, owner, metadata}`, keyed by session, separate from the projects tree.
+
+### Other agents (v0.3.0) — verified against real data, see `docs/ISSUES-v0.3.0.md`
+
+- **Gemini** (`$GEMINI_HOME` or `~/.gemini`): projects under `tmp/<project>/`, true
+  cwd from `tmp/<project>/.project_root` (fallback `history/<project>/.project_root`,
+  non-lossy). Sessions: `tmp/<project>/chats/session-*.jsonl`. **The conversation is
+  NOT in `$set.messages`** (that holds only the synthetic `<session_context>`
+  prelude) — real turns are **bare top-level records** appended one per line
+  (`{id,type,content,thoughts,tokens,toolCalls}`), `type` ∈ `user`/`gemini`,
+  `content` polymorphic (str / `[{text}]` / `[{functionResponse}]`). Doc: `GEMINI.md`.
+- **Codex** (`$CODEX_HOME` or `~/.codex`): sessions under
+  `sessions/YYYY/MM/DD/rollout-*.jsonl`, grouped into projects by mangled cwd. **Each
+  line is a `{timestamp,type,payload}` envelope.** cwd from `session_meta.payload`;
+  turns are `response_item` with `payload.type` ∈ `message` (role user/assistant/
+  developer; content parts `input_text`/`output_text`) / `function_call` /
+  `function_call_output`; context = `last_token_usage.total_tokens` (NOT the
+  cumulative `total_token_usage`). Doc: `AGENTS.md`.
+- **Copilot** (`$COPILOT_HOME` or `~/.copilot`): no CLI history on this machine yet —
+  adapter is empty-but-valid (reads `history/<mangled-cwd>/*.jsonl` if present).
+  Format UNVERIFIED; revalidate if real data appears. Doc: `AGENTS.md`.
 
 ## Conventions and gotchas specific to this codebase
 
