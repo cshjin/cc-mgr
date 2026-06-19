@@ -351,3 +351,14 @@ body {
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+.agentsel {
+  background: var(--panel, #1b1b1d);
+  color: var(--fg, #eee);
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  padding: 2px 6px;
+  margin-left: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
