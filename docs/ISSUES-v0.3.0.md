@@ -46,18 +46,45 @@ maps `type:"gemini"` → assistant, and surfaces tool calls as `tool_use` blocks
 function responses as `tool_result` blocks. The synthetic test fixture in
 `tests/conftest.py` was rewritten to mirror this real layout.
 
-## 2. Codex / Copilot formats remain UNVERIFIED (no local data)
+## 2. Codex real transcript format differs from the design spec (FIXED in T6-revised)
 
-**Severity:** Medium — adapters ship but are unproven against real data.
+**Severity:** Critical — would have shown empty Codex conversations + "unknown" project.
 
-`~/.codex` on this machine has only `config.toml` + `tmp/` (no `sessions/`), and
-`~/.copilot` has only `ide/`. The Codex adapter assumes Claude-identical turn-per-line
-records (`type` in user/assistant, `message.content` blocks, `cwd`, `gitBranch`).
-Real Codex rollout files are known in the wild to use a different envelope
-(e.g. `{"type":"message","role":...,"content":[{"type":"input_text"|"output_text"}]}`
-or `response_item` wrappers). **If real Codex data appears, validate the adapter against
-it** — it may need the same kind of rewrite Gemini needed. Same caveat for Copilot.
-Until then both are "empty-but-valid" which is the agreed v0.3.0 scope.
+Real Codex data WAS found at `$CODEX_HOME=/pscratch/sd/j/jinh/.codex` (the env var
+points off the home dir; `~/.codex` itself only has `config.toml` + `tmp/`). Three real
+`sessions/YYYY/MM/DD/rollout-*.jsonl` files exist there.
+
+**Real format (verified against
+`rollout-2026-06-05T18-26-48-019e9a8a-...jsonl`, 211 lines):**
+
+Every line is an envelope `{timestamp, type, payload}`. `type` is one of:
+- `session_meta` — `payload` has `id, timestamp, cwd, originator, cli_version, ...`.
+  **This is where cwd comes from** (NOT a per-record `cwd` field).
+- `turn_context` — bookkeeping.
+- `event_msg` — UI/telemetry events; `payload.type` includes `task_started`,
+  `token_count` (carries `info.total_token_usage.{input,output,total}_tokens`), etc.
+- `response_item` — the actual conversation. `payload.type` is one of:
+  - `message`: `{role: "user"|"assistant"|"developer", content:[{type:"input_text"|
+    "output_text", text}]}`. (`developer` = system prelude; user/assistant are real.)
+  - `function_call`: `{name, arguments(JSON string), call_id}` → a tool call.
+  - `function_call_output`: `{call_id, output(string)}` → a tool result.
+
+**Consequence of the original (Claude-shaped) parser:** it looked for top-level
+`type in (user,assistant)` and a per-record `cwd`. Real records have neither, so it
+found 0 turns and grouped everything under a `"unknown"` project with empty cwd.
+
+**Fix applied (T6-revised):** the Codex adapter now unwraps the `{type,payload}`
+envelope, reads cwd from `session_meta.payload.cwd`, maps `response_item`/`message`
+roles (skipping `developer` prelude by default in counts), renders `input_text`/
+`output_text` parts, and surfaces `function_call`/`function_call_output` as
+tool_use/tool_result blocks. Context/output tokens come from the last `token_count`
+event when present. Synthetic fixture rewritten to the real envelope; validated
+against the live `$CODEX_HOME` data.
+
+**Copilot still UNVERIFIED** — `~/.copilot` has only `ide/`, no CLI history dir on
+this machine. Its adapter remains "empty-but-valid" (agreed v0.3.0 scope). If real
+Copilot history appears, validate/rewrite the same way (it likely has its own
+envelope, NOT the Claude shape currently assumed).
 
 ## 3. Gemini `<session_context>` prelude is noisy as a "first prompt"
 

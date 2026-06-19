@@ -83,12 +83,35 @@ def codex_home(tmp_path, monkeypatch):
     cwd.mkdir()
     (cwd / "AGENTS.md").write_text("# Codex agents doc\ngamma\n", encoding="utf-8")
     sess = home / "sessions" / "2026" / "06" / "03" / "rollout-2026-06-03-xyz.jsonl"
+    # Mirrors the REAL envelope format: {timestamp, type, payload}. cwd lives in
+    # session_meta; conversation turns are response_item/message with content
+    # parts typed input_text/output_text; tool calls/outputs are function_call*.
     _write_jsonl(sess, [
-        {"type": "user", "uuid": "cu1", "cwd": str(cwd), "gitBranch": "main",
-         "timestamp": "2026-06-03T10:00:00Z",
-         "message": {"role": "user", "content": [{"type": "text", "text": "hello codex"}]}},
-        {"type": "assistant", "uuid": "ca1", "timestamp": "2026-06-03T10:00:01Z",
-         "message": {"role": "assistant", "content": [{"type": "text", "text": "hi from codex"}]}},
+        {"timestamp": "2026-06-03T10:00:00Z", "type": "session_meta",
+         "payload": {"id": "xyz", "timestamp": "2026-06-03T10:00:00Z",
+                     "cwd": str(cwd), "originator": "codex-tui", "cli_version": "1"}},
+        {"timestamp": "2026-06-03T10:00:00Z", "type": "turn_context", "payload": {}},
+        {"timestamp": "2026-06-03T10:00:01Z", "type": "response_item",
+         "payload": {"type": "message", "role": "developer",
+                     "content": [{"type": "input_text", "text": "<permissions...>"}]}},
+        {"timestamp": "2026-06-03T10:00:02Z", "type": "response_item",
+         "payload": {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "hello codex"}]}},
+        {"timestamp": "2026-06-03T10:00:03Z", "type": "response_item",
+         "payload": {"type": "function_call", "name": "exec_command",
+                     "arguments": "{\"cmd\": \"ls\"}", "call_id": "c1"}},
+        {"timestamp": "2026-06-03T10:00:04Z", "type": "response_item",
+         "payload": {"type": "function_call_output", "call_id": "c1",
+                     "output": "a.py\nb.py"}},
+        {"timestamp": "2026-06-03T10:00:05Z", "type": "response_item",
+         "payload": {"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "hi from codex"}]}},
+        {"timestamp": "2026-06-03T10:00:06Z", "type": "event_msg",
+         "payload": {"type": "token_count",
+                     "info": {"total_token_usage": {"input_tokens": 999,
+                              "output_tokens": 99, "total_tokens": 9999},
+                              "last_token_usage": {"input_tokens": 50,
+                              "output_tokens": 9, "total_tokens": 59}}}},
     ])
     monkeypatch.setenv("CODEX_HOME", str(home))
     return home
