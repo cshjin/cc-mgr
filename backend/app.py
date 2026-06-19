@@ -1,4 +1,4 @@
-"""FastAPI app: read-only viewer over Claude Code local project data."""
+"""FastAPI app: read-only viewer over coding-agent local project data."""
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -10,25 +10,74 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import index_db, store
+from .agents import UnsupportedCapability, get_adapter, list_agents
 
-app = FastAPI(title="cc_mgr", version="0.1.0")
+app = FastAPI(title="cc_mgr", version="0.3.0")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 
+def _adapter(agent: str | None):
+    return get_adapter(agent)
+
+
+@app.get("/api/agents")
+def api_agents():
+    return list_agents()
+
+
 @app.get("/api/projects")
-def api_projects():
-    return store.list_projects()
+def api_projects(agent: str | None = None):
+    return _adapter(agent).list_projects()
 
 
 @app.get("/api/projects/{project}/sessions")
-def api_sessions(project: str):
-    return [asdict(s) for s in store.list_sessions(project)]
+def api_sessions(project: str, agent: str | None = None):
+    return [asdict(s) for s in _adapter(agent).list_sessions(project)]
+
+
+@app.get("/api/projects/{project}/doc")
+def api_get_doc(project: str, agent: str | None = None):
+    try:
+        return _adapter(agent).get_doc(project)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+class DocRequest(BaseModel):
+    content: str
+
+
+@app.put("/api/projects/{project}/doc")
+def api_save_doc(project: str, req: DocRequest, agent: str | None = None):
+    try:
+        path = _adapter(agent).save_doc(project, req.content)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"saved": str(path)}
+
+
+# --- back-compat aliases for the current Claude-only frontend ---
+@app.get("/api/projects/{project}/claude-md")
+def api_get_claude_md(project: str, agent: str | None = None):
+    return api_get_doc(project, agent)
+
+
+@app.put("/api/projects/{project}/claude-md")
+def api_save_claude_md(project: str, req: DocRequest, agent: str | None = None):
+    return api_save_doc(project, req, agent)
 
 
 @app.get("/api/projects/{project}/memory")
-def api_memory(project: str):
-    return store.get_memory(project)
+def api_memory(project: str, agent: str | None = None):
+    try:
+        return _adapter(agent).get_memory(project)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 class MemoryFileRequest(BaseModel):
@@ -37,42 +86,29 @@ class MemoryFileRequest(BaseModel):
 
 
 @app.put("/api/projects/{project}/memory")
-def api_save_memory_file(project: str, req: MemoryFileRequest):
+def api_save_memory_file(project: str, req: MemoryFileRequest, agent: str | None = None):
     try:
-        path = store.save_memory_file(project, req.name, req.content)
+        path = _adapter(agent).save_memory_file(project, req.name, req.content)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"saved": str(path)}
 
 
-@app.get("/api/projects/{project}/claude-md")
-def api_get_claude_md(project: str):
-    return store.get_claude_md(project)
-
-
-class ClaudeMdRequest(BaseModel):
-    content: str
-
-
-@app.put("/api/projects/{project}/claude-md")
-def api_save_claude_md(project: str, req: ClaudeMdRequest):
-    try:
-        path = store.save_claude_md(project, req.content)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return {"saved": str(path)}
-
-
 @app.get("/api/projects/{project}/tasks")
-def api_project_tasks(project: str):
-    return store.project_tasks(project)
+def api_project_tasks(project: str, agent: str | None = None):
+    try:
+        return _adapter(agent).project_tasks(project)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/api/projects/{project}/sessions/{session_id}")
-def api_conversation(
-    project: str, session_id: str, offset: int = 0, limit: int = 40
-):
-    result = store.get_conversation(project, session_id, offset=offset, limit=limit)
+def api_conversation(project: str, session_id: str, offset: int = 0,
+                     limit: int = 40, agent: str | None = None):
+    result = _adapter(agent).get_conversation(project, session_id,
+                                              offset=offset, limit=limit)
     if result["total"] == 0:
         raise HTTPException(status_code=404, detail="session not found or empty")
     result["session_id"] = session_id
@@ -80,8 +116,11 @@ def api_conversation(
 
 
 @app.get("/api/sessions/{session_id}/tasks")
-def api_tasks(session_id: str):
-    return store.get_tasks(session_id)
+def api_tasks(session_id: str, agent: str | None = None):
+    try:
+        return _adapter(agent).get_tasks(session_id)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 class TaskStatusRequest(BaseModel):
@@ -89,19 +128,25 @@ class TaskStatusRequest(BaseModel):
 
 
 @app.patch("/api/sessions/{session_id}/tasks/{task_id}")
-def api_update_task(session_id: str, task_id: str, req: TaskStatusRequest):
+def api_update_task(session_id: str, task_id: str, req: TaskStatusRequest,
+                    agent: str | None = None):
     try:
-        return store.update_task_status(session_id, task_id, req.status)
+        return _adapter(agent).update_task_status(session_id, task_id, req.status)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="task not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/projects/{project}/sessions/{session_id}/export", response_class=PlainTextResponse)
-def api_export_inline(project: str, session_id: str):
-    """Return the session as Markdown text (for in-browser preview/download)."""
-    md = store.export_session_markdown(project, session_id)
+@app.get("/api/projects/{project}/sessions/{session_id}/export",
+         response_class=PlainTextResponse)
+def api_export_inline(project: str, session_id: str, agent: str | None = None):
+    try:
+        md = _adapter(agent).export_session_markdown(project, session_id)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
     if not md.strip():
         raise HTTPException(status_code=404, detail="session not found or empty")
     return md
@@ -114,40 +159,40 @@ class DeleteRequest(BaseModel):
 
 
 @app.post("/api/projects/{project}/sessions/{session_id}/delete")
-def api_delete(project: str, session_id: str, req: DeleteRequest):
-    jsonl = store.projects_dir() / project / f"{session_id}.jsonl"
-    if not jsonl.is_file():
-        raise HTTPException(status_code=404, detail="session not found")
-    export_path = None
-    memory_path = None
-    if req.export_first:
-        export_path = str(store.export_session_to_file(project, session_id))
-    if req.save_memory:
-        memory_path = str(store.save_session_as_memory(project, session_id))
-    result = store.delete_session(project, session_id, hard=req.hard)
+def api_delete(project: str, session_id: str, req: DeleteRequest,
+               agent: str | None = None):
+    ad = _adapter(agent)
+    try:
+        export_path = memory_path = None
+        if req.export_first:
+            export_path = str(ad.export_session_to_file(project, session_id))
+        if req.save_memory:
+            memory_path = str(ad.save_session_as_memory(project, session_id))
+        result = ad.delete_session(project, session_id, hard=req.hard)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
     result["export"] = export_path
     result["memory"] = memory_path
     return result
 
 
-class SaveMemoryRequest(BaseModel):
-    pass
-
-
 @app.post("/api/projects/{project}/sessions/{session_id}/save-memory")
-def api_save_memory(project: str, session_id: str):
+def api_save_memory(project: str, session_id: str, agent: str | None = None):
     try:
-        return {"memory": str(store.save_session_as_memory(project, session_id))}
+        return {"memory": str(_adapter(agent).save_session_as_memory(project, session_id))}
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="session not found")
 
 
 @app.get("/api/search")
-def api_search(q: str, limit: int = 50, project: str | None = None):
+def api_search(q: str, limit: int = 50, project: str | None = None,
+               agent: str | None = None):
     if not q.strip():
         return {"query": q, "results": []}
-    return {"query": q, "project": project,
-            "results": index_db.search(q, limit=limit, project=project)}
+    return {"query": q, "project": project, "agent": agent,
+            "results": index_db.search(q, limit=limit, project=project, agent=agent)}
 
 
 @app.post("/api/reindex")

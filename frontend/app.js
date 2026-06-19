@@ -42,13 +42,18 @@ const state = {
   sortBy: "time", // time | name
   convOffset: 0,
   convTotal: 0,
+  agent: localStorage.getItem("cc_agent") || "claude",
+  agents: [],
+  caps: null,
 };
 
 const CONV_PAGE = 40;
 const $ = (sel) => document.querySelector(sel);
 
 async function api(path) {
-  const r = await fetch(path);
+  const u = new URL(path, location.origin);
+  if (!u.searchParams.has("agent")) u.searchParams.set("agent", state.agent);
+  const r = await fetch(u);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }
@@ -87,6 +92,51 @@ function shortModel(m) {
 // ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
+function currentCaps() {
+  return state.agents.find((a) => a.agent_id === state.agent) || null;
+}
+
+async function loadAgents() {
+  try {
+    state.agents = await fetch("/api/agents").then((r) => r.json());
+  } catch {
+    state.agents = [{ agent_id: "claude", label: "Claude", doc_filename: "CLAUDE.md",
+      has_memory: true, has_tasks: true, can_edit_doc: true,
+      can_delete: true, can_export: true }];
+  }
+  state.caps = currentCaps();
+  if (!state.caps && state.agents.length) {
+    state.agent = state.agents[0].agent_id;
+    state.caps = state.agents[0];
+  }
+  const sel = $("#agentSel");
+  sel.innerHTML = state.agents
+    .map((a) => `<option value="${esc(a.agent_id)}">${esc(a.label)}</option>`).join("");
+  sel.value = state.agent;
+  sel.addEventListener("change", async () => {
+    state.agent = sel.value;
+    localStorage.setItem("cc_agent", state.agent);
+    state.caps = currentCaps();
+    state.activeProject = null;
+    state.activeProjectMeta = null;
+    state.activeSession = null;
+    state.sessions = [];
+    closeDetail();
+    $("#projNav").hidden = true;
+    $("#sessionPane").innerHTML =
+      '<div class="empty">Select a project to view its sessions.</div>';
+    updateSubLabel();
+    await loadProjects();
+  });
+  updateSubLabel();
+}
+
+function updateSubLabel() {
+  const label = (state.caps && state.caps.label) || "coding-agent";
+  const el = $("#subLabel");
+  if (el) el.textContent = `local ${label} project viewer`;
+}
+
 async function loadProjects() {
   state.projects = await api("/api/projects");
   renderProjects();
@@ -113,7 +163,8 @@ function renderProjects() {
       ? `<span class="pchip git" title="git repository">⎇ ${esc(p.git.branch || p.git.repo)}</span>`
       : "";
     const mem = p.has_memory ? '<span class="pchip mem">◆ mem</span>' : "";
-    const cmd = p.has_claude_md ? '<span class="pchip cmd">CLAUDE.md</span>' : "";
+    const docName = (state.caps && state.caps.doc_filename) || "CLAUDE.md";
+    const cmd = p.has_claude_md ? `<span class="pchip cmd">${esc(docName)}</span>` : "";
     let task = "";
     let prog = "";
     if (p.total_tasks) {
@@ -174,14 +225,20 @@ function renderProjNav() {
   const nav = $("#projNav");
   if (!state.activeProject) { nav.hidden = true; return; }
   nav.hidden = false;
+  const allowed = new Set(["sessions", "claude"]);
+  if ((state.caps || {}).has_tasks) allowed.add("tasks");
+  if ((state.caps || {}).has_memory) allowed.add("memory");
+  if (!allowed.has(state.projView)) state.projView = "sessions";
   const m = state.activeProjectMeta || {};
   const taskCount = m.total_tasks ? `<span class="pn-count">${m.open_tasks}/${m.total_tasks}</span>` : "";
+  const caps = state.caps || {};
+  const docName = caps.doc_filename || "CLAUDE.md";
   const views = [
     { key: "sessions", label: "Sessions", count: `<span class="pn-count">${m.session_count || 0}</span>` },
-    { key: "tasks", label: "Tasks", count: taskCount },
-    { key: "memory", label: "Memory", count: m.has_memory ? "" : "" },
-    { key: "claude", label: "CLAUDE.md", count: "" },
   ];
+  if (caps.has_tasks) views.push({ key: "tasks", label: "Tasks", count: taskCount });
+  if (caps.has_memory) views.push({ key: "memory", label: "Memory", count: "" });
+  views.push({ key: "claude", label: docName, count: "" });
   nav.innerHTML = views.map((v) =>
     `<button class="pnav-btn ${state.projView === v.key ? "active" : ""}" data-view="${v.key}">${v.label}${v.count}</button>`
   ).join("");
@@ -208,7 +265,7 @@ async function loadProjView() {
       const mem = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`);
       renderMemory(el, mem, true);
     } else if (state.projView === "claude") {
-      const cm = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/claude-md`);
+      const cm = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/doc`);
       renderClaudeMd(el, cm);
     }
   } catch (e) {
@@ -306,15 +363,16 @@ function renderProjectTasks(el, tasks) {
 }
 
 function renderClaudeMd(el, cm) {
+  const docName = (state.caps && state.caps.doc_filename) || "CLAUDE.md";
   if (!cm.cwd) {
     el.innerHTML = '<div class="empty">No working directory known for this project (no session has a cwd yet).</div>';
     return;
   }
-  const status = cm.exists ? "" : "CLAUDE.md does not exist yet — saving will create it.";
+  const status = cm.exists ? "" : `${docName} does not exist yet — saving will create it.`;
   el.innerHTML = `
     <div class="editor-wrap">
       <div class="editor-head">
-        <strong>CLAUDE.md</strong>
+        <strong>${esc(docName)}</strong>
         <span class="ehpath">${esc(cm.path)}</span>
       </div>
       <textarea class="editor" id="cmEditor" spellcheck="false">${esc(cm.content)}</textarea>
@@ -326,14 +384,17 @@ function renderClaudeMd(el, cm) {
   $("#cmSave").addEventListener("click", async () => {
     $("#cmStatus").textContent = "saving…";
     try {
-      const r = await fetch(`/api/projects/${encodeURIComponent(state.activeProject)}/claude-md`, {
+      const u = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/doc`,
+                        location.origin);
+      u.searchParams.set("agent", state.agent);
+      const r = await fetch(u, {
         method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: $("#cmEditor").value }),
       });
       if (!r.ok) throw new Error(`${r.status}`);
       const res = await r.json();
       $("#cmStatus").textContent = "saved ✓";
-      flash("CLAUDE.md saved to " + res.saved);
+      flash(docName + " saved to " + res.saved);
     } catch (e) {
       $("#cmStatus").textContent = "failed: " + e.message;
     }
@@ -359,6 +420,12 @@ async function openSession(id, targetSeq) {
 
 function renderDetailShell() {
   const s = state.sessions.find((x) => x.session_id === state.activeSession);
+  const caps = state.caps || {};
+  // if the active tab isn't supported by this agent, fall back to conversation
+  if ((state.detailTab === "tasks" && !caps.has_tasks) ||
+      (state.detailTab === "memory" && !caps.has_memory)) {
+    state.detailTab = "conversation";
+  }
   const pane = $("#detailPane");
   pane.innerHTML = `
     <div class="detail-head">
@@ -366,26 +433,28 @@ function renderDetailShell() {
       <div class="dtitle">${esc(s ? s.session_id.slice(0, 8) : "")}</div>
       <div class="dmeta">${esc(s ? (s.git_branch || "") : "")} ${s ? fmtTokens(s.context_tokens) + " tok" : ""}</div>
       <div class="dactions">
-        <button class="dbtn" id="exportBtn">⬇ Export .md</button>
-        <button class="dbtn danger" id="deleteBtn">🗑 Delete</button>
+        ${caps.can_export ? '<button class="dbtn" id="exportBtn">⬇ Export .md</button>' : ""}
+        ${caps.can_delete ? '<button class="dbtn danger" id="deleteBtn">🗑 Delete</button>' : ""}
       </div>
     </div>
     <div class="tabs">
       <div class="tab ${state.detailTab === "conversation" ? "active" : ""}" data-tab="conversation">Conversation</div>
-      <div class="tab ${state.detailTab === "tasks" ? "active" : ""}" data-tab="tasks">Tasks${s && s.total_tasks ? ` (${s.total_tasks})` : ""}</div>
-      <div class="tab ${state.detailTab === "memory" ? "active" : ""}" data-tab="memory">Memory</div>
+      ${caps.has_tasks ? `<div class="tab ${state.detailTab === "tasks" ? "active" : ""}" data-tab="tasks">Tasks${s && s.total_tasks ? ` (${s.total_tasks})` : ""}</div>` : ""}
+      ${caps.has_memory ? `<div class="tab ${state.detailTab === "memory" ? "active" : ""}" data-tab="memory">Memory</div>` : ""}
     </div>
     <div id="tabBody"></div>`;
   $("#dclose").addEventListener("click", closeDetail);
-  $("#exportBtn").addEventListener("click", exportSession);
-  $("#deleteBtn").addEventListener("click", openDeleteModal);
+  const exportBtn = $("#exportBtn");
+  if (exportBtn) exportBtn.addEventListener("click", exportSession);
+  const deleteBtn = $("#deleteBtn");
+  if (deleteBtn) deleteBtn.addEventListener("click", openDeleteModal);
   pane.querySelectorAll(".tab").forEach((t) => {
     t.addEventListener("click", () => { state.detailTab = t.dataset.tab; renderDetailShell(); loadTab(); });
   });
 }
 
 function exportSession() {
-  const url = `/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/export`;
+  const url = `/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/export?agent=${encodeURIComponent(state.agent)}`;
   const a = document.createElement("a");
   a.href = url;
   a.download = `${state.activeSession.slice(0, 8)}.md`;
@@ -422,7 +491,10 @@ function openDeleteModal() {
     const hard = $("#mHard").checked;
     $("#mStatus").textContent = "deleting…";
     try {
-      const r = await fetch(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/delete`, {
+      const du = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/delete`,
+                         location.origin);
+      du.searchParams.set("agent", state.agent);
+      const r = await fetch(du, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ export_first: exportFirst, save_memory: saveMemory, hard }),
       });
@@ -636,7 +708,10 @@ function wireKanban(scope, opts = {}) {
       if (card && card.parentElement !== drop) {
         drop.appendChild(card);
         try {
-          const r = await fetch(`/api/sessions/${dragSid}/tasks/${encodeURIComponent(dragId)}`, {
+          const tu = new URL(`/api/sessions/${dragSid}/tasks/${encodeURIComponent(dragId)}`,
+                             location.origin);
+          tu.searchParams.set("agent", state.agent);
+          const r = await fetch(tu, {
             method: "PATCH", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ status: newStatus }),
           });
@@ -712,7 +787,10 @@ function wireMemoryEditors(scope) {
       const status = blk.querySelector(".editor-status");
       status.textContent = "saving…";
       try {
-        const r = await fetch(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`, {
+        const mu = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`,
+                           location.origin);
+        mu.searchParams.set("agent", state.agent);
+        const r = await fetch(mu, {
           method: "PUT", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, content }),
         });
@@ -801,7 +879,7 @@ function initSearch() {
     try {
       const r = await fetch("/api/reindex", { method: "POST" });
       const res = await r.json();
-      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs (memory + CLAUDE.md).`);
+      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs across all agents.`);
     } catch (e) {
       flash("Reindex failed: " + e.message);
     } finally {
@@ -815,7 +893,7 @@ async function runSearch(q) {
   el.innerHTML = '<div class="loading">searching…</div>';
   const scopeProject = $("#searchScope").value === "project" && state.activeProject
     ? state.activeProject : null;
-  let url = `/api/search?q=${encodeURIComponent(q)}&limit=80`;
+  let url = `/api/search?q=${encodeURIComponent(q)}&limit=80&agent=${encodeURIComponent(state.agent)}`;
   if (scopeProject) url += `&project=${encodeURIComponent(scopeProject)}`;
   try {
     const data = await api(url);
@@ -844,8 +922,10 @@ function renderSearchResults(el, results, q, scopeProject) {
           <div class="sr-snip">${snip}</div>
         </div>`;
     }
-    // memory / claude_md doc hit
-    const tag = r.source === "claude_md" ? "CLAUDE.md" : "memory";
+    // memory / claude_md / agent_doc hit
+    const tag = r.source === "claude_md" ? "CLAUDE.md"
+      : r.source === "agent_doc" ? ((state.caps && state.caps.doc_filename) || "doc")
+      : "memory";
     return `
       <div class="searchres doc" data-i="${i}">
         <div class="sr-head">
@@ -867,7 +947,7 @@ async function openSearchResult(r) {
   if (r.project !== state.activeProject) await selectProject(r.project);
   if (r.source === "conversation") {
     openSession(r.session_id, typeof r.seq === "number" ? r.seq : null);
-  } else if (r.source === "claude_md") {
+  } else if (r.source === "claude_md" || r.source === "agent_doc") {
     state.projView = "claude";
     renderProjNav();
     loadProjView();
@@ -906,6 +986,6 @@ document.querySelectorAll(".sortbtn").forEach((b) => {
 initTheme();
 initLayout();
 initSearch();
-loadProjects().catch((e) => {
+loadAgents().then(() => loadProjects()).catch((e) => {
   $("#projectList").innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
 });

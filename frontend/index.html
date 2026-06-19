@@ -3,14 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>cc_mgr — Claude project viewer</title>
+  <title>cc_mgr — coding-agent project viewer</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <header class="topbar">
     <button class="iconbtn" id="sidebarToggle" title="Collapse / expand sidebar">☰</button>
     <div class="brand">cc_mgr</div>
-    <div class="sub">local Claude project viewer</div>
+    <select id="agentSel" class="agentsel" title="Active coding agent"></select>
+    <div class="sub" id="subLabel">local coding-agent viewer</div>
     <div class="searchwrap">
       <select id="searchScope" class="scopesel" title="Search scope">
         <option value="all">All folders</option>
