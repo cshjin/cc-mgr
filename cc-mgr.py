@@ -107,12 +107,68 @@ def _terminate(pid: int) -> None:
 # Commands
 # ---------------------------------------------------------------------------
 
+def _port_in_use(port: int) -> bool:
+    """True if anything is already listening on either loopback address."""
+    for addr in ("127.0.0.1", "::1"):
+        try:
+            family = socket.AF_INET if ":" not in addr else socket.AF_INET6
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                if s.connect_ex((addr, port)) == 0:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _find_port_holder(port: int) -> str | None:
+    """Best-effort identification of the process holding `port`. Windows only
+    (uses `netstat -ano`); returns None on POSIX or if lookup fails."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        out = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    needle = f":{port} "
+    for line in out.splitlines():
+        if "LISTENING" in line and needle in line:
+            parts = line.split()
+            pid = parts[-1] if parts else ""
+            name = ""
+            try:
+                ti = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                if ti:
+                    name = ti.split(",")[0].strip('"')
+            except (OSError, subprocess.SubprocessError):
+                pass
+            return f"pid {pid}" + (f" ({name})" if name else "")
+    return None
+
+
+def _pick_free_port(start: int, tries: int = 20) -> int | None:
+    for p in range(start, start + tries):
+        if not _port_in_use(p):
+            return p
+    return None
+
+
 def _loopback_sockets(port: int) -> list[socket.socket]:
     """Bind both IPv4 (127.0.0.1) and IPv6 (::1) loopback on `port`.
 
     Two separate sockets are needed because a single uvicorn host binds only one
     address family; this is what lets `localhost` work whether the OS resolves it
     to 127.0.0.1 or ::1. Stays loopback-only (never exposed to other interfaces).
+
+    NOTE: SO_REUSEADDR is deliberately NOT set on Windows — there its semantics
+    are nearly the opposite of POSIX and silently allow two processes to bind
+    the same port, with confusing routing of incoming connections.
     """
     socks: list[socket.socket] = []
     specs = [(socket.AF_INET, "127.0.0.1")]
@@ -121,25 +177,45 @@ def _loopback_sockets(port: int) -> list[socket.socket]:
     for family, addr in specs:
         try:
             s = socket.socket(family, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if not IS_WINDOWS:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if family == socket.AF_INET6:
                 s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
             s.bind((addr, port))
             s.listen(128)  # uvicorn expects sockets already listening
             socks.append(s)
         except OSError:
-            # e.g. IPv6 unavailable on this host — skip it, keep IPv4.
+            # IPv6 may be unavailable on this host — skip it, keep IPv4.
+            # An IPv4 failure here is fatal; the caller turns it into a
+            # friendly error message that names the port holder.
             if family == socket.AF_INET:
+                for prev in socks:
+                    prev.close()
                 raise
     return socks
 
 
-def _serve(host: str, port: int, reload: bool) -> None:
+def _serve(host: str, port: int, reload: bool, auto_port: bool = False) -> None:
     """Run uvicorn in the foreground (blocking). Manages the pidfile."""
     # Ensure imports + data paths resolve regardless of the caller's cwd.
     os.chdir(HERE)
     sys.path.insert(0, str(HERE))
     import uvicorn  # lazy: `stop`/`status` don't need it
+
+    # Pre-flight: if the port is already taken, fail (or roll forward) with a
+    # message that actually names the holder. Windows otherwise reports the
+    # confusing WSAEACCES (10013) "forbidden by access permissions".
+    if _port_in_use(port):
+        holder = _find_port_holder(port)
+        if auto_port:
+            alt = _pick_free_port(port + 1)
+            if alt is None:
+                _die_port_in_use(port, holder, no_alt=True)
+            print(f"port {port} is in use" + (f" by {holder}" if holder else "")
+                  + f"; using {alt} instead.")
+            port = alt
+        else:
+            _die_port_in_use(port, holder)
 
     _write_pidfile(os.getpid(), host, port)
     print(f"cc_mgr serving on http://{_display_host(host)}:{port}  "
@@ -161,6 +237,19 @@ def _serve(host: str, port: int, reload: bool) -> None:
         _clear_pidfile()
 
 
+def _die_port_in_use(port: int, holder: str | None, no_alt: bool = False) -> None:
+    msg = [f"Port {port} is already in use"]
+    if holder:
+        msg.append(f" by {holder}")
+    msg.append(".\n")
+    if no_alt:
+        msg.append("No free port found in the next 20 either.\n")
+    msg.append("Either stop the other process, choose a different port with "
+               "`--port`, or pass `--auto-port` to use the next free one.")
+    print("".join(msg), file=sys.stderr)
+    raise SystemExit(2)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     existing = _read_pidfile()
     if existing and _pid_alive(existing["pid"]):
@@ -172,7 +261,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         _clear_pidfile()  # stale
 
     if not args.background:
-        _serve(args.host, args.port, args.reload)
+        _serve(args.host, args.port, args.reload, auto_port=args.auto_port)
         return 0
 
     # --- background: spawn a detached copy running in the foreground ---
@@ -180,6 +269,8 @@ def cmd_run(args: argparse.Namespace) -> int:
            "--host", args.host, "--port", str(args.port)]
     if args.reload:
         cmd.append("--reload")
+    if args.auto_port:
+        cmd.append("--auto-port")
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     logf = open(LOG_FILE, "ab")
     if IS_WINDOWS:
@@ -258,6 +349,8 @@ def main() -> int:
     p_run.add_argument("--reload", action="store_true", help="dev autoreload")
     p_run.add_argument("--background", "-b", action="store_true",
                        help="detach and run in the background")
+    p_run.add_argument("--auto-port", action="store_true",
+                       help="if --port is taken, try the next free one")
     p_run.set_defaults(func=cmd_run)
 
     p_stop = sub.add_parser("stop", help="stop a server started by this script")
