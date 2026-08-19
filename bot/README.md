@@ -35,7 +35,8 @@ re-enqueues labeled issues via startup reconciliation.
 - git
 - A working headless `claude -p` on this machine (third-party gateway is
   fine; its env vars must be `ANTHROPIC_*`-named or listed in
-  `CLAUDE_ENV_EXTRA`)
+  `CLAUDE_ENV_EXTRA`, AND present in the bot's process environment — i.e.
+  in the env file, because systemd does not see interactive-shell exports)
 
 ## Setup
 

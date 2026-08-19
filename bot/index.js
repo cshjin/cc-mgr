@@ -7,9 +7,9 @@ import * as gh from './github-helpers.js';
 import { defaultConfig as config } from './config.js';
 
 // Shared allowlist gate: the webhook path AND reconciliation must agree.
-function authorAllowed(config, issue, ownerLogin) {
+function authorAllowed(config, author, ownerLogin) {
   const allowed = config.allowedAuthors.length > 0 ? config.allowedAuthors : [ownerLogin];
-  return allowed.includes(issue.user.login);
+  return allowed.includes(author);
 }
 
 export function createHandlers({ config, queue, log = () => {} }) {
@@ -19,8 +19,8 @@ export function createHandlers({ config, queue, log = () => {} }) {
     const labels = (issue.labels || []).map((l) => l.name);
     if (!labels.includes(config.triggerLabel)) return;
 
-    if (!authorAllowed(config, issue, payload.repository.owner.login)) {
-      log(`ignoring #${issue.number}: author @${issue.user.login} not in ALLOWED_AUTHORS`);
+    if (!authorAllowed(config, issue.user?.login, payload.repository.owner.login)) {
+      log(`ignoring #${issue.number}: author @${issue.user?.login || 'unknown'} not in ALLOWED_AUTHORS`);
       return;
     }
 
@@ -77,7 +77,7 @@ export async function reconcile({ config, queue, log = () => {}, appOctokit, get
       for (const issue of issues) {
         try {
           if (issue.pull_request) continue;
-          if (!authorAllowed(config, issue, repoData.owner.login)) continue;
+          if (!authorAllowed(config, issue.user?.login, repoData.owner.login)) continue;
           const job = {
             owner, repo, issueNumber: issue.number, title: issue.title, body: issue.body || '',
             author: issue.user.login, cloneUrl: repoData.clone_url, defaultBranch: repoData.default_branch,

@@ -180,6 +180,16 @@ test('runJob skips when a bot PR already exists', async () => {
   assert.equal(result.status, 'skipped');
 });
 
+test('runJob fails cleanly when the clone fails', async () => {
+  const { tmp } = setupRepo();
+  const claude = fakeClaude(tmp, 'exit 0');
+  const config = dryConfig(tmp, claude);
+  const bad = job('/nonexistent/origin.git');
+  const result = await runJob({ job: bad, config, octokit: dryOctokit(), log: () => {} });
+  assert.equal(result.status, 'failed');
+  assert.ok(result.error.includes('Setup failed'));
+});
+
 // Full fake covering the non-dry tail: records every write call. origin is
 // the local bare repo standing in for the GitHub remote, so the simulated
 // deleteRef API call must actually delete the ref there — otherwise runJob's
