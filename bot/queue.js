@@ -10,7 +10,6 @@ export class Queue extends EventEmitter {
     this.concurrency = concurrency;
     this.pending = [];
     this.running = new Set();
-    this.active = 0;
   }
 
   enqueue(id, job) {
@@ -21,19 +20,20 @@ export class Queue extends EventEmitter {
   }
 
   _pump() {
-    while (this.active < this.concurrency && this.pending.length > 0) {
+    while (this.running.size < this.concurrency && this.pending.length > 0) {
       const { id, job } = this.pending.shift();
       this.running.add(id);
-      this.active += 1;
       Promise.resolve()
         .then(() => this.worker(job))
         .catch((err) => {
-          if (this.listenerCount('error') > 0) this.emit('error', id, err);
-          else console.error(`queue job ${id} failed:`, err);
+          if (this.listenerCount('error') > 0) {
+            try { this.emit('error', id, err); } catch { /* listener threw — keep pumping */ }
+          } else {
+            console.error(`queue job ${id} failed:`, err);
+          }
         })
         .finally(() => {
           this.running.delete(id);
-          this.active -= 1;
           this._pump();
         });
     }
