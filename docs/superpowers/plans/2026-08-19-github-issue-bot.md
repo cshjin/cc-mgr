@@ -115,6 +115,8 @@ test('defaults', () => {
   assert.equal(c.dryRun, false);
   assert.equal(c.workdirRoot, path.resolve(path.join('..', 'data', 'bot-worktrees')));
   assert.equal(c.gitName, 'cc-mgr-bot[bot]');
+  assert.equal(c.gitEmail, 'cc-mgr-bot[bot]@users.noreply.github.com');
+  assert.deepEqual(c.claudeEnvExtra, []);
 });
 
 test('overrides and list parsing', () => {
@@ -127,6 +129,7 @@ test('overrides and list parsing', () => {
     CLAUDE_ENV_EXTRA: 'FOO , BAR',
     REPOS: 'cshjin/cc-mgr',
     VERIFY_COMMANDS: '\necho ok\n npm test \n',
+    WORKDIR_ROOT: '/tmp/w',
   });
   assert.equal(c.triggerLabel, 'x:fix');
   assert.deepEqual(c.allowedAuthors, ['alice', 'bob']);
@@ -136,6 +139,14 @@ test('overrides and list parsing', () => {
   assert.deepEqual(c.claudeEnvExtra, ['FOO', 'BAR']);
   assert.deepEqual(c.repos, ['cshjin/cc-mgr']);
   assert.deepEqual(c.verifyCommands, ['echo ok', 'npm test']);
+  assert.equal(c.workdirRoot, path.resolve('/tmp/w'));
+});
+
+test('agentTimeoutMin falls back to 30 for invalid values', () => {
+  assert.equal(load({ AGENT_TIMEOUT_MIN: 'abc' }).agentTimeoutMin, 30);
+  assert.equal(load({ AGENT_TIMEOUT_MIN: '0' }).agentTimeoutMin, 30);
+  assert.equal(load({ AGENT_TIMEOUT_MIN: '-5' }).agentTimeoutMin, 30);
+  assert.equal(load({ AGENT_TIMEOUT_MIN: '15' }).agentTimeoutMin, 15);
 });
 
 test('list helper', () => {
@@ -172,7 +183,10 @@ export function load(env = process.env) {
     claudeArgs: (env.CLAUDE_ARGS || '').split(/\s+/).filter(Boolean),
     permissionMode: env.CLAUDE_PERMISSION_MODE || 'bypassPermissions',
     claudeEnvExtra: list(env.CLAUDE_ENV_EXTRA),
-    agentTimeoutMin: Number(env.AGENT_TIMEOUT_MIN || 30),
+    agentTimeoutMin: (() => {
+      const n = Number(env.AGENT_TIMEOUT_MIN || 30);
+      return Number.isFinite(n) && n > 0 ? n : 30;
+    })(),
     verifyCommands: (env.VERIFY_COMMANDS || '').split('\n').map((s) => s.trim()).filter(Boolean),
     branchPrefix: env.BRANCH_PREFIX || 'bot',
     gitName: env.BOT_GIT_NAME || 'cc-mgr-bot[bot]',
@@ -188,7 +202,7 @@ export const defaultConfig = load();
 - [ ] **Step 2.4: Run the test — expect pass**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && node --test test/config.test.js`
-Expected: PASS — summary shows `# pass 3`, `# fail 0`.
+Expected: PASS — summary shows `# pass 4`, `# fail 0`.
 
 - [ ] **Step 2.5: Commit**
 
@@ -1507,16 +1521,21 @@ REPOS=cshjin/cc-mgr
 # CLAUDE_CMD must be an absolute path if `claude` is not on PATH.
 CLAUDE_CMD=claude
 # Extra args appended after `-p --output-format json --permission-mode <mode>`.
+# Whitespace-separated tokens only — no quoted values (passed to execFile
+# directly, never a shell).
 CLAUDE_ARGS=
 CLAUDE_PERMISSION_MODE=bypassPermissions
 # Comma-separated extra env var names to pass to the claude child. All
 # ANTHROPIC_* vars (e.g. ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN for a
 # third-party gateway) are passed through automatically.
 CLAUDE_ENV_EXTRA=
+# Invalid values (non-numeric, zero, negative) fall back to 30.
 AGENT_TIMEOUT_MIN=30
 
 # ---- Verification & git ----
-# Extra shell commands to run in the clone before committing (newline-separated).
+# Extra shell commands to run in the clone before committing. NOTE: systemd
+# EnvironmentFile values are single-line — join commands with ';', e.g.
+# VERIFY_COMMANDS=make lint; make test
 # Every changed .js gets `node --check`, every changed .py gets py_compile,
 # automatically.
 VERIFY_COMMANDS=
@@ -1710,7 +1729,7 @@ git commit -m "docs(bot): README, env example, systemd units, CLAUDE.md pointer"
 - [ ] **Step 10.1: Run the full check and test suites**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && npm run check && npm test`
-Expected: `node --check` on all six files exits 0; `# pass` total = 32 (3 config + 3 queue + 3 git + 6 helpers + 11 runner + 6 index), `# fail 0`.
+Expected: `node --check` on all six files exits 0; `# pass` total = 33 (4 config + 3 queue + 3 git + 6 helpers + 11 runner + 6 index), `# fail 0`.
 
 - [ ] **Step 10.2: Add the CHANGELOG entry**
 
