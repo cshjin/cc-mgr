@@ -58,7 +58,7 @@ GitHub → Settings → Developer settings → GitHub Apps → New GitHub App:
 ```bash
 mkdir -p ~/.config/cc-mgr-bot
 cp .env.example ~/.config/cc-mgr-bot/env
-# edit ~/.config/cc-mgr-bot/env: APP_ID, WEBHOOK_SECRET, WEBHOOK_PROXY_URL, REPOS
+# edit ~/.config/cc-mgr-bot/env: APP_ID, PRIVATE_KEY_PATH, WEBHOOK_SECRET, WEBHOOK_PROXY_URL, REPOS, ALLOWED_AUTHORS
 ```
 
 ### 3. Install and test
@@ -69,23 +69,28 @@ npm test
 DRY_RUN=1 npm start   # optional: sanity-run before wiring up systemd
 ```
 
-### 4. Run as systemd user services
+### 4. Run as a systemd user service
 
 ```bash
 cp cc-mgr-bot.service.example ~/.config/systemd/user/cc-mgr-bot.service
-cp cc-mgr-bot-smee.service.example ~/.config/systemd/user/cc-mgr-bot-smee.service
-# edit the smee unit: put your channel URL in ExecStart
+# check the ExecStart npm path and Environment=PATH in the unit — they must
+# match this machine
 systemctl --user daemon-reload
-systemctl --user enable --now cc-mgr-bot cc-mgr-bot-smee
+systemctl --user enable --now cc-mgr-bot
+systemctl --user status cc-mgr-bot   # confirm it is running
 loginctl enable-linger   # keep user services running without a login session
 journalctl --user -u cc-mgr-bot -f   # logs
 ```
 
+The webhook tunnel needs no separate service: `WEBHOOK_PROXY_URL` in the
+env file makes Probot run its own smee client.
+
 ### 5. First end-to-end check
 
-Open a harmless issue (e.g. a README typo) on cc-mgr, add the `bot:fix`
-label, and watch for the "👷" comment → PR. Review and merge; merging closes
-the issue via `Closes #<n>`.
+Create the `bot:fix` label in the repo's label list first (the bot
+auto-creates only `bot:done`/`bot:failed`). Open a harmless issue (e.g. a
+README typo) on cc-mgr, add the `bot:fix` label, and watch for the "👷"
+comment → PR. Review and merge; merging closes the issue via `Closes #<n>`.
 
 ## Security & hardening notes
 
@@ -101,8 +106,8 @@ the issue via `Closes #<n>`.
   per-process, and two overlapping processes could race on the same branch
   (the stale-branch retry could delete the other's branch).
 - Verification runs `python -m py_compile` (with a `python3` fallback) and
-  `node --check`; the systemd unit's PATH must include both interpreters, or
-  add them via `VERIFY_COMMANDS`-style overrides in the env file.
+  `node --check`; the systemd unit's `Environment=PATH=` (or a `PATH=` line
+  in the env file) must include both interpreters.
 
 ## Config reference
 
