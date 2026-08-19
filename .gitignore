@@ -12,6 +12,9 @@ env/
 *.sqlite3
 data/
 
+# GitHub issue bot
+bot/node_modules/
+
 # Exports + trash produced by the tool
 exports/
 .cc_mgr_trash/

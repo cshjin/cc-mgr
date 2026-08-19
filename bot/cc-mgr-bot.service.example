@@ -1,0 +1,18 @@
+[Unit]
+Description=cc-mgr issue bot (Probot + Claude Code)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hjin/shared/coding/cc-mgr/bot
+EnvironmentFile=/home/hjin/.config/cc-mgr-bot/env
+# This machine runs Node via nvm and Python via miniconda — neither is on
+# the systemd user-manager PATH. Use absolute paths for ExecStart and set
+# PATH so verifyChanges can find node/python. Adjust to your machine.
+Environment=PATH=/home/hjin/.nvm/versions/node/v24.18.0/bin:/home/hjin/miniconda3/bin:/home/hjin/.local/bin:/usr/bin:/bin
+ExecStart=/home/hjin/.nvm/versions/node/v24.18.0/bin/npm start
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -149,3 +149,12 @@ Three layers, all under `backend/` + `frontend/`:
   through `store.claude_home()`.
 - The running server does **not** hot-reload unless `--reload` is passed; restart it
   to pick up backend changes, and hard-refresh the browser for frontend changes.
+
+## GitHub issue bot (`bot/`)
+
+A separate Node app in this repo: a self-hosted Probot GitHub App that fixes
+`bot:fix`-labeled issues via headless Claude Code and delivers a PR (see
+`bot/README.md`). Requires Node ≥ 20.18.1 — not the Python conda env.
+Develop/test with `cd bot && npm test` (Node's built-in test runner, no
+framework) and `npm run check`; the runtime config is environment variables
+(`bot/.env.example`).

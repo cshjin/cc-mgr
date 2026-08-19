@@ -1,0 +1,18 @@
+{
+  "name": "cc-mgr-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitHub bot: fixes labeled issues via headless Claude Code, delivers as PR",
+  "type": "module",
+  "engines": {
+    "node": "^20.18.1 || >=22"
+  },
+  "scripts": {
+    "start": "probot run ./index.js",
+    "check": "node --check index.js && node --check config.js && node --check queue.js && node --check git.js && node --check github-helpers.js && node --check runner.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "probot": "^14.3.2"
+  }
+}
