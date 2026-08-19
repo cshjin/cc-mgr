@@ -44,13 +44,15 @@ Expected: `v20.18.1` or newer (or any v22+). If older, stop and tell the user �
   "scripts": {
     "start": "probot run ./index.js",
     "check": "node --check index.js && node --check config.js && node --check queue.js && node --check git.js && node --check github-helpers.js && node --check runner.js",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {
     "probot": "^14.3.2"
   }
 }
 ```
+
+Note: the `test` script is bare `node --test` (NOT `node --test test/`) — on Node ≥21 positional args to `--test` are glob patterns, and the directory form fails on Node 22+; bare `node --test` discovers `test/` correctly across the whole supported range.
 
 - [ ] **Step 1.3: Append `bot/` ignores to the repo root `.gitignore`**
 
@@ -68,8 +70,8 @@ Expected: exit 0, `node_modules/` created (note: `bot/package-lock.json` will be
 
 - [ ] **Step 1.5: Smoke-test Probot loads**
 
-Run: `cd /home/hjin/shared/coding/cc-mgr/bot && npx probot --version`
-Expected: prints a version like `14.3.x`.
+Run: `cd /home/hjin/shared/coding/cc-mgr/bot && npm ls probot`
+Expected: `probot@14.3.2`. (Optional: `npx probot --version` — note it prints `0.0.0-dev` because of an upstream probot CLI packaging bug; that is NOT a failure. The library version is what matters.)
 
 - [ ] **Step 1.6: Commit**
 
@@ -1672,15 +1674,30 @@ repos). The Probot glue (`index.js` default export) is exercised by the real
 end-to-end check in step 5.
 ```
 
-- [ ] **Step 9.5: Syntax-check the new JS-free files (nothing to run) and commit**
+- [ ] **Step 9.5: Add a bot pointer to the root CLAUDE.md**
+
+Append to `/home/hjin/shared/coding/cc-mgr/CLAUDE.md` (after the last section):
+
+```markdown
+## GitHub issue bot (`bot/`)
+
+A separate Node app in this repo: a self-hosted Probot GitHub App that fixes
+`bot:fix`-labeled issues via headless Claude Code and delivers a PR (see
+`bot/README.md`). Requires Node ≥ 20.18.1 — not the Python conda env.
+Develop/test with `cd bot && npm test` (Node's built-in test runner, no
+framework) and `npm run check`; the runtime config is environment variables
+(`bot/.env.example`).
+```
+
+- [ ] **Step 9.6: Syntax-check everything and commit**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && npm run check && npm test`
 Expected: check exits 0 (all `node --check` lines pass), tests pass.
 
 ```bash
 cd /home/hjin/shared/coding/cc-mgr
-git add bot/.env.example bot/README.md bot/cc-mgr-bot.service.example bot/cc-mgr-bot-smee.service.example
-git commit -m "docs(bot): README, env example, systemd units"
+git add bot/.env.example bot/README.md bot/cc-mgr-bot.service.example bot/cc-mgr-bot-smee.service.example CLAUDE.md
+git commit -m "docs(bot): README, env example, systemd units, CLAUDE.md pointer"
 ```
 
 ---
