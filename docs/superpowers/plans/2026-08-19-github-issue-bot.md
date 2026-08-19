@@ -1795,10 +1795,19 @@ WEBHOOK_PROXY_URL=https://smee.io/XXXX
 
 # ---- Behavior ----
 TRIGGER_LABEL=bot:fix
+# Labels the bot moves the issue to. Auto-created if missing.
+DONE_LABEL=bot:done
+FAILED_LABEL=bot:failed
 # Comma-separated logins allowed to trigger the bot. Empty = repo owner only.
 ALLOWED_AUTHORS=
 # Repos for startup reconciliation ("owner/repo", comma-separated).
 REPOS=cshjin/cc-mgr
+# Where the bot clones repos for agent runs. Default (relative to bot/):
+# ../data/bot-worktrees — inside the checkout. Point it OUTSIDE the checkout
+# when running as anything other than the owner-only demo.
+# WORKDIR_ROOT=/var/lib/cc-mgr-bot/worktrees
+# Branch prefix for bot PRs.
+BRANCH_PREFIX=bot
 
 # ---- Agent (headless Claude Code) ----
 # CLAUDE_CMD must be an absolute path if `claude` is not on PATH.
@@ -1819,8 +1828,9 @@ AGENT_TIMEOUT_MIN=30
 
 # ---- Verification & git ----
 # Extra shell commands to run in the clone before committing. NOTE: systemd
-# EnvironmentFile values are single-line — join commands with ';', e.g.
-# VERIFY_COMMANDS=make lint; make test
+# EnvironmentFile values are single-line — join commands with '&&' (not ';',
+# which would ignore a failing first step), e.g.
+# VERIFY_COMMANDS=make lint && make test
 # Every changed .js gets `node --check`, every changed .py gets py_compile,
 # automatically.
 VERIFY_COMMANDS=
@@ -1842,7 +1852,11 @@ After=network-online.target
 Type=simple
 WorkingDirectory=/home/hjin/shared/coding/cc-mgr/bot
 EnvironmentFile=/home/hjin/.config/cc-mgr-bot/env
-ExecStart=/usr/bin/npm start
+# This machine runs Node via nvm and Python via miniconda — neither is on
+# the systemd user-manager PATH. Use absolute paths for ExecStart and set
+# PATH so verifyChanges can find node/python. Adjust to your machine.
+Environment=PATH=/home/hjin/.nvm/versions/node/v24.18.0/bin:/home/hjin/miniconda3/bin:/home/hjin/.local/bin:/usr/bin:/bin
+ExecStart=/home/hjin/.nvm/versions/node/v24.18.0/bin/npm start
 Restart=on-failure
 RestartSec=10
 
@@ -1850,23 +1864,12 @@ RestartSec=10
 WantedBy=default.target
 ```
 
-- [ ] **Step 9.3: Create `bot/cc-mgr-bot-smee.service.example`**
+- [ ] **Step 9.3: NO separate smee service unit**
 
-```ini
-[Unit]
-Description=cc-mgr issue bot smee webhook tunnel
-After=network-online.target
-
-[Service]
-Type=simple
-# Replace YOUR_CHANNEL_ID with the smee channel ID from https://smee.io/new
-ExecStart=/usr/bin/npx smee -u https://smee.io/YOUR_CHANNEL_ID -t http://localhost:3000/api/github/webhooks
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-```
+Deleted from the plan: with `WEBHOOK_PROXY_URL` set in the env file, Probot v14
+runs its own smee EventSource client (`createWebhookProxy`), so a standalone
+`smee-client` unit would be a second consumer on the same channel. No
+`cc-mgr-bot-smee.service.example` file is created.
 
 - [ ] **Step 9.4: Create `bot/README.md`**
 
@@ -1930,7 +1933,8 @@ GitHub → Settings → Developer settings → GitHub Apps → New GitHub App:
 ```bash
 mkdir -p ~/.config/cc-mgr-bot
 cp .env.example ~/.config/cc-mgr-bot/env
-# edit ~/.config/cc-mgr-bot/env: APP_ID, WEBHOOK_SECRET, WEBHOOK_PROXY_URL, REPOS
+# edit ~/.config/cc-mgr-bot/env: APP_ID, PRIVATE_KEY_PATH, WEBHOOK_SECRET,
+# WEBHOOK_PROXY_URL, REPOS, ALLOWED_AUTHORS
 ```
 
 ### 3. Install and test
@@ -1941,23 +1945,29 @@ npm test
 DRY_RUN=1 npm start   # optional: sanity-run before wiring up systemd
 ```
 
-### 4. Run as systemd user services
+### 4. Run as a systemd user service
 
 ```bash
 cp cc-mgr-bot.service.example ~/.config/systemd/user/cc-mgr-bot.service
-cp cc-mgr-bot-smee.service.example ~/.config/systemd/user/cc-mgr-bot-smee.service
-# edit the smee unit: put your channel URL in ExecStart
+# check the ExecStart npm path and Environment=PATH in the unit — they must
+# match this machine (nvm/miniconda locations vary)
 systemctl --user daemon-reload
-systemctl --user enable --now cc-mgr-bot cc-mgr-bot-smee
+systemctl --user enable --now cc-mgr-bot
+systemctl --user status cc-mgr-bot   # confirm active before labeling anything
 loginctl enable-linger   # keep user services running without a login session
 journalctl --user -u cc-mgr-bot -f   # logs
 ```
 
+The webhook tunnel needs no separate service: `WEBHOOK_PROXY_URL` in the env
+file makes Probot run its own smee client.
+
 ### 5. First end-to-end check
 
-Open a harmless issue (e.g. a README typo) on cc-mgr, add the `bot:fix`
-label, and watch for the "👷" comment → PR. Review and merge; merging closes
-the issue via `Closes #<n>`.
+Create the `bot:fix` label in the repo's label list first (the bot
+auto-creates only `bot:done`/`bot:failed`). Then open a harmless issue
+(e.g. a README typo) on cc-mgr, add the `bot:fix` label, and watch for the
+"👷" comment → PR. Review and merge; merging closes the issue via
+`Closes #<n>`.
 
 ## Config reference
 
@@ -1980,8 +1990,8 @@ ones: `TRIGGER_LABEL`, `ALLOWED_AUTHORS`, `REPOS`, `CLAUDE_CMD`,
   per-process, and two overlapping processes could race on the same branch
   (the stale-branch retry could delete the other's branch).
 - Verification runs `python -m py_compile` (with a `python3` fallback) and
-  `node --check`; the systemd unit's PATH must include both interpreters, or
-  add them via `VERIFY_COMMANDS`-style overrides in the env file.
+  `node --check`; the systemd unit's `Environment=PATH=` (or a `PATH=` line
+  in the env file) must include both interpreters.
 
 ## Development
 
@@ -2017,8 +2027,9 @@ Expected: check exits 0 (all `node --check` lines pass), tests pass.
 
 ```bash
 cd /home/hjin/shared/coding/cc-mgr
-git add bot/.env.example bot/README.md bot/cc-mgr-bot.service.example bot/cc-mgr-bot-smee.service.example CLAUDE.md
-git commit -m "docs(bot): README, env example, systemd units, CLAUDE.md pointer"
+git rm bot/cc-mgr-bot-smee.service.example   # removed: WEBHOOK_PROXY_URL runs the tunnel itself
+git add bot/.env.example bot/README.md bot/cc-mgr-bot.service.example CLAUDE.md
+git commit -m "docs(bot): README, env example, systemd unit, CLAUDE.md pointer"
 ```
 
 ---
