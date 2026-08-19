@@ -808,6 +808,10 @@ test('buildPrompt fences untrusted data and truncates', () => {
   assert.ok(!prompt.includes('u9:')); // only the newest 20 comments embedded
   assert.ok(prompt.includes('u10:'));
   assert.ok(prompt.length < 100000); // fits comfortably in one argv (128 KiB cap)
+  const cjkBody = '汉'.repeat(4000); // 3 UTF-8 bytes each: 12 KB > 10 KB byte cap
+  const cjkPrompt = buildPrompt({ issueNumber: 2, title: 'T', body: cjkBody, author: 'a', comments: [] });
+  assert.ok(cjkPrompt.includes('(truncated)'));
+  assert.ok(Buffer.byteLength(cjkPrompt, 'utf8') < 40000); // clipped by bytes, not chars
 });
 
 test('parseResult handles json, error flag and raw text', () => {
@@ -871,9 +875,20 @@ const CLIP_BODY = 10000;
 const CLIP_COMMENT = 4000;
 const MAX_COMMENTS = 20;
 
-const clip = (text, max) => {
+// Byte-aware clip: the kernel caps one argv at 128 KiB of UTF-8 BYTES, so
+// char-count clipping would let CJK-heavy text blow the limit.
+const clip = (text, maxBytes) => {
   const t = String(text || '');
-  return t.length > max ? `${t.slice(0, max)}\n…(truncated)` : t;
+  if (Buffer.byteLength(t, 'utf8') <= maxBytes) return t;
+  let out = '';
+  let used = 0;
+  for (const ch of t) {
+    const b = Buffer.byteLength(ch, 'utf8');
+    if (used + b > maxBytes) break;
+    out += ch;
+    used += b;
+  }
+  return `${out}\n…(truncated)`;
 };
 
 export function buildPrompt({ issueNumber, title, body, author, comments }) {
@@ -971,7 +986,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { slugify, buildPrompt, parseResult, claudeEnv, verifyChanges, runClaude, runJob } from '../runner.js';
-import { hasDiff } from '../git.js';
+import { hasDiff, cloneShallow, checkoutNewBranch, commitAll, push } from '../git.js';
 import { load } from '../config.js';
 ```
 
@@ -1084,12 +1099,65 @@ test('runJob skips when a bot PR already exists', async () => {
   assert.equal(result.status, 'skipped');
 });
 
-test('verifyChanges catches bad syntax and runs config commands', async () => {
+// Full fake covering the non-dry tail: records every write call.
+function fullOctokit() {
+  const calls = { deleteRef: [], createComment: [], addLabels: [], removeLabel: [], createLabel: [], createPr: [] };
+  return {
+    calls,
+    paginate: async (fn, args) => (await fn(args)).data,
+    rest: {
+      pulls: {
+        list: async () => ({ data: [] }),
+        create: async (args) => {
+          calls.createPr.push(args);
+          return { data: { html_url: 'https://example.com/pr/1' } };
+        },
+      },
+      issues: {
+        listComments: async () => ({ data: [] }),
+        getLabel: async () => { const e = new Error('missing'); e.status = 404; throw e; },
+        createLabel: async (args) => { calls.createLabel.push(args); },
+        addLabels: async (args) => { calls.addLabels.push(args); },
+        removeLabel: async (args) => { calls.removeLabel.push(args); },
+        createComment: async (args) => { calls.createComment.push(args.body); },
+      },
+      git: { deleteRef: async (args) => { calls.deleteRef.push(args.ref); } },
+    },
+  };
+}
+
+test('runJob retries a conflicting push and runs the real tail (non-dry)', async () => {
+  const { tmp, origin } = setupRepo();
+  const claude = fakeClaude(tmp, "echo fixed >> README.md\necho '{\"result\": \"Fixed.\"}'");
+  const config = load({ WORKDIR_ROOT: path.join(tmp, 'work'), CLAUDE_CMD: claude, AGENT_TIMEOUT_MIN: '1' }); // NOT dry
+
+  // Pre-create a conflicting commit on the same branch in the origin, so the
+  // first push is rejected (non-fast-forward) and the retry path is taken.
+  const other = path.join(tmp, 'other');
+  await cloneShallow(origin, other);
+  await checkoutNewBranch(other, 'bot/issue-1-typo-in-readme');
+  fs.writeFileSync(path.join(other, 'conflict.txt'), 'x\n');
+  await commitAll(other, 'conflict', 't', 't@example.com');
+  await push(other, origin, '', 'bot/issue-1-typo-in-readme');
+
+  const octokit = fullOctokit();
+  const result = await runJob({ job: job(origin), config, octokit, log: () => {} });
+
+  assert.equal(result.status, 'done');
+  assert.equal(result.prUrl, 'https://example.com/pr/1');
+  assert.deepEqual(octokit.calls.deleteRef, ['heads/bot/issue-1-typo-in-readme']); // stale branch deleted, retried
+  assert.ok(octokit.calls.createComment.some((b) => b.includes('Fixed in PR: https://example.com/pr/1')));
+  assert.deepEqual(octokit.calls.addLabels, [{ owner: 'o', repo: 'r', issue_number: 1, labels: ['bot:done'] }]);
+  const refs = sh(tmp, '--git-dir', origin, 'for-each-ref', '--format=%(refname)').toString();
+  assert.ok(refs.includes('refs/heads/bot/issue-1-typo-in-readme'));
+});
+
+test('verifyChanges catches bad syntax, skips deleted files, runs config commands', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-verify-'));
   fs.writeFileSync(path.join(dir, 'bad.js'), 'function ( {\n');
   fs.writeFileSync(path.join(dir, 'ok.js'), 'console.log(1);\n');
-  const failures = await verifyChanges(load({ VERIFY_COMMANDS: 'exit 3' }), dir, ['bad.js', 'ok.js', 'notes.txt']);
-  assert.equal(failures.length, 2);
+  const failures = await verifyChanges(load({ VERIFY_COMMANDS: 'exit 3' }), dir, ['bad.js', 'ok.js', 'notes.txt', 'gone.js']);
+  assert.equal(failures.length, 2); // gone.js is deleted → skipped
   assert.ok(failures[0].includes('bad.js'));
   assert.ok(failures[1].includes('exit 3'));
 });
@@ -1116,6 +1184,7 @@ Append to the end of `bot/runner.js`:
 
 ```js
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -1125,64 +1194,103 @@ import * as gh from './github-helpers.js';
 const execFileAsync = promisify(execFile);
 
 // Runs `claude -p <prompt> --output-format json` headless. Enforces the
-// timeout itself (the CLI has no wall-clock timeout flag). Resolves with
-// stdout; stderr is written to logPath.
+// timeout itself (the CLI has no wall-clock timeout flag): SIGTERM the
+// process group at the limit, SIGKILL after a grace period, and as a last
+// resort reject even if 'close' never fires (a pipe-holding grandchild must
+// not block the single-worker queue forever). Resolves with stdout; stderr
+// is written to logPath.
 export function runClaude(config, prompt, cwd, logPath) {
   const args = ['-p', prompt, '--output-format', 'json', '--permission-mode', config.permissionMode, ...config.claudeArgs];
+  const timeoutMs = config.agentTimeoutMin * 60 * 1000;
   return new Promise((resolve, reject) => {
     // detached: give claude its own process group so the timeout kill takes
-    // down hung grandchildren too (a live child holding the stdio pipes
-    // would otherwise keep 'close' from ever firing).
-    const child = execFile(config.claudeCmd, args, { cwd, env: claudeEnv(config), detached: true, windowsHide: true });
+    // down hung grandchildren too.
+    const child = execFile(config.claudeCmd, args, {
+      cwd,
+      env: claudeEnv(config),
+      detached: true,
+      windowsHide: true,
+      maxBuffer: 64 * 1024 * 1024, // execFile's 1 MiB default kills long runs
+    });
     let timedOut = false;
-    const timer = setTimeout(() => {
+    let settled = false;
+    const killGroup = (signal) => {
+      try { process.kill(-child.pid, signal); } catch { /* group gone */ }
+      try { child.kill(signal); } catch { /* child gone */ }
+    };
+    const killTimer = setTimeout(() => {
       timedOut = true;
-      try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill('SIGTERM'); }
-    }, config.agentTimeoutMin * 60 * 1000);
+      killGroup('SIGTERM');
+    }, timeoutMs);
+    const graceTimer = setTimeout(() => {
+      if (timedOut) killGroup('SIGKILL');
+    }, timeoutMs + 10 * 1000);
+    // Final guarantee: reject even if 'close' never fires.
+    const hardTimer = setTimeout(() => {
+      settle(reject, new Error(`claude timed out after ${config.agentTimeoutMin} min (killed)`));
+    }, timeoutMs + 60 * 1000);
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      clearTimeout(graceTimer);
+      clearTimeout(hardTimer);
+      fn(value);
+    };
     const stdoutChunks = [];
     const stderrChunks = [];
     // execFile streams emit strings on some Node versions — normalize.
     const push = (chunks) => (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     child.stdout.on('data', push(stdoutChunks));
     child.stderr.on('data', push(stderrChunks));
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-    child.on('close', (code) => {
-      clearTimeout(timer);
+    child.on('error', (err) => settle(reject, err));
+    child.on('close', (code, signal) => {
       const stdout = Buffer.concat(stdoutChunks).toString('utf8');
       const stderr = Buffer.concat(stderrChunks).toString('utf8');
-      fs.writeFileSync(logPath, stderr, 'utf8');
-      if (code === 0) return resolve(stdout);
+      try { fs.writeFileSync(logPath, stderr, 'utf8'); } catch { /* log is best-effort */ }
+      if (code === 0) return settle(resolve, stdout);
       const err = new Error(timedOut
         ? `claude timed out after ${config.agentTimeoutMin} min`
-        : `claude exited with code ${code}`);
+        : `claude exited with code ${code}${signal ? ` (${signal})` : ''}`);
       err.stdout = stdout;
       err.stderr = stderr;
       err.timedOut = timedOut;
-      reject(err);
+      settle(reject, err);
     });
   });
 }
 
-async function runCheck(cwd, bin, args) {
+async function runCheck(cwd, bin, args, env = undefined) {
   try {
-    await execFileAsync(bin, args, { cwd });
+    await execFileAsync(bin, args, { cwd, env });
   } catch (err) {
     err.stderr = String(err.stderr || err.message || '').slice(-2000);
     throw err;
   }
 }
 
+// py_compile with the bytecode cache redirected out of the worktree (so
+// __pycache__ never gets committed), falling back to python3.
+async function pyCompile(cwd, file) {
+  const env = { ...process.env, PYTHONPYCACHEPREFIX: path.join(os.tmpdir(), 'cc-mgr-bot-pycache') };
+  try {
+    await runCheck(cwd, 'python', ['-m', 'py_compile', file], env);
+  } catch (err) {
+    if (err.code === 'ENOENT') await runCheck(cwd, 'python3', ['-m', 'py_compile', file], env);
+    else throw err;
+  }
+}
+
 // Static checks per changed file type, plus free-form commands from config.
-// Returns the list of failure strings (empty = all good).
+// Deleted files are skipped (there is nothing to check). Returns the list
+// of failure strings (empty = all good).
 export async function verifyChanges(config, cwd, files) {
   const failures = [];
   for (const file of files) {
     try {
+      if (!fs.existsSync(path.join(cwd, file))) continue; // deleted — nothing to check
       if (file.endsWith('.js')) await runCheck(cwd, 'node', ['--check', file]);
-      else if (file.endsWith('.py')) await runCheck(cwd, 'python', ['-m', 'py_compile', file]);
+      else if (file.endsWith('.py')) await pyCompile(cwd, file);
     } catch (err) {
       failures.push(`${file}:\n${err.stderr}`);
     }
@@ -1274,25 +1382,42 @@ export async function runJob({ job, config, octokit, log = () => {} }) {
     return { status: 'done', summary, dryRun: true };
   }
 
+  // Post-agent phase: wrap every GitHub side effect so a failure here still
+  // labels + comments the issue — never a silent stuck bot:fix.
+  let pr = null;
   try {
-    await git.push(workdir, cloneUrl, installationToken, branch);
-  } catch (pushErr) {
-    log(`#${issueNumber}: push failed (${pushErr.message}), deleting stale branch and retrying once`);
-    await gh.deleteBranch(octokit, { owner, repo, branch });
-    await git.push(workdir, cloneUrl, installationToken, branch);
+    try {
+      await git.push(workdir, cloneUrl, installationToken, branch);
+    } catch (pushErr) {
+      log(`#${issueNumber}: push failed (${pushErr.message}), deleting stale branch and retrying once`);
+      await gh.deleteBranch(octokit, { owner, repo, branch });
+      await git.push(workdir, cloneUrl, installationToken, branch);
+    }
+    pr = await gh.createPr(octokit, {
+      owner, repo,
+      title: `Fix #${issueNumber}: ${title}`,
+      head: branch, base: defaultBranch,
+      body: `${summary || '(no summary)'}\n\nCloses #${issueNumber}`,
+    });
+    await gh.ensureLabel(octokit, { owner, repo, name: config.doneLabel });
+    await gh.addLabels(octokit, { owner, repo, issueNumber, labels: [config.doneLabel] });
+    await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
+    await gh.addComment(octokit, { owner, repo, issueNumber, body: `Fixed in PR: ${pr.html_url}\n\n${summary || ''}` });
+  } catch (err) {
+    if (pr) {
+      // PR is open but a finishing step failed — report it as done with the
+      // link so the issue is not left deduped with bot:fix forever.
+      log(`#${issueNumber}: PR ${pr.html_url} opened but finishing failed: ${err.message}`);
+      try {
+        await gh.ensureLabel(octokit, { owner, repo, name: config.doneLabel });
+        await gh.addLabels(octokit, { owner, repo, issueNumber, labels: [config.doneLabel] });
+        await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
+        await gh.addComment(octokit, { owner, repo, issueNumber, body: `Fixed in PR: ${pr.html_url} (finishing steps hit an error: ${err.message})` });
+      } catch { /* best effort */ }
+      return { status: 'done', summary, prUrl: pr.html_url };
+    }
+    return fail(job, config, octokit, logPath, `Push/PR failed: ${err.message}`, log);
   }
-
-  const pr = await gh.createPr(octokit, {
-    owner, repo,
-    title: `Fix #${issueNumber}: ${title}`,
-    head: branch, base: defaultBranch,
-    body: `${summary || '(no summary)'}\n\nCloses #${issueNumber}`,
-  });
-
-  await gh.ensureLabel(octokit, { owner, repo, name: config.doneLabel });
-  await gh.addLabels(octokit, { owner, repo, issueNumber, labels: [config.doneLabel] });
-  await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
-  await gh.addComment(octokit, { owner, repo, issueNumber, body: `Fixed in PR: ${pr.html_url}\n\n${summary || ''}` });
 
   log(`#${issueNumber}: PR ${pr.html_url}`);
   return { status: 'done', summary, prUrl: pr.html_url };
@@ -1304,7 +1429,7 @@ Note: ESM allows `import` statements only at the top of the file. **Move the six
 - [ ] **Step 7.4: Run the tests — expect pass**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && node --test test/runner.test.js`
-Expected: PASS — `# pass 12`, `# fail 0` (5 part-1 tests + 7 new). The timeout test takes ~1s on a normal host (up to ~5s where setsid is blocked, e.g. sandboxes — the direct-child kill fallback fires; the test only asserts the error message).
+Expected: PASS — `# pass 13`, `# fail 0` (5 part-1 tests + 8 integration tests). The timeout test takes ~1s on a normal host (up to ~5s where setsid is blocked, e.g. sandboxes — the direct-child kill fallback fires; the test only asserts the error message).
 
 - [ ] **Step 7.5: Commit**
 
@@ -1797,6 +1922,20 @@ ones: `TRIGGER_LABEL`, `ALLOWED_AUTHORS`, `REPOS`, `CLAUDE_CMD`,
 `CLAUDE_ARGS`, `CLAUDE_PERMISSION_MODE`, `AGENT_TIMEOUT_MIN`,
 `VERIFY_COMMANDS`, `DRY_RUN`.
 
+## Security & hardening notes
+
+- The agent runs with `bypassPermissions` and can read anything the bot's OS
+  user can — including this repo's `data/` tree if `WORKDIR_ROOT` stays at
+  its default (inside the checkout). For anything beyond the owner-only demo:
+  run the bot as a dedicated OS user with a locked-down home, and point
+  `WORKDIR_ROOT` outside the checkout (e.g. `/var/lib/cc-mgr-bot/worktrees`).
+- The push token is minted when the job is enqueued and spent when it runs;
+  a queue backlog longer than the token lifetime (~1h) would 401 the push.
+  With concurrency 1 this is rare; a retry re-mints on the next trigger.
+- Verification runs `python -m py_compile` (with a `python3` fallback) and
+  `node --check`; the systemd unit's PATH must include both interpreters, or
+  add them via `VERIFY_COMMANDS`-style overrides in the env file.
+
 ## Development
 
 ```bash
@@ -1845,7 +1984,7 @@ git commit -m "docs(bot): README, env example, systemd units, CLAUDE.md pointer"
 - [ ] **Step 10.1: Run the full check and test suites**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && npm run check && npm test`
-Expected: `node --check` on all six files exits 0; `# pass` total = 37 (4 config + 3 queue + 5 git + 7 helpers + 12 runner + 6 index), `# fail 0`.
+Expected: `node --check` on all six files exits 0; `# pass` total = 38 (4 config + 3 queue + 5 git + 7 helpers + 13 runner + 6 index), `# fail 0`.
 
 - [ ] **Step 10.2: Add the CHANGELOG entry**
 
