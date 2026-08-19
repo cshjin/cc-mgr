@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { slugify, buildPrompt, parseResult, claudeEnv, verifyChanges, runClaude, runJob } from '../runner.js';
-import { hasDiff } from '../git.js';
+import { hasDiff, cloneShallow, checkoutNewBranch, commitAll, push } from '../git.js';
 import { load } from '../config.js';
 
 test('slugify', () => {
@@ -39,6 +39,10 @@ test('buildPrompt fences untrusted data and truncates', () => {
   assert.ok(!prompt.includes('u9:')); // only the newest 20 comments embedded
   assert.ok(prompt.includes('u10:'));
   assert.ok(prompt.length < 100000); // fits comfortably in one argv (128 KiB cap)
+  const cjkBody = '汉'.repeat(4000); // 3 UTF-8 bytes each: 12 KB > 10 KB byte cap
+  const cjkPrompt = buildPrompt({ issueNumber: 2, title: 'T', body: cjkBody, author: 'a', comments: [] });
+  assert.ok(cjkPrompt.includes('(truncated)'));
+  assert.ok(Buffer.byteLength(cjkPrompt, 'utf8') < 40000); // clipped by bytes, not chars
 });
 
 test('parseResult handles json, error flag and raw text', () => {
@@ -176,11 +180,73 @@ test('runJob skips when a bot PR already exists', async () => {
   assert.equal(result.status, 'skipped');
 });
 
-test('verifyChanges catches bad syntax and runs config commands', async () => {
+// Full fake covering the non-dry tail: records every write call. origin is
+// the local bare repo standing in for the GitHub remote, so the simulated
+// deleteRef API call must actually delete the ref there — otherwise runJob's
+// retry push is rejected again (non-fast-forward) and never succeeds.
+function fullOctokit(origin) {
+  const calls = { deleteRef: [], createComment: [], addLabels: [], removeLabel: [], createLabel: [], createPr: [] };
+  return {
+    calls,
+    paginate: async (fn, args) => (await fn(args)).data,
+    rest: {
+      pulls: {
+        list: async () => ({ data: [] }),
+        create: async (args) => {
+          calls.createPr.push(args);
+          return { data: { html_url: 'https://example.com/pr/1' } };
+        },
+      },
+      issues: {
+        listComments: async () => ({ data: [] }),
+        getLabel: async () => { const e = new Error('missing'); e.status = 404; throw e; },
+        createLabel: async (args) => { calls.createLabel.push(args); },
+        addLabels: async (args) => { calls.addLabels.push(args); },
+        removeLabel: async (args) => { calls.removeLabel.push(args); },
+        createComment: async (args) => { calls.createComment.push(args.body); },
+      },
+      git: {
+        deleteRef: async (args) => {
+          calls.deleteRef.push(args.ref);
+          // GitHub API ref form is "heads/<branch>"; git needs "refs/heads/...".
+          sh(origin, 'update-ref', '-d', `refs/${args.ref}`);
+        },
+      },
+    },
+  };
+}
+
+test('runJob retries a conflicting push and runs the real tail (non-dry)', async () => {
+  const { tmp, origin } = setupRepo();
+  const claude = fakeClaude(tmp, "echo fixed >> README.md\necho '{\"result\": \"Fixed.\"}'");
+  const config = load({ WORKDIR_ROOT: path.join(tmp, 'work'), CLAUDE_CMD: claude, AGENT_TIMEOUT_MIN: '1' }); // NOT dry
+
+  // Pre-create a conflicting commit on the same branch in the origin, so the
+  // first push is rejected (non-fast-forward) and the retry path is taken.
+  const other = path.join(tmp, 'other');
+  await cloneShallow(origin, other);
+  await checkoutNewBranch(other, 'bot/issue-1-typo-in-readme');
+  fs.writeFileSync(path.join(other, 'conflict.txt'), 'x\n');
+  await commitAll(other, 'conflict', 't', 't@example.com');
+  await push(other, origin, '', 'bot/issue-1-typo-in-readme');
+
+  const octokit = fullOctokit(origin);
+  const result = await runJob({ job: job(origin), config, octokit, log: () => {} });
+
+  assert.equal(result.status, 'done');
+  assert.equal(result.prUrl, 'https://example.com/pr/1');
+  assert.deepEqual(octokit.calls.deleteRef, ['heads/bot/issue-1-typo-in-readme']); // stale branch deleted, retried
+  assert.ok(octokit.calls.createComment.some((b) => b.includes('Fixed in PR: https://example.com/pr/1')));
+  assert.deepEqual(octokit.calls.addLabels, [{ owner: 'o', repo: 'r', issue_number: 1, labels: ['bot:done'] }]);
+  const refs = sh(tmp, '--git-dir', origin, 'for-each-ref', '--format=%(refname)').toString();
+  assert.ok(refs.includes('refs/heads/bot/issue-1-typo-in-readme'));
+});
+
+test('verifyChanges catches bad syntax, skips deleted files, runs config commands', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-verify-'));
   fs.writeFileSync(path.join(dir, 'bad.js'), 'function ( {\n');
   fs.writeFileSync(path.join(dir, 'ok.js'), 'console.log(1);\n');
-  const failures = await verifyChanges(load({ VERIFY_COMMANDS: 'exit 3' }), dir, ['bad.js', 'ok.js', 'notes.txt']);
+  const failures = await verifyChanges(load({ VERIFY_COMMANDS: 'exit 3' }), dir, ['bad.js', 'ok.js', 'notes.txt', 'gone.js']);
   assert.equal(failures.length, 2);
   assert.ok(failures[0].includes('bad.js'));
   assert.ok(failures[1].includes('exit 3'));
