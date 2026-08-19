@@ -1099,8 +1099,10 @@ test('runJob skips when a bot PR already exists', async () => {
   assert.equal(result.status, 'skipped');
 });
 
-// Full fake covering the non-dry tail: records every write call.
-function fullOctokit() {
+// Full fake covering the non-dry tail: records every write call. The
+// deleteRef fake models the real side effect — removing the ref from the
+// local bare repo standing in for GitHub — so the retry push succeeds.
+function fullOctokit(origin) {
   const calls = { deleteRef: [], createComment: [], addLabels: [], removeLabel: [], createLabel: [], createPr: [] };
   return {
     calls,
@@ -1121,7 +1123,12 @@ function fullOctokit() {
         removeLabel: async (args) => { calls.removeLabel.push(args); },
         createComment: async (args) => { calls.createComment.push(args.body); },
       },
-      git: { deleteRef: async (args) => { calls.deleteRef.push(args.ref); } },
+      git: {
+        deleteRef: async (args) => {
+          calls.deleteRef.push(args.ref);
+          sh(origin, 'update-ref', '-d', `refs/${args.ref}`);
+        },
+      },
     },
   };
 }
@@ -1140,7 +1147,7 @@ test('runJob retries a conflicting push and runs the real tail (non-dry)', async
   await commitAll(other, 'conflict', 't', 't@example.com');
   await push(other, origin, '', 'bot/issue-1-typo-in-readme');
 
-  const octokit = fullOctokit();
+  const octokit = fullOctokit(origin);
   const result = await runJob({ job: job(origin), config, octokit, log: () => {} });
 
   assert.equal(result.status, 'done');
