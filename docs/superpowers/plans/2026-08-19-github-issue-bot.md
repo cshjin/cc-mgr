@@ -1299,7 +1299,7 @@ Note: ESM allows `import` statements only at the top of the file. **Move the six
 - [ ] **Step 7.4: Run the tests — expect pass**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && node --test test/runner.test.js`
-Expected: PASS — `# pass 11`, `# fail 0` (4 part-1 tests + 7 new). The timeout test takes ~1s.
+Expected: PASS — `# pass 12`, `# fail 0` (5 part-1 tests + 7 new). The timeout test takes ~1s.
 
 - [ ] **Step 7.5: Commit**
 
