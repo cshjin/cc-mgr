@@ -1155,6 +1155,7 @@ test('runJob retries a conflicting push and runs the real tail (non-dry)', async
   assert.deepEqual(octokit.calls.deleteRef, ['heads/bot/issue-1-typo-in-readme']); // stale branch deleted, retried
   assert.ok(octokit.calls.createComment.some((b) => b.includes('Fixed in PR: https://example.com/pr/1')));
   assert.deepEqual(octokit.calls.addLabels, [{ owner: 'o', repo: 'r', issue_number: 1, labels: ['bot:done'] }]);
+  assert.deepEqual(octokit.calls.removeLabel, [{ owner: 'o', repo: 'r', issue_number: 1, name: 'bot:fix' }]); // trigger label removed
   const refs = sh(tmp, '--git-dir', origin, 'for-each-ref', '--format=%(refname)').toString();
   assert.ok(refs.includes('refs/heads/bot/issue-1-typo-in-readme'));
 });
@@ -1326,6 +1327,9 @@ async function fail(job, config, octokit, logPath, reason, log) {
   if (config.dryRun) {
     log(`DRY_RUN: would comment on #${job.issueNumber}: ${body}`);
   } else {
+    // Remove the trigger label FIRST so the bot's own bot:failed label
+    // event cannot re-trigger a duplicate run.
+    await gh.removeLabel(octokit, { owner: job.owner, repo: job.repo, issueNumber: job.issueNumber, name: config.triggerLabel });
     await gh.ensureLabel(octokit, { owner: job.owner, repo: job.repo, name: config.failedLabel });
     await gh.addLabels(octokit, { owner: job.owner, repo: job.repo, issueNumber: job.issueNumber, labels: [config.failedLabel] });
     await gh.addComment(octokit, { owner: job.owner, repo: job.repo, issueNumber: job.issueNumber, body });
@@ -1406,9 +1410,11 @@ export async function runJob({ job, config, octokit, log = () => {} }) {
       head: branch, base: defaultBranch,
       body: `${summary || '(no summary)'}\n\nCloses #${issueNumber}`,
     });
+    // Remove the trigger label BEFORE adding bot:done so the bot's own
+    // labeled event can never re-trigger the issue.
+    await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
     await gh.ensureLabel(octokit, { owner, repo, name: config.doneLabel });
     await gh.addLabels(octokit, { owner, repo, issueNumber, labels: [config.doneLabel] });
-    await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
     await gh.addComment(octokit, { owner, repo, issueNumber, body: `Fixed in PR: ${pr.html_url}\n\n${summary || ''}` });
   } catch (err) {
     if (pr) {
@@ -1416,9 +1422,9 @@ export async function runJob({ job, config, octokit, log = () => {} }) {
       // link so the issue is not left deduped with bot:fix forever.
       log(`#${issueNumber}: PR ${pr.html_url} opened but finishing failed: ${err.message}`);
       try {
+        await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
         await gh.ensureLabel(octokit, { owner, repo, name: config.doneLabel });
         await gh.addLabels(octokit, { owner, repo, issueNumber, labels: [config.doneLabel] });
-        await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
         await gh.addComment(octokit, { owner, repo, issueNumber, body: `Fixed in PR: ${pr.html_url} (finishing steps hit an error: ${err.message})` });
       } catch { /* best effort */ }
       return { status: 'done', summary, prUrl: pr.html_url };
@@ -1553,7 +1559,7 @@ test('reconcile enqueues labeled issues without a bot PR', async () => {
   const logs = [];
   const appOctokit = {
     rest: {
-      repos: { get: async () => ({ data: { clone_url: 'https://github.com/o/r.git', default_branch: 'main' } }) },
+      repos: { get: async () => ({ data: { clone_url: 'https://github.com/o/r.git', default_branch: 'main', owner: { login: 'o' } } }) },
       apps: {
         getRepoInstallation: async () => ({ data: { id: 9 } }),
         createInstallationAccessToken: async () => ({ data: { token: 'tok' } }),
@@ -1561,12 +1567,14 @@ test('reconcile enqueues labeled issues without a bot PR', async () => {
     },
   };
   const octokit = {
+    paginate: async (fn, args) => (await fn(args)).data,
     rest: {
       issues: {
         listForRepo: async () => ({
           data: [
             { number: 1, title: 't1', body: '', user: { login: 'o' } },
             { number: 2, title: 't2', body: '', user: { login: 'o' }, pull_request: {} },
+            { number: 3, title: 't3', body: '', user: { login: 'mallory' } },
           ],
         }),
       },
@@ -1579,8 +1587,19 @@ test('reconcile enqueues labeled issues without a bot PR', async () => {
     appOctokit,
     getInstallationOctokit: async () => octokit,
   });
-  assert.equal(queue.enqueued.length, 1);
+  assert.equal(queue.enqueued.length, 1); // #3 (mallory) filtered by allowlist too
   assert.equal(queue.enqueued[0].id, 'o/r#1');
+});
+
+test('deduped enqueue returns before commenting', async () => {
+  const octokit = fakeOctokit();
+  const logs = [];
+  const queue = { enqueued: [], enqueue() { return false; } };
+  const handlers = createHandlers({ config: load({}), queue, log: (m) => logs.push(m) });
+  await handlers.handleIssueEvent({ payload: payload(), octokit, appOctokit: octokit });
+  assert.equal(queue.enqueued.length, 0);
+  assert.equal(octokit.comments.length, 0);
+  assert.equal(logs.length, 0);
 });
 
 test('reconcile logs and continues when a repo fails', async () => {
@@ -1619,6 +1638,12 @@ import { runJob } from './runner.js';
 import * as gh from './github-helpers.js';
 import { defaultConfig as config } from './config.js';
 
+// Shared allowlist gate: the webhook path AND reconciliation must agree.
+function authorAllowed(config, issue, ownerLogin) {
+  const allowed = config.allowedAuthors.length > 0 ? config.allowedAuthors : [ownerLogin];
+  return allowed.includes(issue.user.login);
+}
+
 export function createHandlers({ config, queue, log = () => {} }) {
   async function handleIssueEvent({ payload, octokit, appOctokit }) {
     const issue = payload.issue;
@@ -1626,18 +1651,11 @@ export function createHandlers({ config, queue, log = () => {} }) {
     const labels = (issue.labels || []).map((l) => l.name);
     if (!labels.includes(config.triggerLabel)) return;
 
-    const allowed = config.allowedAuthors.length > 0
-      ? config.allowedAuthors
-      : [payload.repository.owner.login];
-    if (!allowed.includes(issue.user.login)) {
+    if (!authorAllowed(config, issue, payload.repository.owner.login)) {
       log(`ignoring #${issue.number}: author @${issue.user.login} not in ALLOWED_AUTHORS`);
       return;
     }
 
-    // One-shot push token from the app-level octokit; the agent never sees it.
-    const { data } = await appOctokit.rest.apps.createInstallationAccessToken({
-      installation_id: payload.installation.id,
-    });
     const job = {
       owner: payload.repository.owner.login,
       repo: payload.repository.name,
@@ -1647,15 +1665,28 @@ export function createHandlers({ config, queue, log = () => {} }) {
       author: issue.user.login,
       cloneUrl: payload.repository.clone_url,
       defaultBranch: payload.repository.default_branch,
-      installationToken: data.token,
     };
 
     const id = `${job.owner}/${job.repo}#${job.issueNumber}`;
-    if (!queue.enqueue(id, () => runJob({ job, config, octokit, log }))) return;
+    if (!queue.enqueue(id, async () => {
+      // Token minted lazily at run time (freshest when spent; no mint for
+      // deduped events). The agent never sees it.
+      const { data } = await appOctokit.rest.apps.createInstallationAccessToken({
+        installation_id: payload.installation.id,
+      });
+      return runJob({ job: { ...job, installationToken: data.token }, config, octokit, log });
+    })) return;
 
     log(`enqueued ${id}`);
     if (!config.dryRun) {
-      await gh.addComment(octokit, { ...job, body: "👷 Working on this — I'll open a PR with the fix shortly." });
+      try {
+        await gh.addComment(octokit, {
+          owner: job.owner, repo: job.repo, issueNumber: job.issueNumber,
+          body: "👷 Working on this — I'll open a PR with the fix shortly.",
+        });
+      } catch (err) {
+        log(`started comment failed for ${id}: ${err.message}`); // best-effort
+      }
     }
   }
 
@@ -1663,8 +1694,8 @@ export function createHandlers({ config, queue, log = () => {} }) {
 }
 
 // Startup reconciliation: re-enqueue trigger-labeled issues left over from a
-// crash (only repos listed in REPOS). The runner's own dedup skips anything
-// that already has an open bot PR.
+// crash (only repos listed in REPOS). Applies the same allowlist gate as the
+// webhook path; the runner's own dedup skips anything with an open bot PR.
 export async function reconcile({ config, queue, log = () => {}, appOctokit, getInstallationOctokit }) {
   for (const repoSpec of config.repos) {
     const [owner, repo] = repoSpec.split('/');
@@ -1672,20 +1703,26 @@ export async function reconcile({ config, queue, log = () => {}, appOctokit, get
       const { data: repoData } = await appOctokit.rest.repos.get({ owner, repo });
       const { data: installation } = await appOctokit.rest.apps.getRepoInstallation({ owner, repo });
       const octokit = await getInstallationOctokit(installation.id);
-      const { data: issues } = await octokit.rest.issues.listForRepo({
+      const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
         owner, repo, state: 'open', labels: config.triggerLabel, per_page: 100,
       });
       for (const issue of issues) {
-        if (issue.pull_request) continue;
-        const { data } = await appOctokit.rest.apps.createInstallationAccessToken({ installation_id: installation.id });
-        const job = {
-          owner, repo, issueNumber: issue.number, title: issue.title, body: issue.body || '',
-          author: issue.user.login, cloneUrl: repoData.clone_url, defaultBranch: repoData.default_branch,
-          installationToken: data.token,
-        };
-        const id = `${owner}/${repo}#${issue.number}`;
-        if (!queue.enqueue(id, () => runJob({ job, config, octokit, log }))) continue;
-        log(`reconcile: enqueued ${id}`);
+        try {
+          if (issue.pull_request) continue;
+          if (!authorAllowed(config, issue, repoData.owner.login)) continue;
+          const job = {
+            owner, repo, issueNumber: issue.number, title: issue.title, body: issue.body || '',
+            author: issue.user.login, cloneUrl: repoData.clone_url, defaultBranch: repoData.default_branch,
+          };
+          const id = `${owner}/${repo}#${issue.number}`;
+          if (!queue.enqueue(id, async () => {
+            const { data } = await appOctokit.rest.apps.createInstallationAccessToken({ installation_id: installation.id });
+            return runJob({ job: { ...job, installationToken: data.token }, config, octokit, log });
+          })) continue;
+          log(`reconcile: enqueued ${id}`);
+        } catch (err) {
+          log(`reconcile: ${repoSpec}#${issue.number}: ${err.message}`);
+        }
       }
     } catch (err) {
       log(`reconcile: ${repoSpec}: ${err.message}`);
@@ -1726,7 +1763,7 @@ export default (app) => {
 - [ ] **Step 8.4: Run the tests — expect pass**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && node --test test/index.test.js`
-Expected: PASS — `# pass 6`, `# fail 0`.
+Expected: PASS — `# pass 7`, `# fail 0`.
 
 - [ ] **Step 8.5: Commit**
 
@@ -1936,9 +1973,12 @@ ones: `TRIGGER_LABEL`, `ALLOWED_AUTHORS`, `REPOS`, `CLAUDE_CMD`,
   its default (inside the checkout). For anything beyond the owner-only demo:
   run the bot as a dedicated OS user with a locked-down home, and point
   `WORKDIR_ROOT` outside the checkout (e.g. `/var/lib/cc-mgr-bot/worktrees`).
-- The push token is minted when the job is enqueued and spent when it runs;
-  a queue backlog longer than the token lifetime (~1h) would 401 the push.
-  With concurrency 1 this is rare; a retry re-mints on the next trigger.
+- The push token is minted lazily when the job actually runs (not at
+  enqueue), so it is freshest when spent; a queue backlog longer than the
+  token lifetime (~1h) would still 401 the push — rare with concurrency 1.
+- Never run two bot instances against the same repo: the in-memory dedup is
+  per-process, and two overlapping processes could race on the same branch
+  (the stale-branch retry could delete the other's branch).
 - Verification runs `python -m py_compile` (with a `python3` fallback) and
   `node --check`; the systemd unit's PATH must include both interpreters, or
   add them via `VERIFY_COMMANDS`-style overrides in the env file.
@@ -1991,7 +2031,7 @@ git commit -m "docs(bot): README, env example, systemd units, CLAUDE.md pointer"
 - [ ] **Step 10.1: Run the full check and test suites**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && npm run check && npm test`
-Expected: `node --check` on all six files exits 0; `# pass` total = 38 (4 config + 3 queue + 5 git + 7 helpers + 13 runner + 6 index), `# fail 0`.
+Expected: `node --check` on all six files exits 0; `# pass` total = 39 (4 config + 3 queue + 5 git + 7 helpers + 13 runner + 7 index), `# fail 0`.
 
 - [ ] **Step 10.2: Add the CHANGELOG entry**
 
