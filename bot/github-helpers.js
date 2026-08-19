@@ -1,17 +1,19 @@
 // Thin octokit wrappers for everything the bot does on GitHub, kept free of
-// Probot so the runner and handlers stay testable with fakes.
+// Probot so the runner and handlers stay testable with fakes. Requires an
+// octokit with `.paginate` (Probot's octokit always has it); findBotPr
+// paginates so the dedup gate sees past the first 100 open PRs.
 
 // The open PR by the bot for this issue, identified by branch-name
 // convention (branch = `${branchPrefix}/issue-<n>-<slug>`).
 export async function findBotPr(octokit, { owner, repo, issueNumber, branchPrefix }) {
-  const { data } = await octokit.rest.pulls.list({ owner, repo, state: 'open', per_page: 100 });
+  const data = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
   const prefix = `${branchPrefix}/issue-${issueNumber}-`;
   return data.find((pr) => pr.head.ref.startsWith(prefix)) || null;
 }
 
 export async function listComments(octokit, { owner, repo, issueNumber }) {
   const { data } = await octokit.rest.issues.listComments({ owner, repo, issue_number: issueNumber, per_page: 100 });
-  return data.map((c) => ({ user: c.user.login, body: c.body || '' }));
+  return data.map((c) => ({ user: c.user?.login || 'ghost', body: c.body || '' }));
 }
 
 export async function addComment(octokit, { owner, repo, issueNumber, body }) {
