@@ -1,0 +1,14 @@
+[Unit]
+Description=cc-mgr issue bot (Probot + Claude Code)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hjin/shared/coding/cc-mgr/bot
+EnvironmentFile=/home/hjin/.config/cc-mgr-bot/env
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

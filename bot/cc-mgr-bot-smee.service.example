@@ -1,0 +1,13 @@
+[Unit]
+Description=cc-mgr issue bot smee webhook tunnel
+After=network-online.target
+
+[Service]
+Type=simple
+# Replace YOUR_CHANNEL_ID with the smee channel ID from https://smee.io/new
+ExecStart=/usr/bin/npx smee -u https://smee.io/YOUR_CHANNEL_ID -t http://localhost:3000/api/github/webhooks
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
