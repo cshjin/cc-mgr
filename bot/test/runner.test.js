@@ -22,6 +22,20 @@ test('buildPrompt includes issue content and constraints', () => {
   assert.ok(noComments.includes('(no body)'));
 });
 
+test('buildPrompt fences untrusted data and truncates', () => {
+  const longBody = 'x'.repeat(20000);
+  const longComment = 'y'.repeat(10000);
+  const comments = Array.from({ length: 30 }, (_, i) => ({ user: `u${i}`, body: i === 29 ? longComment : 'c' }));
+  const prompt = buildPrompt({ issueNumber: 1, title: 'T', body: longBody, author: 'a', comments });
+  assert.ok(prompt.includes('<issue_data>'));
+  assert.ok(prompt.includes('</issue_data>'));
+  assert.ok(prompt.includes('(truncated)'));
+  assert.ok(!prompt.includes('y'.repeat(9000))); // long comment clipped to 4000 chars
+  assert.ok(!prompt.includes('u9:')); // only the newest 20 comments embedded
+  assert.ok(prompt.includes('u10:'));
+  assert.ok(prompt.length < 100000); // fits comfortably in one argv (128 KiB cap)
+});
+
 test('parseResult handles json, error flag and raw text', () => {
   assert.deepEqual(
     parseResult('{"type":"result","result":"did the thing"}'),
