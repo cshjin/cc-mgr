@@ -2,6 +2,12 @@
 // PR → issue comment. Every GitHub action goes through github-helpers, and
 // DRY_RUN turns external side effects into log lines, so runJob is testable
 // with fakes and a local git repo. (Task 7 appends verifyChanges/runJob.)
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import * as git from './git.js';
+import * as gh from './github-helpers.js';
 
 export function slugify(text, maxLen = 40) {
   const slug = String(text || '')
@@ -87,4 +93,194 @@ export function claudeEnv(config) {
     if (process.env[name] !== undefined) env[name] = process.env[name];
   }
   return env;
+}
+
+const execFileAsync = promisify(execFile);
+
+// Runs `claude -p <prompt> --output-format json` headless. Enforces the
+// timeout itself (the CLI has no wall-clock timeout flag). Resolves with
+// stdout; stderr is written to logPath.
+export function runClaude(config, prompt, cwd, logPath) {
+  const args = ['-p', prompt, '--output-format', 'json', '--permission-mode', config.permissionMode, ...config.claudeArgs];
+  return new Promise((resolve, reject) => {
+    // detached: the agent may spawn its own children (subprocesses that
+    // inherit its pipes), so the timeout must kill the whole process group —
+    // a SIGTERM to the direct child alone would leave the pipes open and the
+    // promise would never settle. windowsHide keeps detached from opening a
+    // console window on Windows.
+    const child = execFile(config.claudeCmd, args, { cwd, env: claudeEnv(config), detached: true, windowsHide: true });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGTERM'); // whole process group (production)
+        } catch {
+          /* no such group (e.g. setsid unavailable) — fall through */
+        }
+        try {
+          child.kill('SIGTERM'); // at minimum the direct child
+        } catch {
+          /* already gone */
+        }
+      }
+    }, config.agentTimeoutMin * 60 * 1000);
+    // Normalize to Buffers: execFile streams may deliver strings depending on
+    // the Node version, and Buffer.concat needs Buffers (byte-exact).
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const collect = (chunks) => (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    child.stdout.on('data', collect(stdoutChunks));
+    child.stderr.on('data', collect(stderrChunks));
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+      const stderr = Buffer.concat(stderrChunks).toString('utf8');
+      fs.writeFileSync(logPath, stderr, 'utf8');
+      if (code === 0) return resolve(stdout);
+      const err = new Error(timedOut
+        ? `claude timed out after ${config.agentTimeoutMin} min`
+        : `claude exited with code ${code}`);
+      err.stdout = stdout;
+      err.stderr = stderr;
+      err.timedOut = timedOut;
+      reject(err);
+    });
+  });
+}
+
+async function runCheck(cwd, bin, args) {
+  try {
+    await execFileAsync(bin, args, { cwd });
+  } catch (err) {
+    err.stderr = String(err.stderr || err.message || '').slice(-2000);
+    throw err;
+  }
+}
+
+// Static checks per changed file type, plus free-form commands from config.
+// Returns the list of failure strings (empty = all good).
+export async function verifyChanges(config, cwd, files) {
+  const failures = [];
+  for (const file of files) {
+    try {
+      if (file.endsWith('.js')) await runCheck(cwd, 'node', ['--check', file]);
+      else if (file.endsWith('.py')) await runCheck(cwd, 'python', ['-m', 'py_compile', file]);
+    } catch (err) {
+      failures.push(`${file}:\n${err.stderr}`);
+    }
+  }
+  for (const cmd of config.verifyCommands) {
+    try {
+      await runCheck(cwd, '/bin/sh', ['-c', cmd]);
+    } catch (err) {
+      failures.push(`${cmd}:\n${err.stderr}`);
+    }
+  }
+  return failures;
+}
+
+function readTail(filePath, lines) {
+  try {
+    return fs.readFileSync(filePath, 'utf8').split('\n').slice(-lines).join('\n');
+  } catch {
+    return '';
+  }
+}
+
+async function fail(job, config, octokit, logPath, reason, log) {
+  const tail = readTail(logPath, 30);
+  const body = `❌ ${reason}${tail ? `\n\n<details><summary>Log tail</summary>\n\n\`\`\`\n${tail}\n\`\`\`\n</details>` : ''}`;
+  if (config.dryRun) {
+    log(`DRY_RUN: would comment on #${job.issueNumber}: ${body}`);
+  } else {
+    await gh.ensureLabel(octokit, { owner: job.owner, repo: job.repo, name: config.failedLabel });
+    await gh.addLabels(octokit, { owner: job.owner, repo: job.repo, issueNumber: job.issueNumber, labels: [config.failedLabel] });
+    await gh.addComment(octokit, { owner: job.owner, repo: job.repo, issueNumber: job.issueNumber, body });
+  }
+  return { status: 'failed', error: reason };
+}
+
+// The whole agentic job. job = { owner, repo, issueNumber, title, body,
+// author, cloneUrl, defaultBranch, installationToken }.
+export async function runJob({ job, config, octokit, log = () => {} }) {
+  const { owner, repo, issueNumber, title, body, author, cloneUrl, defaultBranch, installationToken } = job;
+  const branch = `${config.branchPrefix}/issue-${issueNumber}-${slugify(title)}`;
+
+  // Authoritative dedup — an open bot PR for this issue means it is handled.
+  if (await gh.findBotPr(octokit, { owner, repo, issueNumber, branchPrefix: config.branchPrefix })) {
+    log(`#${issueNumber}: open PR already exists, skipping`);
+    return { status: 'skipped' };
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const workdir = path.join(config.workdirRoot, `issue-${issueNumber}-${ts}`);
+  const logPath = `${workdir}.log`;
+  fs.mkdirSync(config.workdirRoot, { recursive: true });
+
+  log(`#${issueNumber}: cloning ${cloneUrl}`);
+  await git.cloneShallow(cloneUrl, workdir);
+  await git.checkoutNewBranch(workdir, branch);
+
+  const comments = await gh.listComments(octokit, { owner, repo, issueNumber });
+  const prompt = buildPrompt({ issueNumber, title, body, author, comments });
+
+  log(`#${issueNumber}: running ${config.claudeCmd}`);
+  let stdout;
+  try {
+    stdout = await runClaude(config, prompt, workdir, logPath);
+  } catch (err) {
+    return fail(job, config, octokit, logPath, `Agent run failed: ${err.message}`, log);
+  }
+  const { summary, isError } = parseResult(stdout);
+  if (isError) {
+    return fail(job, config, octokit, logPath, `Agent reported an error:\n\n${summary || '(no details)'}`, log);
+  }
+
+  if (!(await git.hasDiff(workdir))) {
+    return fail(job, config, octokit, logPath, `No changes were made.\n\nAgent summary:\n\n${summary || '(empty)'}`, log);
+  }
+
+  const files = await git.changedFiles(workdir);
+  const verifyFailures = await verifyChanges(config, workdir, files);
+  if (verifyFailures.length > 0) {
+    return fail(job, config, octokit, logPath, `Verification failed:\n\n${verifyFailures.join('\n\n')}`, log);
+  }
+
+  const commitMessage = `fix(issue-${issueNumber}): ${title}`;
+  await git.commitAll(workdir, commitMessage, config.gitName, config.gitEmail);
+
+  if (config.dryRun) {
+    log(`DRY_RUN: would push ${branch}`);
+    log(`DRY_RUN: would open PR "Fix #${issueNumber}: ${title}"`);
+    log(`DRY_RUN: would comment on #${issueNumber} with the summary`);
+    return { status: 'done', summary, dryRun: true };
+  }
+
+  try {
+    await git.push(workdir, cloneUrl, installationToken, branch);
+  } catch (pushErr) {
+    log(`#${issueNumber}: push failed (${pushErr.message}), deleting stale branch and retrying once`);
+    await gh.deleteBranch(octokit, { owner, repo, branch });
+    await git.push(workdir, cloneUrl, installationToken, branch);
+  }
+
+  const pr = await gh.createPr(octokit, {
+    owner, repo,
+    title: `Fix #${issueNumber}: ${title}`,
+    head: branch, base: defaultBranch,
+    body: `${summary || '(no summary)'}\n\nCloses #${issueNumber}`,
+  });
+
+  await gh.ensureLabel(octokit, { owner, repo, name: config.doneLabel });
+  await gh.addLabels(octokit, { owner, repo, issueNumber, labels: [config.doneLabel] });
+  await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
+  await gh.addComment(octokit, { owner, repo, issueNumber, body: `Fixed in PR: ${pr.html_url}\n\n${summary || ''}` });
+
+  log(`#${issueNumber}: PR ${pr.html_url}`);
+  return { status: 'done', summary, prUrl: pr.html_url };
 }
