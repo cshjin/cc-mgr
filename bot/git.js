@@ -33,17 +33,20 @@ export async function hasDiff(cwd) {
   return stdout.trim().length > 0;
 }
 
-// Changed files including untracked ones; resolves "old -> new" rename lines.
+// Changed files including untracked ones. Uses --porcelain -z (NUL-separated
+// records, no C-style quoting) so non-ASCII/quoted filenames survive intact;
+// rename records are "R  <dest>\0<src>\0" — the source path is skipped.
 export async function changedFiles(cwd) {
-  const { stdout } = await run(cwd, ['status', '--porcelain']);
-  return stdout
-    .split('\n')
-    .map((line) => {
-      const rest = line.slice(3).trim();
-      const arrow = rest.lastIndexOf(' -> ');
-      return arrow === -1 ? rest : rest.slice(arrow + 4);
-    })
-    .filter(Boolean);
+  const { stdout } = await run(cwd, ['status', '--porcelain', '-z']);
+  const files = [];
+  const fields = stdout.split('\0');
+  for (let i = 0; i < fields.length; i++) {
+    const f = fields[i];
+    if (f.length < 3 || f[2] !== ' ') continue; // not a record header
+    files.push(f.slice(3));
+    if (f[0] === 'R' || f[0] === 'C') i++; // skip the rename/copy source path
+  }
+  return files;
 }
 
 export function pushUrl(remoteUrl, token) {
@@ -52,6 +55,14 @@ export function pushUrl(remoteUrl, token) {
     : remoteUrl;
 }
 
+// Pushes using the one-shot token embedded only in the push URL. On failure
+// rethrows an error built from stderr only — execFile's default error
+// message echoes the full command line, which would leak the token into logs.
 export async function push(cwd, remoteUrl, token, branch) {
-  return run(cwd, ['push', pushUrl(remoteUrl, token), branch]);
+  try {
+    return await run(cwd, ['push', pushUrl(remoteUrl, token), branch]);
+  } catch (err) {
+    const clean = new Error(String(err.stderr).slice(-2000) || 'git push failed');
+    throw clean;
+  }
 }

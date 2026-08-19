@@ -71,3 +71,35 @@ test('pushUrl embeds token only for https remotes', () => {
   );
   assert.equal(pushUrl('/tmp/x.git', 'tok'), '/tmp/x.git');
 });
+
+test('push failure does not leak the token', async () => {
+  const { tmp, origin } = setup();
+  const cloneDir = path.join(tmp, 'clone');
+  await cloneShallow(origin, cloneDir);
+  await checkoutNewBranch(cloneDir, 'bot/issue-3-x');
+  fs.writeFileSync(path.join(cloneDir, 'change.txt'), 'x\n');
+  await commitAll(cloneDir, 'fix', 'bot[bot]', 'bot@example.com');
+  // Unreachable https remote: push must reject, and neither the error
+  // message nor stderr may contain the token.
+  await assert.rejects(
+    () => push(cloneDir, 'https://127.0.0.1:1/never.git', 'ghs_supersecrettoken', 'bot/issue-3-x'),
+    (err) => {
+      const text = `${err.message || ''} ${err.stderr || ''}`;
+      assert.ok(!text.includes('ghs_supersecrettoken'));
+      return true;
+    }
+  );
+});
+
+test('changedFiles handles unicode, quoted, and renamed filenames', async () => {
+  const { tmp, origin } = setup();
+  const cloneDir = path.join(tmp, 'clone');
+  await cloneShallow(origin, cloneDir);
+  fs.writeFileSync(path.join(cloneDir, 'café.txt'), 'x\n');
+  fs.writeFileSync(path.join(cloneDir, 'b"q.txt'), 'x\n');
+  sh(cloneDir, 'mv', 'a.txt', 'sp ace.txt');
+  const files = await changedFiles(cloneDir);
+  assert.ok(files.includes('café.txt'));
+  assert.ok(files.includes('b"q.txt'));
+  assert.ok(files.includes('sp ace.txt'));
+});
