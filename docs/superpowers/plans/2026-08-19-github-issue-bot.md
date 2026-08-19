@@ -1130,16 +1130,21 @@ const execFileAsync = promisify(execFile);
 export function runClaude(config, prompt, cwd, logPath) {
   const args = ['-p', prompt, '--output-format', 'json', '--permission-mode', config.permissionMode, ...config.claudeArgs];
   return new Promise((resolve, reject) => {
-    const child = execFile(config.claudeCmd, args, { cwd, env: claudeEnv(config) });
+    // detached: give claude its own process group so the timeout kill takes
+    // down hung grandchildren too (a live child holding the stdio pipes
+    // would otherwise keep 'close' from ever firing).
+    const child = execFile(config.claudeCmd, args, { cwd, env: claudeEnv(config), detached: true, windowsHide: true });
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
+      try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill('SIGTERM'); }
     }, config.agentTimeoutMin * 60 * 1000);
     const stdoutChunks = [];
     const stderrChunks = [];
-    child.stdout.on('data', (chunk) => stdoutChunks.push(chunk));
-    child.stderr.on('data', (chunk) => stderrChunks.push(chunk));
+    // execFile streams emit strings on some Node versions — normalize.
+    const push = (chunks) => (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    child.stdout.on('data', push(stdoutChunks));
+    child.stderr.on('data', push(stderrChunks));
     child.on('error', (err) => {
       clearTimeout(timer);
       reject(err);
@@ -1299,7 +1304,7 @@ Note: ESM allows `import` statements only at the top of the file. **Move the six
 - [ ] **Step 7.4: Run the tests — expect pass**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && node --test test/runner.test.js`
-Expected: PASS — `# pass 12`, `# fail 0` (5 part-1 tests + 7 new). The timeout test takes ~1s.
+Expected: PASS — `# pass 12`, `# fail 0` (5 part-1 tests + 7 new). The timeout test takes ~1s on a normal host (up to ~5s where setsid is blocked, e.g. sandboxes — the direct-child kill fallback fires; the test only asserts the error message).
 
 - [ ] **Step 7.5: Commit**
 
