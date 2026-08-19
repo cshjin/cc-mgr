@@ -422,6 +422,38 @@ test('pushUrl embeds token only for https remotes', () => {
   );
   assert.equal(pushUrl('/tmp/x.git', 'tok'), '/tmp/x.git');
 });
+
+test('push failure does not leak the token', async () => {
+  const { tmp, origin } = setup();
+  const cloneDir = path.join(tmp, 'clone');
+  await cloneShallow(origin, cloneDir);
+  await checkoutNewBranch(cloneDir, 'bot/issue-3-x');
+  fs.writeFileSync(path.join(cloneDir, 'change.txt'), 'x\n');
+  await commitAll(cloneDir, 'fix', 'bot[bot]', 'bot@example.com');
+  // Unreachable https remote: push must reject, and neither the error
+  // message nor stderr may contain the token.
+  await assert.rejects(
+    () => push(cloneDir, 'https://127.0.0.1:1/never.git', 'ghs_supersecrettoken', 'bot/issue-3-x'),
+    (err) => {
+      const text = `${err.message || ''} ${err.stderr || ''}`;
+      assert.ok(!text.includes('ghs_supersecrettoken'));
+      return true;
+    }
+  );
+});
+
+test('changedFiles handles unicode, quoted, and renamed filenames', async () => {
+  const { tmp, origin } = setup();
+  const cloneDir = path.join(tmp, 'clone');
+  await cloneShallow(origin, cloneDir);
+  fs.writeFileSync(path.join(cloneDir, 'café.txt'), 'x\n');
+  fs.writeFileSync(path.join(cloneDir, 'b"q.txt'), 'x\n');
+  sh(cloneDir, 'mv', 'a.txt', 'sp ace.txt');
+  const files = await changedFiles(cloneDir);
+  assert.ok(files.includes('café.txt'));
+  assert.ok(files.includes('b"q.txt'));
+  assert.ok(files.includes('sp ace.txt'));
+});
 ```
 
 - [ ] **Step 4.2: Run it — expect failure**
@@ -467,17 +499,20 @@ export async function hasDiff(cwd) {
   return stdout.trim().length > 0;
 }
 
-// Changed files including untracked ones; resolves "old -> new" rename lines.
+// Changed files including untracked ones. Uses --porcelain -z (NUL-separated
+// records, no C-style quoting) so non-ASCII/quoted filenames survive intact;
+// rename records are "R  <dest>\0<src>\0" — the source path is skipped.
 export async function changedFiles(cwd) {
-  const { stdout } = await run(cwd, ['status', '--porcelain']);
-  return stdout
-    .split('\n')
-    .map((line) => {
-      const rest = line.slice(3).trim();
-      const arrow = rest.lastIndexOf(' -> ');
-      return arrow === -1 ? rest : rest.slice(arrow + 4);
-    })
-    .filter(Boolean);
+  const { stdout } = await run(cwd, ['status', '--porcelain', '-z']);
+  const files = [];
+  const fields = stdout.split('\0');
+  for (let i = 0; i < fields.length; i++) {
+    const f = fields[i];
+    if (f.length < 3 || f[2] !== ' ') continue; // not a record header
+    files.push(f.slice(3));
+    if (f[0] === 'R' || f[0] === 'C') i++; // skip the rename/copy source path
+  }
+  return files;
 }
 
 export function pushUrl(remoteUrl, token) {
@@ -486,15 +521,23 @@ export function pushUrl(remoteUrl, token) {
     : remoteUrl;
 }
 
+// Pushes using the one-shot token embedded only in the push URL. On failure
+// rethrows an error built from stderr only — execFile's default error
+// message echoes the full command line, which would leak the token into logs.
 export async function push(cwd, remoteUrl, token, branch) {
-  return run(cwd, ['push', pushUrl(remoteUrl, token), branch]);
+  try {
+    return await run(cwd, ['push', pushUrl(remoteUrl, token), branch]);
+  } catch (err) {
+    const clean = new Error(String(err.stderr).slice(-2000) || 'git push failed');
+    throw clean;
+  }
 }
 ```
 
 - [ ] **Step 4.4: Run the test — expect pass**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && node --test test/git.test.js`
-Expected: PASS — `# pass 3`, `# fail 0`.
+Expected: PASS — `# pass 5`, `# fail 0`.
 
 - [ ] **Step 4.5: Commit**
 
@@ -1729,7 +1772,7 @@ git commit -m "docs(bot): README, env example, systemd units, CLAUDE.md pointer"
 - [ ] **Step 10.1: Run the full check and test suites**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && npm run check && npm test`
-Expected: `node --check` on all six files exits 0; `# pass` total = 33 (4 config + 3 queue + 3 git + 6 helpers + 11 runner + 6 index), `# fail 0`.
+Expected: `node --check` on all six files exits 0; `# pass` total = 35 (4 config + 3 queue + 5 git + 6 helpers + 11 runner + 6 index), `# fail 0`.
 
 - [ ] **Step 10.2: Add the CHANGELOG entry**
 
