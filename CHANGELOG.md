@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.0 — 2026-08-19
+
+- GitHub issue bot (`bot/`): label-triggered agentic auto-fix via headless
+  Claude Code, delivered as a PR for review (Probot + smee, self-hosted,
+  config-driven, DRY_RUN mode).
+
 ## v0.3.0 — 2026-06-18
 
 - Multi-agent support: browse and search Claude, Gemini, Codex, and Copilot from
