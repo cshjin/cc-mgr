@@ -18,7 +18,10 @@ export function load(env = process.env) {
     claudeArgs: (env.CLAUDE_ARGS || '').split(/\s+/).filter(Boolean),
     permissionMode: env.CLAUDE_PERMISSION_MODE || 'bypassPermissions',
     claudeEnvExtra: list(env.CLAUDE_ENV_EXTRA),
-    agentTimeoutMin: Number(env.AGENT_TIMEOUT_MIN || 30),
+    agentTimeoutMin: (() => {
+      const n = Number(env.AGENT_TIMEOUT_MIN || 30);
+      return Number.isFinite(n) && n > 0 ? n : 30;
+    })(),
     verifyCommands: (env.VERIFY_COMMANDS || '').split('\n').map((s) => s.trim()).filter(Boolean),
     branchPrefix: env.BRANCH_PREFIX || 'bot',
     gitName: env.BOT_GIT_NAME || 'cc-mgr-bot[bot]',

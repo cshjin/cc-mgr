@@ -25,6 +25,7 @@ test('defaults', () => {
 
 test('overrides and list parsing', () => {
   const c = load({
+    WORKDIR_ROOT: '/tmp/w',
     TRIGGER_LABEL: 'x:fix',
     ALLOWED_AUTHORS: 'alice, bob ,',
     AGENT_TIMEOUT_MIN: '5',
@@ -35,6 +36,7 @@ test('overrides and list parsing', () => {
     VERIFY_COMMANDS: '\necho ok\n npm test \n',
   });
   assert.equal(c.triggerLabel, 'x:fix');
+  assert.equal(c.workdirRoot, path.resolve('/tmp/w'));
   assert.deepEqual(c.allowedAuthors, ['alice', 'bob']);
   assert.equal(c.agentTimeoutMin, 5);
   assert.equal(c.dryRun, true);
@@ -42,6 +44,13 @@ test('overrides and list parsing', () => {
   assert.deepEqual(c.claudeEnvExtra, ['FOO', 'BAR']);
   assert.deepEqual(c.repos, ['cshjin/cc-mgr']);
   assert.deepEqual(c.verifyCommands, ['echo ok', 'npm test']);
+});
+
+test('agentTimeoutMin falls back to 30 for invalid values', () => {
+  assert.equal(load({ AGENT_TIMEOUT_MIN: 'abc' }).agentTimeoutMin, 30);
+  assert.equal(load({ AGENT_TIMEOUT_MIN: '0' }).agentTimeoutMin, 30);
+  assert.equal(load({ AGENT_TIMEOUT_MIN: '-5' }).agentTimeoutMin, 30);
+  assert.equal(load({ AGENT_TIMEOUT_MIN: '15' }).agentTimeoutMin, 15);
 });
 
 test('list helper', () => {
