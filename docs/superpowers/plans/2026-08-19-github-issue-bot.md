@@ -562,7 +562,7 @@ Create `bot/test/github-helpers.test.js`:
 ```js
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findBotPr, ensureLabel, removeLabel, deleteBranch, listComments } from '../github-helpers.js';
+import { findBotPr, ensureLabel, removeLabel, deleteBranch, listComments, addComment, createPr, addLabels } from '../github-helpers.js';
 
 const mkErr = (status) => {
   const err = new Error('nope');
@@ -570,13 +570,17 @@ const mkErr = (status) => {
   return err;
 };
 
+const paginate = async (fn, args) => (await fn(args)).data;
+
 test('findBotPr matches the branch prefix for the issue', async () => {
   const octokit = {
+    paginate,
     rest: {
       pulls: {
         list: async () => ({
           data: [
             { head: { ref: 'bot/issue-1-fix-typo' } },
+            { head: { ref: 'bot/issue-10-other' } },
             { head: { ref: 'bot/issue-2-other' } },
             { head: { ref: 'someone/pr' } },
           ],
@@ -589,7 +593,7 @@ test('findBotPr matches the branch prefix for the issue', async () => {
 });
 
 test('findBotPr returns null when nothing matches', async () => {
-  const octokit = { rest: { pulls: { list: async () => ({ data: [] }) } } };
+  const octokit = { paginate, rest: { pulls: { list: async () => ({ data: [] }) } } };
   assert.equal(await findBotPr(octokit, { owner: 'o', repo: 'r', issueNumber: 3, branchPrefix: 'bot' }), null);
 });
 
@@ -631,7 +635,7 @@ test('removeLabel and deleteBranch swallow the expected missing errors', async (
   );
 });
 
-test('listComments maps to {user, body}', async () => {
+test('listComments maps to {user, body}, null user becomes ghost', async () => {
   const octokit = {
     rest: {
       issues: {
@@ -639,6 +643,7 @@ test('listComments maps to {user, body}', async () => {
           data: [
             { user: { login: 'alice' }, body: 'hi' },
             { user: { login: 'bob' }, body: null },
+            { user: null, body: 'deleted account' },
           ],
         }),
       },
@@ -647,7 +652,32 @@ test('listComments maps to {user, body}', async () => {
   assert.deepEqual(await listComments(octokit, { owner: 'o', repo: 'r', issueNumber: 1 }), [
     { user: 'alice', body: 'hi' },
     { user: 'bob', body: '' },
+    { user: 'ghost', body: 'deleted account' },
   ]);
+});
+
+test('pass-through helpers send the exact API payloads', async () => {
+  const calls = [];
+  const octokit = {
+    rest: {
+      issues: {
+        createComment: async (args) => { calls.push(['createComment', args]); },
+        addLabels: async (args) => { calls.push(['addLabels', args]); },
+      },
+      pulls: {
+        create: async (args) => {
+          calls.push(['create', args]);
+          return { data: { html_url: 'https://example/pr' } };
+        },
+      },
+    },
+  };
+  await addComment(octokit, { owner: 'o', repo: 'r', issueNumber: 1, body: 'hi' });
+  await createPr(octokit, { owner: 'o', repo: 'r', title: 't', head: 'h', base: 'main', body: 'b' });
+  await addLabels(octokit, { owner: 'o', repo: 'r', issueNumber: 1, labels: ['bot:done'] });
+  assert.deepEqual(calls[0], ['createComment', { owner: 'o', repo: 'r', issue_number: 1, body: 'hi' }]);
+  assert.deepEqual(calls[1], ['create', { owner: 'o', repo: 'r', title: 't', head: 'h', base: 'main', body: 'b' }]);
+  assert.deepEqual(calls[2], ['addLabels', { owner: 'o', repo: 'r', issue_number: 1, labels: ['bot:done'] }]);
 });
 ```
 
@@ -663,16 +693,17 @@ Expected: FAIL — `Cannot find module '../github-helpers.js'`.
 // Probot so the runner and handlers stay testable with fakes.
 
 // The open PR by the bot for this issue, identified by branch-name
-// convention (branch = `${branchPrefix}/issue-<n>-<slug>`).
+// convention (branch = `${branchPrefix}/issue-<n>-<slug>`). Uses paginate so
+// repos with >100 open PRs cannot hide the match on a later page.
 export async function findBotPr(octokit, { owner, repo, issueNumber, branchPrefix }) {
-  const { data } = await octokit.rest.pulls.list({ owner, repo, state: 'open', per_page: 100 });
+  const data = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
   const prefix = `${branchPrefix}/issue-${issueNumber}-`;
   return data.find((pr) => pr.head.ref.startsWith(prefix)) || null;
 }
 
 export async function listComments(octokit, { owner, repo, issueNumber }) {
   const { data } = await octokit.rest.issues.listComments({ owner, repo, issue_number: issueNumber, per_page: 100 });
-  return data.map((c) => ({ user: c.user.login, body: c.body || '' }));
+  return data.map((c) => ({ user: c.user?.login || 'ghost', body: c.body || '' }));
 }
 
 export async function addComment(octokit, { owner, repo, issueNumber, body }) {
@@ -718,7 +749,7 @@ export async function deleteBranch(octokit, { owner, repo, branch }) {
 - [ ] **Step 5.4: Run the test — expect pass**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && node --test test/github-helpers.test.js`
-Expected: PASS — `# pass 6`, `# fail 0`.
+Expected: PASS — `# pass 7`, `# fail 0`.
 
 - [ ] **Step 5.5: Commit**
 
@@ -949,6 +980,7 @@ function dryConfig(tmp, claudeCmd) {
 // Octokit fake covering everything runJob touches in dry-run mode.
 function dryOctokit() {
   return {
+    paginate: async (fn, args) => (await fn(args)).data,
     rest: {
       pulls: { list: async () => ({ data: [] }) },
       issues: { listComments: async () => ({ data: [] }) },
@@ -1772,7 +1804,7 @@ git commit -m "docs(bot): README, env example, systemd units, CLAUDE.md pointer"
 - [ ] **Step 10.1: Run the full check and test suites**
 
 Run: `cd /home/hjin/shared/coding/cc-mgr/bot && npm run check && npm test`
-Expected: `node --check` on all six files exits 0; `# pass` total = 35 (4 config + 3 queue + 5 git + 6 helpers + 11 runner + 6 index), `# fail 0`.
+Expected: `node --check` on all six files exits 0; `# pass` total = 36 (4 config + 3 queue + 5 git + 7 helpers + 11 runner + 6 index), `# fail 0`.
 
 - [ ] **Step 10.2: Add the CHANGELOG entry**
 
