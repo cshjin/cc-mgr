@@ -238,6 +238,7 @@ test('runJob retries a conflicting push and runs the real tail (non-dry)', async
   assert.deepEqual(octokit.calls.deleteRef, ['heads/bot/issue-1-typo-in-readme']); // stale branch deleted, retried
   assert.ok(octokit.calls.createComment.some((b) => b.includes('Fixed in PR: https://example.com/pr/1')));
   assert.deepEqual(octokit.calls.addLabels, [{ owner: 'o', repo: 'r', issue_number: 1, labels: ['bot:done'] }]);
+  assert.deepEqual(octokit.calls.removeLabel, [{ owner: 'o', repo: 'r', issue_number: 1, name: 'bot:fix' }]); // trigger label removed
   const refs = sh(tmp, '--git-dir', origin, 'for-each-ref', '--format=%(refname)').toString();
   assert.ok(refs.includes('refs/heads/bot/issue-1-typo-in-readme'));
 });

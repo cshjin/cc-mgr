@@ -235,6 +235,9 @@ async function fail(job, config, octokit, logPath, reason, log) {
   if (config.dryRun) {
     log(`DRY_RUN: would comment on #${job.issueNumber}: ${body}`);
   } else {
+    // Remove the trigger label FIRST so the bot's own bot:failed label
+    // event cannot re-trigger a duplicate run.
+    await gh.removeLabel(octokit, { owner: job.owner, repo: job.repo, issueNumber: job.issueNumber, name: config.triggerLabel });
     await gh.ensureLabel(octokit, { owner: job.owner, repo: job.repo, name: config.failedLabel });
     await gh.addLabels(octokit, { owner: job.owner, repo: job.repo, issueNumber: job.issueNumber, labels: [config.failedLabel] });
     await gh.addComment(octokit, { owner: job.owner, repo: job.repo, issueNumber: job.issueNumber, body });
@@ -315,9 +318,11 @@ export async function runJob({ job, config, octokit, log = () => {} }) {
       head: branch, base: defaultBranch,
       body: `${summary || '(no summary)'}\n\nCloses #${issueNumber}`,
     });
+    // Remove the trigger label first: the bot's own bot:done label event
+    // must never observe bot:fix still present.
+    await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
     await gh.ensureLabel(octokit, { owner, repo, name: config.doneLabel });
     await gh.addLabels(octokit, { owner, repo, issueNumber, labels: [config.doneLabel] });
-    await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
     await gh.addComment(octokit, { owner, repo, issueNumber, body: `Fixed in PR: ${pr.html_url}\n\n${summary || ''}` });
   } catch (err) {
     if (pr) {
@@ -325,9 +330,9 @@ export async function runJob({ job, config, octokit, log = () => {} }) {
       // link so the issue is not left deduped with bot:fix forever.
       log(`#${issueNumber}: PR ${pr.html_url} opened but finishing failed: ${err.message}`);
       try {
+        await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
         await gh.ensureLabel(octokit, { owner, repo, name: config.doneLabel });
         await gh.addLabels(octokit, { owner, repo, issueNumber, labels: [config.doneLabel] });
-        await gh.removeLabel(octokit, { owner, repo, issueNumber, name: config.triggerLabel });
         await gh.addComment(octokit, { owner, repo, issueNumber, body: `Fixed in PR: ${pr.html_url} (finishing steps hit an error: ${err.message})` });
       } catch { /* best effort */ }
       return { status: 'done', summary, prUrl: pr.html_url };

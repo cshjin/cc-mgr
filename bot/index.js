@@ -6,6 +6,12 @@ import { runJob } from './runner.js';
 import * as gh from './github-helpers.js';
 import { defaultConfig as config } from './config.js';
 
+// Shared allowlist gate: the webhook path AND reconciliation must agree.
+function authorAllowed(config, issue, ownerLogin) {
+  const allowed = config.allowedAuthors.length > 0 ? config.allowedAuthors : [ownerLogin];
+  return allowed.includes(issue.user.login);
+}
+
 export function createHandlers({ config, queue, log = () => {} }) {
   async function handleIssueEvent({ payload, octokit, appOctokit }) {
     const issue = payload.issue;
@@ -13,18 +19,11 @@ export function createHandlers({ config, queue, log = () => {} }) {
     const labels = (issue.labels || []).map((l) => l.name);
     if (!labels.includes(config.triggerLabel)) return;
 
-    const allowed = config.allowedAuthors.length > 0
-      ? config.allowedAuthors
-      : [payload.repository.owner.login];
-    if (!allowed.includes(issue.user.login)) {
+    if (!authorAllowed(config, issue, payload.repository.owner.login)) {
       log(`ignoring #${issue.number}: author @${issue.user.login} not in ALLOWED_AUTHORS`);
       return;
     }
 
-    // One-shot push token from the app-level octokit; the agent never sees it.
-    const { data } = await appOctokit.rest.apps.createInstallationAccessToken({
-      installation_id: payload.installation.id,
-    });
     const job = {
       owner: payload.repository.owner.login,
       repo: payload.repository.name,
@@ -34,15 +33,28 @@ export function createHandlers({ config, queue, log = () => {} }) {
       author: issue.user.login,
       cloneUrl: payload.repository.clone_url,
       defaultBranch: payload.repository.default_branch,
-      installationToken: data.token,
     };
 
     const id = `${job.owner}/${job.repo}#${job.issueNumber}`;
-    if (!queue.enqueue(id, () => runJob({ job, config, octokit, log }))) return;
+    if (!queue.enqueue(id, async () => {
+      // Token minted lazily at run time (freshest when spent; no mint for
+      // deduped events). The agent never sees it.
+      const { data } = await appOctokit.rest.apps.createInstallationAccessToken({
+        installation_id: payload.installation.id,
+      });
+      return runJob({ job: { ...job, installationToken: data.token }, config, octokit, log });
+    })) return;
 
     log(`enqueued ${id}`);
     if (!config.dryRun) {
-      await gh.addComment(octokit, { ...job, body: "👷 Working on this — I'll open a PR with the fix shortly." });
+      try {
+        await gh.addComment(octokit, {
+          owner: job.owner, repo: job.repo, issueNumber: job.issueNumber,
+          body: "👷 Working on this — I'll open a PR with the fix shortly.",
+        });
+      } catch (err) {
+        log(`started comment failed for ${id}: ${err.message}`); // best-effort
+      }
     }
   }
 
@@ -50,8 +62,8 @@ export function createHandlers({ config, queue, log = () => {} }) {
 }
 
 // Startup reconciliation: re-enqueue trigger-labeled issues left over from a
-// crash (only repos listed in REPOS). The runner's own dedup skips anything
-// that already has an open bot PR.
+// crash (only repos listed in REPOS). Applies the same allowlist gate as the
+// webhook path; the runner's own dedup skips anything with an open bot PR.
 export async function reconcile({ config, queue, log = () => {}, appOctokit, getInstallationOctokit }) {
   for (const repoSpec of config.repos) {
     const [owner, repo] = repoSpec.split('/');
@@ -59,20 +71,26 @@ export async function reconcile({ config, queue, log = () => {}, appOctokit, get
       const { data: repoData } = await appOctokit.rest.repos.get({ owner, repo });
       const { data: installation } = await appOctokit.rest.apps.getRepoInstallation({ owner, repo });
       const octokit = await getInstallationOctokit(installation.id);
-      const { data: issues } = await octokit.rest.issues.listForRepo({
+      const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
         owner, repo, state: 'open', labels: config.triggerLabel, per_page: 100,
       });
       for (const issue of issues) {
-        if (issue.pull_request) continue;
-        const { data } = await appOctokit.rest.apps.createInstallationAccessToken({ installation_id: installation.id });
-        const job = {
-          owner, repo, issueNumber: issue.number, title: issue.title, body: issue.body || '',
-          author: issue.user.login, cloneUrl: repoData.clone_url, defaultBranch: repoData.default_branch,
-          installationToken: data.token,
-        };
-        const id = `${owner}/${repo}#${issue.number}`;
-        if (!queue.enqueue(id, () => runJob({ job, config, octokit, log }))) continue;
-        log(`reconcile: enqueued ${id}`);
+        try {
+          if (issue.pull_request) continue;
+          if (!authorAllowed(config, issue, repoData.owner.login)) continue;
+          const job = {
+            owner, repo, issueNumber: issue.number, title: issue.title, body: issue.body || '',
+            author: issue.user.login, cloneUrl: repoData.clone_url, defaultBranch: repoData.default_branch,
+          };
+          const id = `${owner}/${repo}#${issue.number}`;
+          if (!queue.enqueue(id, async () => {
+            const { data } = await appOctokit.rest.apps.createInstallationAccessToken({ installation_id: installation.id });
+            return runJob({ job: { ...job, installationToken: data.token }, config, octokit, log });
+          })) continue;
+          log(`reconcile: enqueued ${id}`);
+        } catch (err) {
+          log(`reconcile: ${repoSpec}#${issue.number}: ${err.message}`);
+        }
       }
     } catch (err) {
       log(`reconcile: ${repoSpec}: ${err.message}`);
