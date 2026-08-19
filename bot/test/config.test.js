@@ -19,6 +19,8 @@ test('defaults', () => {
   assert.equal(c.dryRun, false);
   assert.equal(c.workdirRoot, path.resolve(path.join('..', 'data', 'bot-worktrees')));
   assert.equal(c.gitName, 'cc-mgr-bot[bot]');
+  assert.equal(c.gitEmail, 'cc-mgr-bot[bot]@users.noreply.github.com');
+  assert.deepEqual(c.claudeEnvExtra, []);
 });
 
 test('overrides and list parsing', () => {
