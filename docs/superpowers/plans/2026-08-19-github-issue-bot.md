@@ -396,7 +396,7 @@ test('clone, branch, commit, diff, changedFiles', async () => {
   await commitAll(cloneDir, 'fix(issue-1): test', 'bot[bot]', 'bot@example.com');
   assert.equal(await hasDiff(cloneDir), false);
   assert.equal(
-    sh(cloneDir, 'log', '--format=%an <%ae> %s').toString().trim(),
+    sh(cloneDir, 'log', '-1', '--format=%an <%ae> %s').toString().trim(),
     'bot[bot] <bot@example.com> fix(issue-1): test'
   );
 });
