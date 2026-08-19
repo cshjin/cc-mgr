@@ -10,7 +10,7 @@
   "scripts": {
     "start": "probot run ./index.js",
     "check": "node --check index.js && node --check config.js && node --check queue.js && node --check git.js && node --check github-helpers.js && node --check runner.js",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {
     "probot": "^14.3.2"
