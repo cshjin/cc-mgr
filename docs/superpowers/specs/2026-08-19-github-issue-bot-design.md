@@ -82,7 +82,7 @@ bot restart are not lost.
    - Runs optional verify commands (default: `node --check frontend/app.js` and
      `python -m py_compile` on changed `.py` files).
    - Commits, pushes the branch, opens a PR (title `Fix #<n>: <title>`, body =
-     agent summary + diff stat + `Closes #<n>`).
+     agent summary + `Closes #<n>`).
 4. Comments on the issue: summary + PR link. Moves the label: `bot:fix` →
    `bot:done`.
 5. The issue author reviews the PR; merging closes the issue via `Closes #<n>`.
