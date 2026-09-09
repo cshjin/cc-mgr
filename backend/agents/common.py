@@ -165,3 +165,4 @@ class SessionSummary:
     open_tasks: int = 0
     total_tasks: int = 0
     agent: str = "claude"
+    title: str = ""

@@ -91,6 +91,8 @@ def _register(adapter: AgentAdapter) -> None:
 
 
 def get_adapter(agent_id: str | None) -> AgentAdapter:
+    if agent_id == "antigravity":
+        agent_id = "agy"
     return _REGISTRY.get(agent_id or "claude", _REGISTRY["claude"])
 
 
@@ -104,11 +106,13 @@ def list_agents() -> list[dict[str, Any]]:
 
 # Import + register concrete adapters (after class defs to avoid cycles).
 from .claude import ClaudeAdapter      # noqa: E402
+from .agy import AgyAdapter            # noqa: E402
 from .gemini import GeminiAdapter      # noqa: E402
 from .codex import CodexAdapter        # noqa: E402
 from .copilot import CopilotAdapter    # noqa: E402
 
 _register(ClaudeAdapter())
+_register(AgyAdapter())
 _register(GeminiAdapter())
 _register(CodexAdapter())
 _register(CopilotAdapter())

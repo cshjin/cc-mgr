@@ -210,6 +210,7 @@ class SessionSummary:
     has_memory: bool = False
     open_tasks: int = 0
     total_tasks: int = 0
+    title: str = ""
 
 
 def list_projects() -> list[dict[str, Any]]:

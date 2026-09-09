@@ -5,17 +5,24 @@ from backend.app import app
 client = TestClient(app)
 
 
-def test_agents_endpoint_lists_four(claude_home):
+def test_agents_endpoint_lists_known(claude_home):
     r = client.get("/api/agents")
     assert r.status_code == 200
     ids = {a["agent_id"] for a in r.json()}
-    assert ids == {"claude", "gemini", "codex", "copilot"}
+    assert ids == {"claude", "gemini", "codex", "copilot", "agy"}
 
 
 def test_projects_default_claude(claude_home):
     r = client.get("/api/projects")
     assert r.status_code == 200
     assert len(r.json()) == 1
+
+
+def test_projects_agy(agy_home):
+    r = client.get("/api/projects", params={"agent": "agy"})
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+    assert "repo_agy" in r.json()[0]["cwd"]
 
 
 def test_projects_gemini(gemini_home, claude_home):

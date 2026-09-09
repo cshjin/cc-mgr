@@ -51,16 +51,16 @@ Three layers, all under `backend/` + `frontend/`:
 - **`backend/agents/`** — the multi-agent layer (v0.3.0). `AgentAdapter` (ABC) +
   `Capabilities` + a registry in `__init__.py`; `common.py` holds agent-neutral
   helpers (`SessionSummary`, jsonl iter, context tiers, git info, path-guarded doc
-  read/write). One adapter per agent: `claude.py` (delegates to `store.py`, full
-  features), `gemini.py`, `codex.py`, `copilot.py`. `get_adapter(agent_id)` returns
-  the adapter (defaults to claude); `all_adapters()` / `list_agents()` enumerate.
+  read/write). Adapters: `claude.py` (delegates to `store.py`, full
+  features), `agy.py` (Antigravity CLI: full browsing, memory/artifacts, export, delete),
+  `gemini.py`, `codex.py`, `copilot.py`. `get_adapter(agent_id)` returns
+  the adapter (defaults to claude; supports "antigravity" alias for "agy");
+  `all_adapters()` / `list_agents()` enumerate.
   **Only the transcript parser truly differs per agent** — paths, doc filename, and
-  capability flags are data on each adapter. Non-Claude adapters implement only
+  capability flags are data on each adapter. Non-Claude/non-agy adapters implement only
   read + `get_doc`/`save_doc`; the base raises `UnsupportedCapability` for
-  tasks/memory/export/delete (mapped to HTTP 404 in `app.py`). The real on-disk
-  formats are documented in `docs/ISSUES-v0.3.0.md` — **Gemini and Codex are NOT
-  Claude-shaped** (Gemini = bare top-level turn records + a `$set` prelude; Codex =
-  `{type,payload}` envelopes with `response_item`/`message` + `function_call*`).
+  unsupported operations (mapped to HTTP 404 in `app.py`). The real on-disk
+  formats are documented in `docs/ISSUES-v0.3.0.md`.
 - **`backend/index_db.py`** — SQLite + FTS5 full-text index over every conversation
   turn (`turns`/`turns_fts`) **and** every project's memory files + root doc
   (`docs`/`docs_fts`), across **all agents**. A **rebuildable cache** at
@@ -105,8 +105,14 @@ Three layers, all under `backend/` + `frontend/`:
 - `~/.claude/tasks/<session-uuid>/N.json` — tasks `{id, subject, status, blocks,
   blockedBy, owner, metadata}`, keyed by session, separate from the projects tree.
 
-### Other agents (v0.3.0) — verified against real data, see `docs/ISSUES-v0.3.0.md`
+### Other agents — verified against real data, see `docs/ISSUES-v0.3.0.md`
 
+- **Antigravity CLI (`agy`)** (`$AGY_HOME` / `$ANTIGRAVITY_HOME` or `~/.gemini/antigravity-cli`):
+  sessions under `brain/<conversation-id>/.system_generated/logs/transcript.jsonl`.
+  Artifacts under `brain/<conversation-id>/*.md` surfaced in Memory tab. Session metadata
+  from `conversation_summaries.db` (title, preview, workspace_uris) and `history.jsonl`
+  (workspace mapping fallback). Full support for browsing, memory, export to Markdown, and
+  soft/hard deletion. Doc: `GEMINI.md` / `AGENTS.md`.
 - **Gemini** (`$GEMINI_HOME` or `~/.gemini`): projects under `tmp/<project>/`, true
   cwd from `tmp/<project>/.project_root` (fallback `history/<project>/.project_root`,
   non-lossy). Sessions: `tmp/<project>/chats/session-*.jsonl`. **The conversation is

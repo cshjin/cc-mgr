@@ -178,7 +178,7 @@ function renderProjects() {
     }
     return `
       <div class="project ${p.name === state.activeProject ? "active" : ""}" data-name="${esc(p.name)}">
-        <div class="pname">${esc(p.name)}</div>
+        <div class="pname" title="${esc(p.display_path || p.name)}">${esc(p.display_path || p.name)}</div>
         <div class="ptime">${p.session_count} session${p.session_count === 1 ? "" : "s"} · ${fmtTime(p.mtime)}</div>
         <div class="pbadges">${git}${mem}${cmd}${task}</div>
         ${prog}
@@ -321,7 +321,7 @@ function renderSessions() {
     return `
       <div class="session ${s.session_id === state.activeSession ? "active" : ""}" data-id="${esc(s.session_id)}">
         <div class="session-head">
-          <span class="session-id">${esc(s.session_id.slice(0, 8))}</span>
+          <span class="session-id" title="${esc(s.session_id)}">${esc(s.title || s.session_id.slice(0, 8))}</span>
           <span class="session-time">${fmtTime(s.mtime)}</span>
         </div>
         <div class="session-prompt ${state.showPrompts ? "" : "hidden"}">${esc(s.last_prompt || s.first_prompt || "(no prompt)")}</div>
@@ -430,7 +430,7 @@ function renderDetailShell() {
   pane.innerHTML = `
     <div class="detail-head">
       <span class="dclose" id="dclose">×</span>
-      <div class="dtitle">${esc(s ? s.session_id.slice(0, 8) : "")}</div>
+      <div class="dtitle" title="${esc(s ? s.session_id : '')}">${esc(s ? (s.title || s.session_id.slice(0, 8)) : "")}</div>
       <div class="dmeta">${esc(s ? (s.git_branch || "") : "")} ${s ? fmtTokens(s.context_tokens) + " tok" : ""}</div>
       <div class="dactions">
         ${caps.can_export ? '<button class="dbtn" id="exportBtn">⬇ Export .md</button>' : ""}

@@ -132,3 +132,85 @@ def copilot_home(tmp_path, monkeypatch):
     (home / "ide").mkdir(parents=True)
     monkeypatch.setenv("COPILOT_HOME", str(home))
     return home
+
+
+@pytest.fixture
+def agy_home(tmp_path, monkeypatch):
+    import sqlite3
+    home = tmp_path / "antigravity-cli"
+    cwd = tmp_path / "repo_agy"
+    cwd.mkdir()
+    (cwd / "GEMINI.md").write_text("# AGY project doc\ndelta\n", encoding="utf-8")
+
+    cid = "11111111-2222-3333-4444-555555555555"
+    brain_dir = home / "brain" / cid / ".system_generated" / "logs"
+    brain_dir.mkdir(parents=True)
+    transcript = brain_dir / "transcript.jsonl"
+    _write_jsonl(transcript, [
+        {
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "created_at": "2026-09-01T10:00:00Z",
+            "content": "<USER_REQUEST>\nhello agy\n</USER_REQUEST>",
+        },
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-09-01T10:00:01Z",
+            "thinking": "analyzing user request",
+            "content": "hello from agy",
+            "tool_calls": [{"name": "list_dir", "args": {"DirectoryPath": f'"{str(cwd)}"'}}],
+        },
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "created_at": "2026-09-01T10:00:02Z",
+            "content": '{"name": "GEMINI.md"}',
+        },
+    ])
+
+    # Artifact file in brain
+    (home / "brain" / cid / "report.md").write_text("# Report\nsome findings\n", encoding="utf-8")
+
+    # history.jsonl
+    (home / "history.jsonl").write_text(
+        json.dumps({
+            "display": "hello agy",
+            "timestamp": 1779822449094,
+            "workspace": str(cwd),
+            "conversationId": cid,
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    # conversation_summaries.db
+    db_file = home / "conversation_summaries.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "CREATE TABLE conversation_summaries ("
+        "conversation_id text PRIMARY KEY, title text, preview text, step_count integer, "
+        "last_modified_time datetime, workspace_uris text, status text, source text, "
+        "project_id text, agent_name text, parent_conversation_id text, nesting_depth integer, "
+        "battle_id text, winning_conversation_id text, not_fully_idle numeric, killed numeric, "
+        "last_user_input_time datetime, last_user_input_step_index integer, app_data_dir text, "
+        "raw_summary BLOB)"
+    )
+    conn.execute(
+        "INSERT INTO conversation_summaries (conversation_id, title, preview, step_count, "
+        "last_modified_time, workspace_uris) VALUES (?, ?, ?, ?, ?, ?)",
+        (cid, "Test AGY Title", "hello agy", 3, "2026-09-01 10:00:02", json.dumps([f"file://{str(cwd)}"])),
+    )
+    conn.commit()
+    conn.close()
+
+    # settings.json
+    (home / "settings.json").write_text(
+        json.dumps({"model": "Gemini 3.8 Flash (High)", "trustedWorkspaces": [str(cwd)]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("AGY_HOME", str(home))
+    return home

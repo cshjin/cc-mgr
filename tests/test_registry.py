@@ -5,9 +5,9 @@ from backend.agents import (
 )
 
 
-def test_list_agents_returns_four_known_ids():
+def test_list_agents_returns_known_ids():
     ids = {a["agent_id"] for a in list_agents()}
-    assert ids == {"claude", "gemini", "codex", "copilot"}
+    assert ids == {"claude", "gemini", "codex", "copilot", "agy"}
 
 
 def test_get_adapter_defaults_to_claude_on_unknown():
@@ -17,6 +17,10 @@ def test_get_adapter_defaults_to_claude_on_unknown():
 
 def test_get_adapter_none_defaults_to_claude():
     assert get_adapter(None).capabilities.agent_id == "claude"
+
+
+def test_get_adapter_antigravity_alias():
+    assert get_adapter("antigravity").capabilities.agent_id == "agy"
 
 
 def test_capabilities_shape():
