@@ -9,7 +9,7 @@ def test_agents_endpoint_lists_known(claude_home):
     r = client.get("/api/agents")
     assert r.status_code == 200
     ids = {a["agent_id"] for a in r.json()}
-    assert ids == {"claude", "gemini", "codex", "copilot", "agy"}
+    assert ids == {"claude", "gemini", "codex", "copilot", "agy", "opencode"}
 
 
 def test_projects_default_claude(claude_home):
@@ -23,6 +23,13 @@ def test_projects_agy(agy_home):
     assert r.status_code == 200
     assert len(r.json()) == 1
     assert "repo_agy" in r.json()[0]["cwd"]
+
+
+def test_projects_opencode(opencode_home):
+    r = client.get("/api/projects", params={"agent": "opencode"})
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+    assert "repo_opencode" in r.json()[0]["cwd"]
 
 
 def test_projects_gemini(gemini_home, claude_home):

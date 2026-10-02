@@ -7,7 +7,7 @@ from backend.agents import (
 
 def test_list_agents_returns_known_ids():
     ids = {a["agent_id"] for a in list_agents()}
-    assert ids == {"claude", "gemini", "codex", "copilot", "agy"}
+    assert ids == {"claude", "gemini", "codex", "copilot", "agy", "opencode"}
 
 
 def test_get_adapter_defaults_to_claude_on_unknown():
@@ -21,6 +21,11 @@ def test_get_adapter_none_defaults_to_claude():
 
 def test_get_adapter_antigravity_alias():
     assert get_adapter("antigravity").capabilities.agent_id == "agy"
+
+
+def test_get_adapter_opencode_alias():
+    assert get_adapter("open-code").capabilities.agent_id == "opencode"
+    assert get_adapter("opencode").capabilities.agent_id == "opencode"
 
 
 def test_capabilities_shape():
