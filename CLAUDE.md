@@ -127,6 +127,11 @@ Three layers, all under `backend/` + `frontend/`:
   developer; content parts `input_text`/`output_text`) / `function_call` /
   `function_call_output`; context = `last_token_usage.total_tokens` (NOT the
   cumulative `total_token_usage`). Doc: `AGENTS.md`.
+- **OpenCode (`opencode`)** (`$OPENCODE_DB`, `$XDG_DATA_HOME/opencode/opencode.db`, `$OPENCODE_BASE/share/opencode/opencode.db`, or `~/.local/share/opencode/opencode.db`):
+  SQLite database with Drizzle ORM schema. Sessions under `session` table grouped by `directory`
+  (cwd). Turns parsed from `message` + `part` tables (`part.type` ∈ `text`, `reasoning` → thinking,
+  `tool` → tool_use + tool_result, `file`, `patch`). Full task support via `todo` table mapped to Kanban
+  board. Project doc: `AGENTS.md`. Supports Markdown export, soft (archive) and hard deletion.
 - **Copilot** (`$COPILOT_HOME` or `~/.copilot`): no CLI history on this machine yet —
   adapter is empty-but-valid (reads `history/<mangled-cwd>/*.jsonl` if present).
   Format UNVERIFIED; revalidate if real data appears. Doc: `AGENTS.md`.

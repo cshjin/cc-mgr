@@ -5,6 +5,7 @@ resolve into the tmp tree instead of the real ~/. No real user data touched.
 """
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -214,3 +215,136 @@ def agy_home(tmp_path, monkeypatch):
 
     monkeypatch.setenv("AGY_HOME", str(home))
     return home
+
+
+@pytest.fixture
+def opencode_home(tmp_path, monkeypatch):
+    home = tmp_path / "opencode"
+    home.mkdir(parents=True, exist_ok=True)
+    cwd = tmp_path / "repo_opencode"
+    cwd.mkdir(parents=True, exist_ok=True)
+    (cwd / "AGENTS.md").write_text("# OpenCode project doc\ngamma\n", encoding="utf-8")
+
+    db_file = home / "opencode.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute("""
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            parent_id TEXT,
+            slug TEXT,
+            directory TEXT,
+            title TEXT,
+            version TEXT,
+            share_url TEXT,
+            summary_additions INTEGER,
+            summary_deletions INTEGER,
+            summary_files INTEGER,
+            summary_diffs TEXT,
+            revert TEXT,
+            permission TEXT,
+            time_created INTEGER,
+            time_updated INTEGER,
+            time_compacting INTEGER,
+            time_archived INTEGER,
+            workspace_id TEXT,
+            path TEXT,
+            agent TEXT,
+            model TEXT,
+            cost REAL,
+            tokens_input INTEGER,
+            tokens_output INTEGER,
+            tokens_reasoning INTEGER,
+            tokens_cache_read INTEGER,
+            tokens_cache_write INTEGER,
+            metadata TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT,
+            time_created INTEGER,
+            time_updated INTEGER,
+            data TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY,
+            message_id TEXT,
+            session_id TEXT,
+            time_created INTEGER,
+            time_updated INTEGER,
+            data TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE todo (
+            session_id TEXT,
+            content TEXT,
+            status TEXT,
+            priority TEXT,
+            position INTEGER,
+            time_created INTEGER,
+            time_updated INTEGER
+        )
+    """)
+
+    sid = "ses_test_1"
+    now_ms = 1780000000000
+    conn.execute(
+        "INSERT INTO session (id, directory, title, model, tokens_input, tokens_output, time_created, time_updated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (sid, str(cwd), "Test OpenCode Title", '{"id":"test-model"}', 100, 50, now_ms, now_ms + 1000),
+    )
+
+    m1_id = "msg_u1"
+    m2_id = "msg_a1"
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+        (m1_id, sid, now_ms, json.dumps({"role": "user", "time": {"created": now_ms}})),
+    )
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+        (m2_id, sid, now_ms + 500, json.dumps({
+            "role": "assistant",
+            "modelID": "test-model",
+            "tokens": {"input": 100, "output": 50},
+            "time": {"created": now_ms + 500},
+        })),
+    )
+
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)",
+        ("prt_1", m1_id, sid, now_ms, json.dumps({"type": "text", "text": "hello opencode"})),
+    )
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)",
+        ("prt_2", m2_id, sid, now_ms + 510, json.dumps({"type": "reasoning", "text": "thinking..."})),
+    )
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)",
+        ("prt_3", m2_id, sid, now_ms + 520, json.dumps({"type": "text", "text": "hi from opencode"})),
+    )
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?, ?, ?, ?, ?)",
+        ("prt_4", m2_id, sid, now_ms + 530, json.dumps({
+            "type": "tool",
+            "tool": "bash",
+            "state": {"status": "completed", "input": {"command": "ls"}, "output": "file.txt"},
+        })),
+    )
+
+    conn.execute(
+        "INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (sid, "test task 1", "pending", "high", 0, now_ms, now_ms),
+    )
+
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("OPENCODE_DB", str(db_file))
+    return home
+
