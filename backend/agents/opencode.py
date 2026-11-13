@@ -1,24 +1,41 @@
-"""OpencodeAdapter — OpenCode CLI (opencode.ai) sessions and projects.
+"""OpencodeAdapter — OpenCode (opencode.ai) sessions from its SQLite database.
 
-Real on-disk format for OpenCode:
-  - Database: opencode.db (SQLite with Drizzle ORM)
-    * Location priority:
-      1. OPENCODE_DB environment variable
-      2. $XDG_DATA_HOME/opencode/opencode.db
-      3. $OPENCODE_BASE/share/opencode/opencode.db
-      4. ~/.local/share/opencode/opencode.db
-      5. `opencode db path` CLI lookup
-  - Tables:
-    * `session`: id, project_id, directory (cwd), title, model, tokens_*, cost, time_created, time_updated, time_archived
-    * `message`: id, session_id, time_created, time_updated, data (JSON: role, model, tokens, etc.)
-    * `part`: id, message_id, session_id, time_created, data (JSON: type ∈ text, reasoning, tool, file, patch, step-*)
-    * `todo`: session_id, content, status (pending/in_progress/completed), priority, position
-    * `project`: id, worktree, name, time_created, time_updated
-  - Documentation:
-    * Project instruction doc: AGENTS.md in project working directory
+Database location (first hit wins):
+  1. $OPENCODE_DB
+  2. $XDG_DATA_HOME/opencode/opencode.db
+  3. $OPENCODE_BASE/share/opencode/opencode.db
+  4. ~/.local/share/opencode/opencode.db
+  5. the `db` line of `opencode debug paths` (OpenCode v2; `opencode db path`
+     no longer exists)
+
+Schemas (verified against real data, OpenCode 2.2.7):
+  v2  `session_v2` (one row per session; `parent_id` is set for subagent runs)
+      and `session_message(id, session_id, type, seq, data)`, ordered by `seq`:
+        user        {text, files[{name, mime, data}]}
+        assistant   {model{id,…}, content[], tokens{input, output, reasoning,
+                     cache{read, write}}}; content parts are inlined:
+                     reasoning{text} · text{text} · tool{name, state{status,
+                     input, content[{type: text|file}] | error{message}}}
+        compaction  {summary, reason, tokens} · synthetic / system {text}
+        shell       {command, exit, output{output}}
+        model-switched / location-switched / idle — bookkeeping
+      `session_part` exists but is empty today; it is read as a fallback for an
+      assistant message's content.
+  v1  `session`, `message` (data.role, data.tokens), `part` (data.type: text,
+      reasoning, tool{tool, state.output}, file, patch, step-finish), `todo`.
+  v2 migrated every v1 session into session_v2 (same ids), so once session_v2
+  exists it is the only source of sessions. `todo` has no v2 equivalent (v2 has
+  no todo tool); it still supplies read-only tasks for old sessions.
+
+Writes: on a v2 database that the local `opencode` CLI manages, archive and
+delete go through OpenCode itself (`opencode api session.update`,
+`opencode session delete`). Any other v2 database is read-only — raw SQL into
+a DB owned by a running v2 server would bypass its bookkeeping. Legacy
+v1-only databases keep the direct-SQL behaviour.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -26,56 +43,92 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
     SessionSummary, connect_sqlite_ro, context_limit_for, default_export_dir,
-    is_safe_id, read_doc_file, read_git_info, save_doc_file, block_text,
+    is_safe_id, read_doc_file, read_git_info, save_doc_file,
 )
 
 
+# ---------------------------------------------------------------------------
+# Locating the database / talking to the CLI
+# ---------------------------------------------------------------------------
+
+def _opencode_cli() -> str | None:
+    return shutil.which("opencode")
+
+
+@functools.lru_cache(maxsize=1)
+def _cli_paths() -> dict[str, str]:
+    """`opencode debug paths` as {name: path}; {} if the CLI is unavailable."""
+    cli = _opencode_cli()
+    if not cli:
+        return {}
+    try:
+        proc = subprocess.run([cli, "debug", "paths"], capture_output=True, text=True,
+                              timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    paths: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        name, _, value = line.strip().partition(" ")
+        if name and value.strip():
+            paths[name] = value.strip()
+    return paths
+
+
 def opencode_db_path() -> Path | None:
-    """Locate OpenCode SQLite database file."""
-    # 1. Environment variable OPENCODE_DB
+    """Locate OpenCode's SQLite database (order in the module docstring)."""
+    candidates: list[Path] = []
     env_db = os.environ.get("OPENCODE_DB")
     if env_db:
-        p = Path(env_db).expanduser()
-        if p.is_file():
-            return p
-
-    # 2. XDG_DATA_HOME
+        candidates.append(Path(env_db).expanduser())
     xdg_data = os.environ.get("XDG_DATA_HOME")
     if xdg_data:
-        p = Path(xdg_data).expanduser() / "opencode" / "opencode.db"
-        if p.is_file():
-            return p
-
-    # 3. OPENCODE_BASE
+        candidates.append(Path(xdg_data).expanduser() / "opencode" / "opencode.db")
     base = os.environ.get("OPENCODE_BASE")
     if base:
-        p = Path(base).expanduser() / "share" / "opencode" / "opencode.db"
+        candidates.append(Path(base).expanduser() / "share" / "opencode" / "opencode.db")
+    candidates.append(Path.home() / ".local" / "share" / "opencode" / "opencode.db")
+    for p in candidates:
         if p.is_file():
             return p
-
-    # 4. Standard default ~/.local/share/opencode/opencode.db
-    default_p = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
-    if default_p.is_file():
-        return default_p
-
-    # 5. CLI fallback
-    try:
-        proc = subprocess.run(["opencode", "db", "path"], capture_output=True, text=True, timeout=2)
-        if proc.returncode == 0:
-            out = proc.stdout.strip()
-            if out:
-                p = Path(out).expanduser()
-                if p.is_file():
-                    return p
-    except Exception:
-        pass
-
+    cli_db = _cli_paths().get("db")
+    if cli_db and Path(cli_db).expanduser().is_file():
+        return Path(cli_db).expanduser()
     return None
+
+
+def _is_cli_managed(db_file: Path) -> bool:
+    """True if db_file is the database the local `opencode` CLI/service uses."""
+    cli_db = _cli_paths().get("db")
+    if not cli_db:
+        return False
+    try:
+        return Path(cli_db).expanduser().resolve() == Path(db_file).resolve()
+    except OSError:
+        return False
+
+
+def _run_opencode(args: list[str]) -> None:
+    """Run `opencode <args>`; raise RuntimeError with its message on failure."""
+    cli = _opencode_cli()
+    if not cli:
+        raise UnsupportedCapability("the `opencode` CLI is not available")
+    what = " ".join(args[:2])
+    try:
+        proc = subprocess.run([cli, *args], capture_output=True, text=True,
+                              timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"`opencode {what}` failed: {e}") from e
+    if proc.returncode != 0:
+        lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise RuntimeError(f"`opencode {what}` failed: "
+                           f"{lines[-1] if lines else f'exit {proc.returncode}'}")
 
 
 def _connect_ro(db_file: Path) -> sqlite3.Connection:
@@ -84,20 +137,68 @@ def _connect_ro(db_file: Path) -> sqlite3.Connection:
 
 
 def _connect_rw(db_file: Path) -> sqlite3.Connection:
-    """Connect to SQLite database in read-write mode."""
+    """Read-write connection (legacy v1-only databases)."""
     conn = sqlite3.connect(db_file, timeout=5.0)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                        (name,)).fetchone() is not None
+
+
+def _is_v2(conn: sqlite3.Connection) -> bool:
+    return _has_table(conn, "session_v2") and _has_table(conn, "session_message")
+
+
+def _session_table(conn: sqlite3.Connection) -> str:
+    return "session_v2" if _is_v2(conn) else "session"
+
+
+# ---------------------------------------------------------------------------
+# Small parsing helpers
+# ---------------------------------------------------------------------------
+
 def _mangle(cwd: str) -> str:
     return cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
 
 
-def _unmangle_path(name: str) -> str:
-    if "--" in name:
-        name = name.replace("--", ":/", 1)
-    return name.replace("-", "/")
+def _json(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ms_to_iso(ms: Any) -> str:
+    if not ms:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(ms) / 1000.0, timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+def _context_from_tokens(tokens: Any) -> int:
+    """Live context of one turn: input + cache read/write + output."""
+    t = _json(tokens)
+    if not t:
+        return 0
+    cache = t.get("cache") if isinstance(t.get("cache"), dict) else {}
+    total = (_int(t.get("input")) + _int(t.get("output"))
+             + _int(cache.get("read")) + _int(cache.get("write")))
+    return total or _int(t.get("total"))
 
 
 def _format_model_name(model_raw: Any) -> str:
@@ -106,123 +207,308 @@ def _format_model_name(model_raw: Any) -> str:
     if isinstance(model_raw, str):
         try:
             m_dict = json.loads(model_raw)
-            if isinstance(m_dict, dict):
-                return m_dict.get("id") or m_dict.get("modelID") or model_raw
-        except Exception:
+        except (TypeError, ValueError):
             return model_raw
-    elif isinstance(model_raw, dict):
+        if isinstance(m_dict, dict):
+            return m_dict.get("id") or m_dict.get("modelID") or ""
+        return model_raw
+    if isinstance(model_raw, dict):
         return model_raw.get("id") or model_raw.get("modelID") or ""
     return str(model_raw)
 
 
-def _parse_session_turns(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
-    """Parse messages and parts for a session into normalized turns."""
-    msgs = conn.execute(
-        "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC",
-        (session_id,),
-    ).fetchall()
+def _file_label(f: dict[str, Any]) -> str:
+    """Name an attachment without ever echoing inline base64 / data: URIs."""
+    name = f.get("filename") or f.get("name") or f.get("path")
+    uri = f.get("url") or f.get("uri") or ""
+    if not name and isinstance(uri, str) and uri and not uri.startswith("data:"):
+        name = uri
+    mime = f.get("mime") or ""
+    if name and mime:
+        return f"{name} ({mime})"
+    return str(name or mime or "file")
 
-    parts_rows = conn.execute(
-        "SELECT id, message_id, time_created, data FROM part WHERE session_id = ? ORDER BY time_created ASC, id ASC",
-        (session_id,),
-    ).fetchall()
 
-    parts_by_msg: dict[str, list[dict[str, Any]]] = {}
-    for pr in parts_rows:
-        try:
-            p_data = json.loads(pr["data"])
-            parts_by_msg.setdefault(pr["message_id"], []).append(p_data)
-        except Exception:
-            continue
-
-    turns: list[dict[str, Any]] = []
-
-    for m in msgs:
-        mid = m["id"]
-        try:
-            m_data = json.loads(m["data"])
-        except Exception:
-            m_data = {}
-
-        role = m_data.get("role") or "user"
-        norm_role = "user" if role == "user" else "assistant"
-
-        ts_ms = m["time_created"] or (m_data.get("time") or {}).get("created")
-        ts_str = ""
-        if ts_ms:
-            try:
-                ts_str = datetime.fromtimestamp(ts_ms / 1000.0, timezone.utc).isoformat()
-            except Exception:
-                pass
-
-        tokens_info = m_data.get("tokens") or {}
-        out_tokens = tokens_info.get("output", 0) if isinstance(tokens_info, dict) else 0
-        model_name = _format_model_name(m_data.get("modelID") or m_data.get("model"))
-
-        blocks: list[dict[str, Any]] = []
-        msg_parts = parts_by_msg.get(mid, [])
-        has_text_or_reasoning = False
-
-        for p in msg_parts:
-            ptype = p.get("type")
-            if ptype == "text":
-                txt = p.get("text", "")
-                if txt:
-                    blocks.append({"type": "text", "text": txt})
-                    has_text_or_reasoning = True
-            elif ptype == "reasoning":
-                reasoning_txt = p.get("text", "")
-                if reasoning_txt:
-                    blocks.append({"type": "thinking", "text": reasoning_txt})
-                    has_text_or_reasoning = True
-            elif ptype == "tool":
-                tool_name = p.get("tool", "")
-                state = p.get("state") or {}
-                tool_inp = state.get("input") or {}
-                blocks.append({"type": "tool_use", "name": tool_name, "input": tool_inp})
-
-                tool_out = state.get("output")
-                if tool_out is not None:
-                    out_str = tool_out if isinstance(tool_out, str) else json.dumps(tool_out, ensure_ascii=False)
-                    blocks.append({"type": "tool_result", "text": out_str})
-            elif ptype == "file":
-                fname = p.get("filename") or ""
-                url = p.get("url") or ""
-                blocks.append({"type": "text", "text": f"[Attachment: {fname or url}]"})
-            elif ptype == "patch":
-                files = p.get("files") or []
-                if files:
-                    blocks.append({"type": "text", "text": f"[Modified files: {', '.join(files)}]"})
-            elif ptype == "step-finish":
-                sf_tokens = p.get("tokens") or {}
-                if not out_tokens and isinstance(sf_tokens, dict):
-                    out_tokens = sf_tokens.get("output", 0)
-
-        if not blocks:
-            summary = m_data.get("summary")
-            if summary and isinstance(summary, str):
-                blocks.append({"type": "text", "text": summary})
-            else:
+def _tool_result_text(state: dict[str, Any]) -> str | None:
+    if state.get("status") == "error" or state.get("error"):
+        err = state.get("error")
+        msg = err.get("message") if isinstance(err, dict) else err
+        return f"Error: {msg}" if msg else "Error"
+    out = state.get("output")  # v1
+    if out is not None:
+        return out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+    content = state.get("content")  # v2
+    if isinstance(content, list):
+        pieces = []
+        for c in content:
+            if not isinstance(c, dict):
                 continue
+            if c.get("type") == "text":
+                pieces.append(c.get("text") or "")
+            elif c.get("type") == "file":
+                pieces.append(f"[file: {_file_label(c)}]")
+        return "\n".join(pieces)
+    return None
 
-        if norm_role == "assistant":
-            kind = "assistant" if has_text_or_reasoning else "tool"
-        else:
-            kind = "user"
 
-        turns.append({
-            "uuid": mid,
-            "role": norm_role,
-            "kind": kind,
-            "timestamp": ts_str,
-            "model": model_name,
-            "blocks": blocks,
-            "attribution_skill": None,
-            "attribution_plugin": None,
-            "output_tokens": out_tokens,
-        })
+def _content_blocks(parts: Iterable[Any]) -> tuple[list[dict[str, Any]], bool]:
+    """Normalize OpenCode parts (v1 rows or v2 inline content) into blocks.
 
+    Returns (blocks, has_text) where has_text means text or reasoning exists.
+    """
+    blocks: list[dict[str, Any]] = []
+    has_text = False
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        ptype = p.get("type")
+        if ptype == "text":
+            if p.get("text"):
+                blocks.append({"type": "text", "text": p["text"]})
+                has_text = True
+        elif ptype == "reasoning":
+            if p.get("text"):
+                blocks.append({"type": "thinking", "text": p["text"]})
+                has_text = True
+        elif ptype == "tool":
+            state = p.get("state") if isinstance(p.get("state"), dict) else {}
+            blocks.append({"type": "tool_use", "name": p.get("name") or p.get("tool") or "",
+                           "input": state.get("input") or {}})
+            result = _tool_result_text(state)
+            if result is not None:
+                blocks.append({"type": "tool_result", "text": result})
+        elif ptype == "file":
+            blocks.append({"type": "text", "text": f"[Attachment: {_file_label(p)}]"})
+        elif ptype == "patch":
+            files = p.get("files") or []
+            if files:
+                blocks.append({"type": "text",
+                               "text": f"[Modified files: {', '.join(map(str, files))}]"})
+    return blocks, has_text
+
+
+def _turn(uuid: str, role: str, kind: str, timestamp: str, blocks: list[dict[str, Any]],
+          model: str = "", output_tokens: int = 0) -> dict[str, Any]:
+    return {"uuid": uuid, "role": role, "kind": kind, "timestamp": timestamp,
+            "model": model, "blocks": blocks, "attribution_skill": None,
+            "attribution_plugin": None, "output_tokens": output_tokens}
+
+
+def _chunks(seq: list[str], size: int = 500) -> Iterator[list[str]]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+# ---------------------------------------------------------------------------
+# v2: session_v2 + session_message
+# ---------------------------------------------------------------------------
+
+def _v2_turn(mid: str, mtype: str, data: dict[str, Any], created_ms: Any,
+             extra_parts: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    ts = _ms_to_iso(created_ms or (data.get("time") or {}).get("created"))
+    if mtype == "user":
+        blocks = [{"type": "text", "text": data["text"]}] if data.get("text") else []
+        for f in data.get("files") or []:
+            if isinstance(f, dict):
+                blocks.append({"type": "text", "text": f"[Attachment: {_file_label(f)}]"})
+        return _turn(mid, "user", "user", ts, blocks) if blocks else None
+    if mtype == "assistant":
+        blocks, has_text = _content_blocks(data.get("content") or extra_parts or [])
+        if not blocks and data.get("error"):
+            err = data["error"]
+            msg = err.get("message") if isinstance(err, dict) else err
+            blocks, has_text = [{"type": "text", "text": f"[error] {msg or err}"}], True
+        if not blocks:
+            return None
+        tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+        return _turn(mid, "assistant", "assistant" if has_text else "tool", ts, blocks,
+                     _format_model_name(data.get("model")), _int(tokens.get("output")))
+    if mtype == "compaction":
+        if not data.get("summary"):
+            return None
+        text = f"[compaction · {data.get('reason') or 'auto'}]\n{data['summary']}"
+        return _turn(mid, "system", "system", ts, [{"type": "text", "text": text}])
+    if mtype in ("synthetic", "system"):
+        text = data.get("text") or data.get("description")
+        return _turn(mid, "system", "system", ts, [{"type": "text", "text": text}]) if text else None
+    if mtype == "shell":
+        out = data.get("output")
+        out_text = out.get("output") if isinstance(out, dict) else out
+        blocks = [{"type": "tool_use", "name": "shell", "input": {"command": data.get("command", "")}}]
+        if out_text is not None or data.get("exit") is not None:
+            text = str(out_text or "")
+            if data.get("exit") not in (None, 0):
+                text += f"\n[exit {data['exit']}]"
+            blocks.append({"type": "tool_result", "text": text})
+        return _turn(mid, "user", "tool", ts, blocks)
+    if mtype == "model-switched":
+        new = _format_model_name(data.get("model")) or "?"
+        old = _format_model_name(data.get("previous")) or "?"
+        return _turn(mid, "system", "system", ts, [{"type": "text", "text": f"[model] {old} → {new}"}])
+    if mtype == "location-switched":
+        new = (data.get("location") or {}).get("directory") or "?"
+        old = ((data.get("previous") or {}).get("location") or {}).get("directory") or "?"
+        return _turn(mid, "system", "system", ts, [{"type": "text", "text": f"[directory] {old} → {new}"}])
+    return None  # idle and other bookkeeping
+
+
+def _v2_turns(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    parts_by_msg: dict[str, list[dict[str, Any]]] = {}
+    if _has_table(conn, "session_part"):
+        for pr in conn.execute(
+                "SELECT message_id, type, data FROM session_part WHERE session_id = ? "
+                "ORDER BY message_id, ordinal", (session_id,)):
+            part = dict(_json(pr["data"]))
+            part.setdefault("type", pr["type"])
+            parts_by_msg.setdefault(pr["message_id"], []).append(part)
+    turns = []
+    for r in conn.execute(
+            "SELECT id, type, time_created, data FROM session_message WHERE session_id = ? "
+            "ORDER BY seq", (session_id,)):
+        turn = _v2_turn(r["id"], r["type"], _json(r["data"]), r["time_created"],
+                        parts_by_msg.get(r["id"]))
+        if turn:
+            turns.append(turn)
     return turns
+
+
+def _v2_session_stats(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dict[str, Any]]:
+    stats = {sid: {"prompts": [], "user": 0, "assistant": 0, "context": 0, "peak": 0,
+                   "model": ""} for sid in ids}
+    for chunk in _chunks(ids):
+        ph = ",".join("?" * len(chunk))
+        for r in conn.execute(
+                f"SELECT session_id, json_extract(data, '$.text') AS text FROM session_message "
+                f"WHERE session_id IN ({ph}) AND type = 'user' ORDER BY session_id, seq", chunk):
+            text = (r["text"] or "").strip()
+            if text:
+                stats[r["session_id"]]["prompts"].append(text[:500])
+        for r in conn.execute(
+                f"SELECT session_id, type, COUNT(*) AS n FROM session_message "
+                f"WHERE session_id IN ({ph}) AND type IN ('user', 'assistant') "
+                f"GROUP BY session_id, type", chunk):
+            stats[r["session_id"]][r["type"]] = r["n"]
+        # A compaction row records the context size when it was compacted, so a
+        # proven tier survives the drop in live context afterwards.
+        for r in conn.execute(
+                f"SELECT session_id, json_extract(data, '$.tokens') AS tokens FROM session_message "
+                f"WHERE session_id IN ({ph}) AND type = 'compaction'", chunk):
+            st = stats[r["session_id"]]
+            st["peak"] = max(st["peak"], _context_from_tokens(r["tokens"]))
+    # Live context = the newest assistant turn that has finished (has tokens).
+    # Reading every turn's tokens costs seconds on big sessions; the newest few
+    # rows come straight off the (session_id, type, seq) index.
+    for sid in ids:
+        st = stats[sid]
+        for r in conn.execute(
+                "SELECT json_extract(data, '$.tokens') AS tokens, json_extract(data, '$.model') AS model "
+                "FROM session_message WHERE session_id = ? AND type = 'assistant' "
+                "ORDER BY seq DESC LIMIT 5", (sid,)):
+            st["model"] = st["model"] or _format_model_name(r["model"])
+            ctx = _context_from_tokens(r["tokens"])
+            if ctx:
+                st["context"] = ctx
+                break
+        st["peak"] = max(st["peak"], st["context"])
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# v1 (legacy): session + message + part
+# ---------------------------------------------------------------------------
+
+def _v1_turns(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    parts_by_msg: dict[str, list[dict[str, Any]]] = {}
+    for pr in conn.execute(
+            "SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created, id",
+            (session_id,)):
+        parts_by_msg.setdefault(pr["message_id"], []).append(_json(pr["data"]))
+    turns = []
+    for m in conn.execute(
+            "SELECT id, time_created, data FROM message WHERE session_id = ? "
+            "ORDER BY time_created, id", (session_id,)):
+        data = _json(m["data"])
+        parts = parts_by_msg.get(m["id"], [])
+        role = "user" if (data.get("role") or "user") == "user" else "assistant"
+        blocks, has_text = _content_blocks(parts)
+        tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+        out_tokens = _int(tokens.get("output"))
+        if not out_tokens:
+            for p in parts:
+                if p.get("type") == "step-finish" and isinstance(p.get("tokens"), dict):
+                    out_tokens = _int(p["tokens"].get("output"))
+                    if out_tokens:
+                        break
+        if not blocks:
+            summary = data.get("summary")
+            if not (isinstance(summary, str) and summary):
+                continue
+            blocks = [{"type": "text", "text": summary}]
+        kind = "user" if role == "user" else ("assistant" if has_text else "tool")
+        ts = _ms_to_iso(m["time_created"] or (data.get("time") or {}).get("created"))
+        turns.append(_turn(m["id"], role, kind, ts, blocks,
+                           _format_model_name(data.get("modelID") or data.get("model")), out_tokens))
+    return turns
+
+
+def _v1_session_stats(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dict[str, Any]]:
+    stats = {sid: {"prompts": [], "user": 0, "assistant": 0, "context": 0, "peak": 0,
+                   "model": ""} for sid in ids}
+    for chunk in _chunks(ids):
+        ph = ",".join("?" * len(chunk))
+        for r in conn.execute(
+                f"SELECT m.session_id, p.data AS part_data FROM message m "
+                f"JOIN part p ON m.id = p.message_id "
+                f"WHERE m.session_id IN ({ph}) AND json_extract(m.data, '$.role') = 'user' "
+                f"AND json_extract(p.data, '$.type') = 'text' "
+                f"ORDER BY m.time_created, m.id", chunk):
+            text = (_json(r["part_data"]).get("text") or "").strip()
+            if text:
+                stats[r["session_id"]]["prompts"].append(text[:500])
+        # v1 message rows are small (parts live elsewhere), so walk them all.
+        for r in conn.execute(
+                f"SELECT session_id, data FROM message WHERE session_id IN ({ph}) "
+                f"ORDER BY time_created, id", chunk):
+            st = stats[r["session_id"]]
+            data = _json(r["data"])
+            role = data.get("role") or "user"
+            if role in ("user", "assistant"):
+                st[role] += 1
+            if role == "assistant":
+                ctx = _context_from_tokens(data.get("tokens"))
+                if ctx:
+                    st["context"] = ctx
+                    st["peak"] = max(st["peak"], ctx)
+                st["model"] = _format_model_name(data.get("modelID")) or st["model"]
+    return stats
+
+
+def _todo_counts(conn: sqlite3.Connection, ids: list[str]) -> dict[str, tuple[int, int]]:
+    if not _has_table(conn, "todo"):
+        return {}
+    out: dict[str, tuple[int, int]] = {}
+    for chunk in _chunks(ids):
+        ph = ",".join("?" * len(chunk))
+        for r in conn.execute(
+                f"SELECT session_id, COUNT(*) AS total, "
+                f"SUM(CASE WHEN status IN ('completed', 'cancelled') THEN 0 ELSE 1 END) AS open "
+                f"FROM todo WHERE session_id IN ({ph}) GROUP BY session_id", chunk):
+            out[r["session_id"]] = (r["total"] or 0, r["open"] or 0)
+    return out
+
+
+def _todo_row(r: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": str(r["position"]),
+        "subject": r["content"],
+        "status": r["status"] or "pending",
+        "priority": r["priority"] or "medium",
+        "position": r["position"],
+        "session_id": r["session_id"],
+        "owner": "",
+        "blocks": [],
+        "blockedBy": [],
+    }
 
 
 class OpencodeAdapter(AgentAdapter):
@@ -241,66 +527,69 @@ class OpencodeAdapter(AgentAdapter):
         return opencode_db_path()
 
     def _project_cwd(self, project: str) -> str:
-        """Resolve mangled or direct project identifier to working directory."""
+        """Resolve a project name (mangled cwd) back to its real directory."""
         db_file = self._db_path()
         if not db_file:
-            return _unmangle_path(project)
-
+            return ""
         conn = _connect_ro(db_file)
         try:
-            dirs = conn.execute(
-                "SELECT DISTINCT directory FROM session WHERE directory IS NOT NULL AND directory != ''"
-            ).fetchall()
-            for r in dirs:
+            table = _session_table(conn)
+            for r in conn.execute(f"SELECT DISTINCT directory FROM {table} "
+                                  f"WHERE directory IS NOT NULL AND directory != ''"):
                 d = r["directory"]
                 if _mangle(d) == project or d == project:
                     return d
         finally:
             conn.close()
-
-        return _unmangle_path(project)
+        return ""
 
     def list_projects(self) -> list[dict[str, Any]]:
         db_file = self._db_path()
         if not db_file:
             return []
-
         conn = _connect_ro(db_file)
-        out: list[dict[str, Any]] = []
         try:
-            rows = conn.execute("""
-                SELECT session.directory,
-                       COUNT(DISTINCT session.id) as session_count,
-                       MAX(session.time_updated) / 1000.0 as mtime,
-                       COUNT(todo.position) as total_tasks,
-                       SUM(CASE WHEN todo.status != 'completed' THEN 1 ELSE 0 END) as open_tasks
-                FROM session
-                LEFT JOIN todo ON session.id = todo.session_id
-                WHERE session.directory IS NOT NULL AND session.directory != ''
-                  AND (session.time_archived IS NULL OR session.time_archived = 0)
-                GROUP BY session.directory
-                ORDER BY mtime DESC
+            table = _session_table(conn)
+            rows = conn.execute(f"""
+                SELECT directory,
+                       SUM(CASE WHEN parent_id IS NULL OR parent_id = '' THEN 1 ELSE 0 END)
+                           AS session_count,
+                       MAX(time_updated) AS last_ms
+                FROM {table}
+                WHERE directory IS NOT NULL AND directory != ''
+                  AND (time_archived IS NULL OR time_archived = 0)
+                GROUP BY directory
             """).fetchall()
-
-            for r in rows:
-                cwd = r["directory"]
-                name = _mangle(cwd)
-                has_doc = bool(cwd and (Path(cwd) / "AGENTS.md").is_file())
-                out.append({
-                    "name": name,
-                    "display_path": cwd,
-                    "cwd": cwd,
-                    "session_count": r["session_count"] or 0,
-                    "has_memory": False,
-                    "has_claude_md": has_doc,
-                    "open_tasks": r["open_tasks"] or 0,
-                    "total_tasks": r["total_tasks"] or 0,
-                    "git": read_git_info(cwd),
-                    "mtime": r["mtime"] or 0.0,
-                })
+            todos: dict[str, tuple[int, int]] = {}
+            if _has_table(conn, "todo"):
+                for r in conn.execute(f"""
+                    SELECT s.directory AS directory, COUNT(*) AS total,
+                           SUM(CASE WHEN t.status IN ('completed', 'cancelled') THEN 0 ELSE 1 END)
+                               AS open
+                    FROM todo t JOIN {table} s ON s.id = t.session_id
+                    WHERE s.time_archived IS NULL OR s.time_archived = 0
+                    GROUP BY s.directory
+                """):
+                    todos[r["directory"]] = (r["total"] or 0, r["open"] or 0)
         finally:
             conn.close()
 
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            cwd = r["directory"]
+            total, opn = todos.get(cwd, (0, 0))
+            out.append({
+                "name": _mangle(cwd),
+                "display_path": cwd,
+                "cwd": cwd,
+                "session_count": r["session_count"] or 0,
+                "has_memory": False,
+                "has_claude_md": (Path(cwd) / "AGENTS.md").is_file(),
+                "open_tasks": opn,
+                "total_tasks": total,
+                "git": read_git_info(cwd),
+                "mtime": (r["last_ms"] or 0) / 1000.0,
+            })
         out.sort(key=lambda p: p["mtime"], reverse=True)
         return out
 
@@ -308,139 +597,82 @@ class OpencodeAdapter(AgentAdapter):
         db_file = self._db_path()
         if not db_file:
             return []
-
         cwd = self._project_cwd(project)
+        if not cwd:
+            return []
         conn = _connect_ro(db_file)
-        summaries: list[SessionSummary] = []
         try:
-            sessions = conn.execute("""
-                SELECT s.*,
-                       COUNT(t.position) as total_tasks,
-                       SUM(CASE WHEN t.status != 'completed' THEN 1 ELSE 0 END) as open_tasks
-                FROM session s
-                LEFT JOIN todo t ON s.id = t.session_id
-                WHERE s.directory = ?
-                  AND (s.time_archived IS NULL OR s.time_archived = 0)
-                GROUP BY s.id
-                ORDER BY s.time_updated DESC
-            """, (cwd,)).fetchall()
-
-            if not sessions:
-                return []
-
-            session_ids = [s["id"] for s in sessions]
-            placeholders = ",".join("?" for _ in session_ids)
-
-            # Fetch user messages with text parts to deduce first/last prompt and turn counts
-            user_texts = conn.execute(f"""
-                SELECT m.session_id, m.id, m.time_created, p.data as part_data
-                FROM message m
-                JOIN part p ON m.id = p.message_id
-                WHERE m.session_id IN ({placeholders})
-                  AND json_extract(m.data, '$.role') = 'user'
-                  AND json_extract(p.data, '$.type') = 'text'
-                ORDER BY m.time_created ASC, m.id ASC
-            """, session_ids).fetchall()
-
-            # Group prompts by session
-            session_prompts: dict[str, list[str]] = {}
-            for row in user_texts:
-                sid = row["session_id"]
-                try:
-                    p_info = json.loads(row["part_data"])
-                    txt = p_info.get("text", "").strip()
-                    if txt:
-                        session_prompts.setdefault(sid, []).append(txt)
-                except Exception:
-                    continue
-
-            # Fetch message counts grouped by session and role
-            role_counts = conn.execute(f"""
-                SELECT m.session_id,
-                       json_extract(m.data, '$.role') as role,
-                       COUNT(*) as cnt
-                FROM message m
-                WHERE m.session_id IN ({placeholders})
-                GROUP BY m.session_id, role
-            """, session_ids).fetchall()
-
-            counts_by_session: dict[str, dict[str, int]] = {}
-            for rc in role_counts:
-                sid = rc["session_id"]
-                role = rc["role"] or "user"
-                counts_by_session.setdefault(sid, {})[role] = rc["cnt"]
-
-            git_info = read_git_info(cwd)
-            git_branch = (git_info or {}).get("branch") or ""
-
-            for s in sessions:
-                sid = s["id"]
-                prompts = session_prompts.get(sid, [])
-                first_prompt = prompts[0][:500] if prompts else ""
-                last_prompt = prompts[-1][:500] if prompts else ""
-
-                s_counts = counts_by_session.get(sid, {})
-                user_turns = s_counts.get("user", 0)
-                asst_turns = s_counts.get("assistant", 0)
-                msg_count = user_turns + asst_turns
-
-                mtime = (s["time_updated"] or s["time_created"] or 0) / 1000.0
-                ctx_tokens = (s["tokens_input"] or 0) + (s["tokens_output"] or 0)
-                model_str = _format_model_name(s["model"])
-
-                win = context_limit_for(ctx_tokens)
-                summ = SessionSummary(
-                    session_id=sid,
-                    project=project,
-                    file=str(db_file),
-                    size_bytes=ctx_tokens,
-                    mtime=mtime,
-                    first_prompt=first_prompt,
-                    last_prompt=last_prompt,
-                    message_count=msg_count,
-                    user_turns=user_turns,
-                    assistant_turns=asst_turns,
-                    context_tokens=ctx_tokens,
-                    context_limit=win["limit"],
-                    context_limit_known=win["known"],
-                    total_output_tokens=s["tokens_output"] or 0,
-                    model=model_str,
-                    git_branch=git_branch,
-                    cwd=cwd,
-                    has_memory=False,
-                    open_tasks=s["open_tasks"] or 0,
-                    total_tasks=s["total_tasks"] or 0,
-                    agent="opencode",
-                    title=s["title"] or sid,
-                )
-                summaries.append(summ)
-
+            v2 = _is_v2(conn)
+            table = "session_v2" if v2 else "session"
+            sessions = conn.execute(
+                f"SELECT * FROM {table} WHERE directory = ? "
+                f"AND (time_archived IS NULL OR time_archived = 0) ORDER BY time_updated DESC",
+                (cwd,)).fetchall()
+            ids = [s["id"] for s in sessions]
+            stats = (_v2_session_stats if v2 else _v1_session_stats)(conn, ids)
+            todos = _todo_counts(conn, ids)
         finally:
             conn.close()
 
+        git_branch = (read_git_info(cwd) or {}).get("branch") or ""
+        summaries: list[SessionSummary] = []
+        for s in sessions:
+            sid = s["id"]
+            keys = s.keys()
+            st = stats.get(sid, {})
+            prompts = st.get("prompts") or []
+            user_turns = st.get("user", 0)
+            asst_turns = st.get("assistant", 0)
+            ctx = st.get("context", 0)
+            win = context_limit_for(max(ctx, st.get("peak", 0)))
+            total, opn = todos.get(sid, (0, 0))
+            model = st.get("model") or _format_model_name(s["model"] if "model" in keys else "")
+            updated = s["time_updated"] or s["time_created"] or 0
+            summaries.append(SessionSummary(
+                session_id=sid,
+                project=project,
+                file=str(db_file),
+                # Change key for the search index (mtime + this); not a byte size.
+                size_bytes=user_turns + asst_turns,
+                mtime=updated / 1000.0,
+                first_prompt=prompts[0] if prompts else "",
+                last_prompt=prompts[-1] if prompts else "",
+                message_count=user_turns + asst_turns,
+                user_turns=user_turns,
+                assistant_turns=asst_turns,
+                context_tokens=ctx,
+                context_limit=win["limit"],
+                context_limit_known=win["known"],
+                total_output_tokens=(s["tokens_output"] if "tokens_output" in keys else 0) or 0,
+                model=model,
+                git_branch=git_branch,
+                cwd=cwd,
+                has_memory=False,
+                open_tasks=opn,
+                total_tasks=total,
+                agent="opencode",
+                title=(s["title"] if "title" in keys else "") or sid,
+                parent_id=(s["parent_id"] if "parent_id" in keys else "") or "",
+            ))
         summaries.sort(key=lambda x: x.mtime, reverse=True)
         return summaries
+
+    def _turns(self, db_file: Path, session_id: str) -> list[dict[str, Any]]:
+        conn = _connect_ro(db_file)
+        try:
+            return _v2_turns(conn, session_id) if _is_v2(conn) else _v1_turns(conn, session_id)
+        finally:
+            conn.close()
 
     def get_conversation(self, project: str, session_id: str,
                          offset: int = 0, limit: int | None = None) -> dict[str, Any]:
         db_file = self._db_path()
         if not db_file:
             return {"total": 0, "offset": offset, "limit": limit, "turns": []}
-
-        conn = _connect_ro(db_file)
-        try:
-            turns = _parse_session_turns(conn, session_id)
-        finally:
-            conn.close()
-
+        turns = self._turns(db_file, session_id)
         total = len(turns)
         end = total if limit is None else min(total, offset + limit)
-        return {
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "turns": turns[offset:end],
-        }
+        return {"total": total, "offset": offset, "limit": limit, "turns": turns[offset:end]}
 
     def iter_turns(self, project: str, session_id: str) -> Iterator[dict[str, Any]]:
         data = self.get_conversation(project, session_id, offset=0, limit=None)
@@ -459,31 +691,20 @@ class OpencodeAdapter(AgentAdapter):
     def save_doc(self, project: str, content: str) -> Path:
         return save_doc_file(self._project_cwd(project), "AGENTS.md", content)
 
+    # ---- tasks: the legacy v1 `todo` table (OpenCode v2 has no todo tool) ----
+
     def get_tasks(self, session_id: str) -> list[dict[str, Any]]:
         db_file = self._db_path()
         if not db_file:
             return []
-
         conn = _connect_ro(db_file)
         try:
+            if not _has_table(conn, "todo"):
+                return []
             rows = conn.execute(
-                "SELECT session_id, content, status, priority, position FROM todo WHERE session_id = ? ORDER BY position ASC",
-                (session_id,),
-            ).fetchall()
-            tasks: list[dict[str, Any]] = []
-            for r in rows:
-                tasks.append({
-                    "id": str(r["position"]),
-                    "subject": r["content"],
-                    "status": r["status"] or "pending",
-                    "priority": r["priority"] or "medium",
-                    "position": r["position"],
-                    "session_id": r["session_id"],
-                    "owner": "",
-                    "blocks": [],
-                    "blockedBy": [],
-                })
-            return tasks
+                "SELECT session_id, content, status, priority, position FROM todo "
+                "WHERE session_id = ? ORDER BY position ASC", (session_id,)).fetchall()
+            return [_todo_row(r) for r in rows]
         finally:
             conn.close()
 
@@ -491,32 +712,19 @@ class OpencodeAdapter(AgentAdapter):
         db_file = self._db_path()
         if not db_file:
             return []
-
         cwd = self._project_cwd(project)
         conn = _connect_ro(db_file)
         try:
-            rows = conn.execute("""
+            if not cwd or not _has_table(conn, "todo"):
+                return []
+            table = _session_table(conn)
+            rows = conn.execute(f"""
                 SELECT t.session_id, t.content, t.status, t.priority, t.position
-                FROM todo t
-                JOIN session s ON t.session_id = s.id
-                WHERE s.directory = ?
-                  AND (s.time_archived IS NULL OR s.time_archived = 0)
+                FROM todo t JOIN {table} s ON t.session_id = s.id
+                WHERE s.directory = ? AND (s.time_archived IS NULL OR s.time_archived = 0)
                 ORDER BY s.time_updated DESC, t.position ASC
             """, (cwd,)).fetchall()
-            tasks: list[dict[str, Any]] = []
-            for r in rows:
-                tasks.append({
-                    "id": str(r["position"]),
-                    "subject": r["content"],
-                    "status": r["status"] or "pending",
-                    "priority": r["priority"] or "medium",
-                    "position": r["position"],
-                    "session_id": r["session_id"],
-                    "owner": "",
-                    "blocks": [],
-                    "blockedBy": [],
-                })
-            return tasks
+            return [_todo_row(r) for r in rows]
         finally:
             conn.close()
 
@@ -524,71 +732,65 @@ class OpencodeAdapter(AgentAdapter):
         valid = {"pending", "in_progress", "completed", "deleted"}
         if status not in valid:
             raise ValueError(f"invalid status: {status}")
-
         db_file = self._db_path()
         if not db_file:
             raise FileNotFoundError("opencode database not found")
+        conn = _connect_ro(db_file)
+        try:
+            v2 = _is_v2(conn)
+            has_todo = _has_table(conn, "todo")
+        finally:
+            conn.close()
+        if v2:
+            raise UnsupportedCapability(
+                "OpenCode v2 no longer tracks todos; the legacy todo list is read-only")
+        if not has_todo:
+            raise FileNotFoundError(f"task {task_id} not found for session {session_id}")
+        try:
+            pos = int(task_id)
+        except ValueError:
+            raise FileNotFoundError(f"task {task_id} not found for session {session_id}")
 
         conn = _connect_rw(db_file)
         try:
-            try:
-                pos = int(task_id)
-                row = conn.execute(
-                    "SELECT session_id, content, status, priority, position FROM todo WHERE session_id = ? AND position = ?",
-                    (session_id, pos),
-                ).fetchone()
-            except ValueError:
-                row = None
-
+            row = conn.execute(
+                "SELECT session_id, content, status, priority, position FROM todo "
+                "WHERE session_id = ? AND position = ?", (session_id, pos)).fetchone()
             if not row:
                 raise FileNotFoundError(f"task {task_id} not found for session {session_id}")
-
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            conn.execute(
-                "UPDATE todo SET status = ?, time_updated = ? WHERE session_id = ? AND position = ?",
-                (status, now_ms, session_id, pos),
-            )
+            conn.execute("UPDATE todo SET status = ?, time_updated = ? "
+                         "WHERE session_id = ? AND position = ?", (status, now_ms, session_id, pos))
             conn.commit()
-            return {
-                "id": str(pos),
-                "subject": row["content"],
-                "status": status,
-                "priority": row["priority"],
-                "position": pos,
-                "session_id": session_id,
-            }
+            return {"id": str(pos), "subject": row["content"], "status": status,
+                    "priority": row["priority"], "position": pos, "session_id": session_id}
         finally:
             conn.close()
+
+    # ---- export / delete ----
 
     def export_session_markdown(self, project: str, session_id: str) -> str:
         db_file = self._db_path()
         if not db_file:
             raise FileNotFoundError("opencode database not found")
-
         conn = _connect_ro(db_file)
         try:
-            s = conn.execute("SELECT * FROM session WHERE id = ?", (session_id,)).fetchone()
+            table = _session_table(conn)
+            s = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (session_id,)).fetchone()
             if not s:
                 raise FileNotFoundError(f"session {session_id} not found")
-            turns = _parse_session_turns(conn, session_id)
+            turns = _v2_turns(conn, session_id) if table == "session_v2" else _v1_turns(conn, session_id)
         finally:
             conn.close()
 
         cwd = s["directory"] or self._project_cwd(project)
-        model = _format_model_name(s["model"])
-        created_str = ""
-        if s["time_created"]:
-            try:
-                created_str = datetime.fromtimestamp(s["time_created"] / 1000.0, timezone.utc).isoformat()
-            except Exception:
-                pass
-
+        model = _format_model_name(s["model"] if "model" in s.keys() else "")
         lines = [
             f"# Session: {s['title'] or session_id}",
             "",
-            f"- **Agent:** OpenCode",
+            "- **Agent:** OpenCode",
             f"- **Session ID:** `{session_id}`",
-            f"- **Created:** {created_str}",
+            f"- **Created:** {_ms_to_iso(s['time_created'])}",
             f"- **Model:** {model or 'unknown'}",
             f"- **Directory:** `{cwd}`",
             f"- **Total Turns:** {len(turns)}",
@@ -596,32 +798,25 @@ class OpencodeAdapter(AgentAdapter):
             "---",
             "",
         ]
-
         for t in turns:
-            role = t["role"].capitalize()
             ts = f" ({t['timestamp']})" if t.get("timestamp") else ""
-            lines.append(f"### {role}{ts}")
+            lines.append(f"### {t['role'].capitalize()}{ts}")
             lines.append("")
             for b in t["blocks"]:
                 bt = b.get("type")
                 if bt == "text":
                     lines.append(b.get("text", ""))
-                    lines.append("")
                 elif bt == "thinking":
                     indented = b.get("text", "").replace("\n", "\n> ")
                     lines.append(f"> **Thinking:**\n> {indented}")
-                    lines.append("")
                 elif bt == "tool_use":
                     inp = json.dumps(b.get("input", {}), indent=2, ensure_ascii=False)
                     lines.append(f"**→ tool: {b.get('name', '')}**\n\n```json\n{inp}\n```")
-                    lines.append("")
                 elif bt == "tool_result":
-                    txt = b.get("text", "")
-                    lines.append(f"**tool result**\n\n```\n{txt}\n```")
-                    lines.append("")
+                    lines.append(f"**tool result**\n\n```\n{b.get('text', '')}\n```")
+                lines.append("")
             lines.append("---")
             lines.append("")
-
         return "\n".join(lines)
 
     def export_session_to_file(self, project: str, session_id: str, out_dir: Path | None = None) -> Path:
@@ -641,33 +836,62 @@ class OpencodeAdapter(AgentAdapter):
         db_file = self._db_path()
         if not db_file:
             raise FileNotFoundError("opencode database not found")
+        conn = _connect_ro(db_file)
+        try:
+            v2 = _is_v2(conn)
+            table = "session_v2" if v2 else "session"
+            if not conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (session_id,)).fetchone():
+                raise FileNotFoundError(f"session {session_id} not found")
+        finally:
+            conn.close()
+        if v2:
+            return self._delete_v2(db_file, session_id, hard)
+        return self._delete_v1(db_file, session_id, hard)
 
+    def _delete_v2(self, db_file: Path, session_id: str, hard: bool) -> dict[str, Any]:
+        if not _opencode_cli() or not _is_cli_managed(db_file):
+            raise UnsupportedCapability(
+                "this OpenCode v2 database isn't the one the local `opencode` CLI manages, "
+                "so cc_mgr shows it read-only")
         if hard:
-            cli = shutil.which("opencode")
-            if cli:
-                try:
-                    proc = subprocess.run([cli, "session", "delete", session_id], capture_output=True, text=True, timeout=10)
-                    if proc.returncode == 0:
-                        return {"deleted": [session_id], "trash": None}
-                except Exception:
-                    pass
+            _run_opencode(["session", "delete", session_id])
+        else:
+            _run_opencode(["api", "session.update", "--param", f"sessionID={session_id}",
+                           "--data", json.dumps({"archived": True})])
+        conn = _connect_ro(db_file)
+        try:
+            row = conn.execute("SELECT time_archived FROM session_v2 WHERE id = ?",
+                               (session_id,)).fetchone()
+        finally:
+            conn.close()
+        if hard and row is not None:
+            raise RuntimeError(f"OpenCode did not delete session {session_id}")
+        if not hard and not (row and row["time_archived"]):
+            raise RuntimeError(f"OpenCode did not archive session {session_id}")
+        if hard:
+            return {"deleted": [session_id], "trash": None,
+                    "note": "Deleted in OpenCode (its subagent sessions too)."}
+        return {"deleted": [session_id], "trash": "opencode-archive",
+                "note": "Archived in OpenCode; restore it from OpenCode's session list."}
 
-            conn = _connect_rw(db_file)
-            try:
+    def _delete_v1(self, db_file: Path, session_id: str, hard: bool) -> dict[str, Any]:
+        """Legacy v1-only database: there is no v2 server to go through."""
+        conn = _connect_rw(db_file)
+        try:
+            if hard:
                 conn.execute("DELETE FROM part WHERE session_id = ?", (session_id,))
                 conn.execute("DELETE FROM message WHERE session_id = ?", (session_id,))
-                conn.execute("DELETE FROM todo WHERE session_id = ?", (session_id,))
+                if _has_table(conn, "todo"):
+                    conn.execute("DELETE FROM todo WHERE session_id = ?", (session_id,))
                 conn.execute("DELETE FROM session WHERE id = ?", (session_id,))
-                conn.commit()
-            finally:
-                conn.close()
+            else:
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                conn.execute("UPDATE session SET time_archived = ? WHERE id = ?",
+                             (now_ms, session_id))
+            conn.commit()
+        finally:
+            conn.close()
+        if hard:
             return {"deleted": [session_id], "trash": None}
-        else:
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            conn = _connect_rw(db_file)
-            try:
-                conn.execute("UPDATE session SET time_archived = ? WHERE id = ?", (now_ms, session_id))
-                conn.commit()
-            finally:
-                conn.close()
-            return {"deleted": [session_id], "trash": f"archived_{now_ms}"}
+        return {"deleted": [session_id], "trash": "opencode-archive",
+                "note": "Archived (legacy OpenCode database)."}

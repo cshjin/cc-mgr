@@ -282,6 +282,8 @@ def api_delete(project: str, session_id: str, req: DeleteRequest,
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:  # the agent's own CLI refused or failed
+        raise HTTPException(status_code=502, detail=str(e))
     result["export"] = export_path
     result["memory"] = memory_path
     return result

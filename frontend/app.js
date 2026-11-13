@@ -484,6 +484,8 @@ function openDeleteModal() {
       <h3>Delete session ${esc(sid)}?</h3>
       <p>This removes the transcript, sidecar files, and tasks. By default it
          is a <b>soft delete</b> (moved to a trash folder, reversible).</p>
+      ${state.agent === "opencode" ? `<p>OpenCode: the soft delete archives the session inside
+         OpenCode; a permanent delete also removes its subagent sessions.</p>` : ""}
       <label class="mrow"><input type="checkbox" id="mExport" checked /> Export to Markdown first</label>
       <label class="mrow"><input type="checkbox" id="mMemory" /> Save a summary to project memory</label>
       <label class="mrow"><input type="checkbox" id="mHard" /> Permanent delete (skip trash)</label>
@@ -518,7 +520,8 @@ function openDeleteModal() {
       renderSessions();
       const note = res.export ? ` Exported.` : "";
       const mem = res.memory ? ` Saved to memory.` : "";
-      const where = res.trash ? ` Moved to trash.` : " Permanently removed.";
+      const where = res.note ? ` ${res.note}`
+        : (res.trash ? " Moved to trash." : " Permanently removed.");
       flash(`Session deleted.${note}${mem}${where}`);
     } catch (e) {
       $("#mStatus").textContent = "Failed: " + e.message;

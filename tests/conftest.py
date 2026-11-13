@@ -394,3 +394,110 @@ def opencode_home(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENCODE_DB", str(db_file))
     return home
 
+
+@pytest.fixture
+def opencode_v2_home(tmp_path, monkeypatch):
+    """An OpenCode v2 database shaped like the real one (2.2.7).
+
+    session_v2 + session_message (parts inlined in data.content), an empty-ish
+    session_part, and the legacy v1 tables that v2 keeps after migrating.
+    """
+    home = tmp_path / "opencode_v2"
+    home.mkdir()
+    cwd = tmp_path / "repo_oc2"
+    cwd.mkdir()
+    (cwd / "AGENTS.md").write_text("# OpenCode v2 doc\nzeta\n", encoding="utf-8")
+    db_file = home / "opencode.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript("""
+        CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, slug TEXT,
+            directory TEXT NOT NULL, title TEXT, version TEXT, model TEXT, agent TEXT,
+            tokens_input INTEGER DEFAULT 0, tokens_output INTEGER DEFAULT 0,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER);
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE session_part (
+            message_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+            type TEXT NOT NULL, call_id TEXT, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+            PRIMARY KEY (message_id, ordinal));
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, directory TEXT, title TEXT,
+            model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                              time_updated INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                           time_created INTEGER, time_updated INTEGER, data TEXT);
+        CREATE TABLE todo (session_id TEXT, content TEXT, status TEXT, priority TEXT,
+                           position INTEGER, time_created INTEGER, time_updated INTEGER);
+    """)
+    t0 = 1_790_000_000_000
+    claude = {"id": "claude-opus-5.5", "providerID": "github-copilot", "variant": "max"}
+    gpt = {"id": "gpt-6-astra", "providerID": "github-copilot", "variant": "max"}
+    sessions = [
+        ("ses_v2_parent", None, "V2 Parent", json.dumps(claude), t0, t0 + 9000, None),
+        ("ses_v2_child", "ses_v2_parent", "Subagent run", json.dumps(gpt), t0 + 100, t0 + 500, None),
+        ("ses_old", None, "Migrated v1", json.dumps(claude), t0 - 50_000, t0 - 40_000, None),
+        ("ses_archived", None, "Archived", json.dumps(claude), t0, t0 + 1, t0 + 2),
+    ]
+    for sid, parent, title, model, created, updated, archived in sessions:
+        conn.execute(
+            "INSERT INTO session_v2 (id, parent_id, directory, title, model, tokens_input, "
+            "tokens_output, time_created, time_updated, time_archived) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (sid, parent, str(cwd), title, model, 36, 99, created, updated, archived))
+    conn.execute("INSERT INTO session (id, directory, title, time_created, time_updated) "
+                 "VALUES ('ses_old', ?, 'Migrated v1', ?, ?)", (str(cwd), t0 - 50_000, t0 - 40_000))
+    conn.execute("INSERT INTO todo VALUES ('ses_old', 'legacy task', 'pending', 'high', 0, ?, ?)",
+                 (t0, t0))
+
+    def msg(sid, seq, mtype, data, mid=None):
+        conn.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                     (mid or f"msg_{sid}_{seq}", sid, mtype, seq, t0 + seq, t0 + seq, json.dumps(data)))
+
+    p = "ses_v2_parent"
+    msg(p, 1, "user", {"text": "hello v2", "files": [
+        {"name": "paper.pdf", "mime": "application/pdf", "data": "JVBERi0xLjUK",
+         "source": {"type": "inline"}}]})
+    msg(p, 2, "assistant", {"model": gpt, "content": [
+        {"type": "reasoning", "text": "thinking v2"},
+        {"type": "text", "text": "answer v2"},
+        {"type": "tool", "id": "t1", "name": "shell", "state": {
+            "status": "completed", "input": {"command": "ls"},
+            "content": [{"type": "text", "text": "a.py\nb.py"},
+                        {"type": "file", "uri": "data:image/png;base64,AAAA", "mime": "image/png"}]}},
+        {"type": "tool", "id": "t2", "name": "read", "state": {
+            "status": "error", "input": {"path": "/nope"},
+            "error": {"type": "tool.execution", "message": "File not found: /nope"}}},
+    ], "tokens": {"input": 5, "output": 7, "reasoning": 0, "cache": {"read": 1000, "write": 10}}})
+    msg(p, 3, "idle", {"outcome": "succeeded"})
+    msg(p, 4, "compaction", {"summary": "## Objective\nsummary text", "reason": "auto",
+                             "tokens": {"input": 250000, "output": 100, "cache": {"read": 0, "write": 0}}})
+    msg(p, 5, "synthetic", {"text": "<shell id=\"sh_1\">done</shell>", "description": "bg"})
+    msg(p, 6, "model-switched", {"model": claude, "previous": gpt})
+    msg(p, 7, "user", {"text": "second prompt", "files": []})
+    msg(p, 8, "assistant", {"model": claude, "content": [{"type": "text", "text": "final answer"}],
+                            "tokens": {"input": 2, "output": 3, "cache": {"read": 150000, "write": 10}}})
+    # still running: no tokens yet, so the context comes from seq 8
+    msg(p, 9, "assistant", {"model": claude, "content": [
+        {"type": "tool", "name": "shell", "state": {"status": "running", "input": {"command": "sleep 1"}}}]})
+
+    c = "ses_v2_child"
+    msg(c, 1, "user", {"text": "sub task"})
+    msg(c, 2, "assistant", {"model": gpt, "content": [],
+                            "tokens": {"input": 1, "output": 1, "cache": {"read": 10, "write": 0}}},
+        mid="msg_child_answer")
+    conn.execute("INSERT INTO session_part VALUES ('msg_child_answer', ?, 0, 'text', NULL, ?, ?, ?)",
+                 (c, t0, t0, json.dumps({"type": "text", "text": "from session_part"})))
+
+    msg("ses_old", 1, "user", {"text": "old prompt"})
+    msg("ses_old", 2, "assistant", {"model": claude, "content": [{"type": "text", "text": "old answer"}],
+                                    "tokens": {"input": 1, "output": 1, "cache": {"read": 0, "write": 0}}})
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("OPENCODE_DB", str(db_file))
+    return home
+

@@ -222,3 +222,4 @@ class SessionSummary:
     total_tasks: int = 0
     agent: str = "claude"
     title: str = ""
+    parent_id: str = ""  # set for subagent (child) sessions
