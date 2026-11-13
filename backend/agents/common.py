@@ -2,12 +2,44 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
 CTX_TIERS = (200_000, 1_000_000)
 STD_WINDOW = 200_000
+
+_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
+
+
+def is_safe_id(value: str | None) -> bool:
+    """Session / task ids: a single plain path component, no glob characters."""
+    return bool(value) and _SAFE_ID.fullmatch(value) is not None
+
+
+def is_safe_name(value: str | None) -> bool:
+    """Project names: one path component (mangled cwds may contain spaces, dots,
+    unicode, …) but never a separator, NUL, or a dot-only name."""
+    return (bool(value) and value not in (".", "..")
+            and not any(c in value for c in ("/", "\\", "\x00")))
+
+
+def safe_join(root: Path, *parts: str) -> Path:
+    """Join parts under root, refusing any result that escapes root."""
+    base = os.path.abspath(root)
+    target = os.path.abspath(os.path.join(base, *parts))
+    if target != base and not target.startswith(base + os.sep):
+        raise ValueError(f"path escapes {root}: {parts!r}")
+    return Path(target)
+
+
+def default_export_dir(project: str) -> Path:
+    """exports/<project>/ for session exports (project must be a safe name)."""
+    if not is_safe_name(project):
+        raise ValueError("invalid project name")
+    return safe_join(Path.cwd() / "exports", project)
 
 
 def context_limit_for(observed_tokens: int) -> dict[str, Any]:

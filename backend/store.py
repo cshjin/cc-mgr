@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .agents.common import default_export_dir, is_safe_id, is_safe_name, safe_join
+
 
 def claude_home() -> Path:
     """Root of the Claude Code data dir, overridable for remote/testing.
@@ -43,6 +45,23 @@ def projects_dir() -> Path:
 
 def tasks_dir() -> Path:
     return claude_home() / "tasks"
+
+
+def _project_dir(project: str) -> Path:
+    """projects/<project>, refusing names that could escape projects/."""
+    if not is_safe_name(project):
+        raise ValueError("invalid project name")
+    return safe_join(projects_dir(), project)
+
+
+def _session_id(session_id: str) -> str:
+    if not is_safe_id(session_id):
+        raise ValueError("invalid session id")
+    return session_id
+
+
+def _task_dir(session_id: str) -> Path:
+    return safe_join(tasks_dir(), _session_id(session_id))
 
 
 def unmangle_path(folder_name: str) -> str:
@@ -330,7 +349,7 @@ def _scan_session(path: Path, project: str) -> SessionSummary:
 
 
 def list_sessions(project: str) -> list[SessionSummary]:
-    d = projects_dir() / project
+    d = _project_dir(project)
     if not d.is_dir():
         return []
     has_mem = (d / "memory").is_dir()
@@ -363,7 +382,7 @@ def _count_tasks(tdir: Path) -> tuple[int, int]:
 
 
 def get_tasks(session_id: str) -> list[dict[str, Any]]:
-    tdir = tasks_dir() / session_id
+    tdir = _task_dir(session_id)
     if not tdir.is_dir():
         return []
     tasks = []
@@ -381,7 +400,9 @@ def update_task_status(session_id: str, task_id: str, status: str) -> dict[str, 
     valid = {"pending", "in_progress", "completed", "deleted"}
     if status not in valid:
         raise ValueError(f"invalid status: {status}")
-    jf = tasks_dir() / session_id / f"{task_id}.json"
+    if not is_safe_id(task_id):
+        raise ValueError("invalid task id")
+    jf = safe_join(_task_dir(session_id), f"{task_id}.json")
     if not jf.is_file():
         raise FileNotFoundError(f"task {task_id} not found for session {session_id}")
     data = json.loads(jf.read_text(encoding="utf-8"))
@@ -391,7 +412,7 @@ def update_task_status(session_id: str, task_id: str, status: str) -> dict[str, 
 
 
 def get_memory(project: str) -> dict[str, Any]:
-    mem_dir = projects_dir() / project / "memory"
+    mem_dir = _project_dir(project) / "memory"
     if not mem_dir.is_dir():
         return {"index": "", "index_path": "", "dir": str(mem_dir), "files": []}
     index = ""
@@ -424,7 +445,7 @@ def save_memory_file(project: str, name: str, content: str) -> Path:
         raise ValueError("invalid memory file name")
     if not name.endswith(".md"):
         raise ValueError("memory files must end in .md")
-    mem_dir = projects_dir() / project / "memory"
+    mem_dir = _project_dir(project) / "memory"
     mem_dir.mkdir(parents=True, exist_ok=True)
     out = mem_dir / name
     out.write_text(content, encoding="utf-8")
@@ -433,7 +454,7 @@ def save_memory_file(project: str, name: str, content: str) -> Path:
 
 def _project_cwd(project: str) -> str:
     """Resolve the working directory for a project from its newest session."""
-    d = projects_dir() / project
+    d = _project_dir(project)
     sessions = sorted(d.glob("*.jsonl"), key=lambda s: s.stat().st_mtime, reverse=True)
     if not sessions:
         return ""
@@ -471,7 +492,7 @@ def save_claude_md(project: str, content: str) -> Path:
 
 def project_tasks(project: str) -> list[dict[str, Any]]:
     """All tasks across all sessions in a project, tagged with their session id."""
-    d = projects_dir() / project
+    d = _project_dir(project)
     out: list[dict[str, Any]] = []
     for s in sorted(d.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
         for t in get_tasks(s.stem):
@@ -493,7 +514,7 @@ def get_conversation(
     prompts, keeping the viewer focused on prompts and responses. Returns
     {total, offset, limit, turns} so the UI can lazily page huge sessions.
     """
-    path = projects_dir() / project / f"{session_id}.jsonl"
+    path = _project_dir(project) / f"{_session_id(session_id)}.jsonl"
     if not path.is_file():
         return {"total": 0, "offset": offset, "limit": limit, "turns": []}
 
@@ -564,10 +585,10 @@ def export_session_markdown(project: str, session_id: str) -> str:
 def export_session_to_file(project: str, session_id: str, out_dir: Path | None = None) -> Path:
     """Write the session export to exports/<project>/<session>.md and return the path."""
     if out_dir is None:
-        out_dir = Path.cwd() / "exports" / project
+        out_dir = default_export_dir(project)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_path = out_dir / f"{session_id}.{stamp}.md"
+    out_path = out_dir / f"{_session_id(session_id)}.{stamp}.md"
     out_path.write_text(export_session_markdown(project, session_id), encoding="utf-8")
     return out_path
 
@@ -620,7 +641,7 @@ def save_session_as_memory(project: str, session_id: str) -> Path:
             body.append(f"- [{t.get('status','?')}] {t.get('subject','(untitled)')}")
     body.append("")
 
-    mem_dir = projects_dir() / project / "memory"
+    mem_dir = _project_dir(project) / "memory"
     mem_dir.mkdir(parents=True, exist_ok=True)
     out = mem_dir / f"session_{short}.md"
     out.write_text("\n".join(body), encoding="utf-8")
@@ -644,10 +665,11 @@ def delete_session(project: str, session_id: str, hard: bool = False) -> dict[st
     <claude_home>/.cc_mgr_trash/<timestamp>/ so the action is reversible.
     Set hard=True to permanently remove instead.
     """
-    proj_dir = projects_dir() / project
+    proj_dir = _project_dir(project)
+    _session_id(session_id)
     jsonl = proj_dir / f"{session_id}.jsonl"
-    sidecar = proj_dir / session_id
-    tdir = tasks_dir() / session_id
+    sidecar = safe_join(proj_dir, session_id)
+    tdir = _task_dir(session_id)
 
     moved: list[str] = []
     if hard:

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from . import index_db, store
 from .agents import UnsupportedCapability, get_adapter, list_agents
+from .agents.common import is_safe_id, is_safe_name
 
 app = FastAPI(title="cc_mgr", version="0.3.0")
 
@@ -19,6 +20,20 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 def _adapter(agent: str | None):
     return get_adapter(agent)
+
+
+def _project(project: str) -> str:
+    """Reject anything that is not a single, non-dot path component."""
+    if not is_safe_name(project):
+        raise HTTPException(status_code=400, detail="invalid project name")
+    return project
+
+
+def _ident(value: str, what: str) -> str:
+    """Session / task ids are plain tokens: no separators, dots-only or globs."""
+    if not is_safe_id(value):
+        raise HTTPException(status_code=400, detail=f"invalid {what}")
+    return value
 
 
 @app.get("/api/agents")
@@ -33,11 +48,13 @@ def api_projects(agent: str | None = None):
 
 @app.get("/api/projects/{project}/sessions")
 def api_sessions(project: str, agent: str | None = None):
+    _project(project)
     return [asdict(s) for s in _adapter(agent).list_sessions(project)]
 
 
 @app.get("/api/projects/{project}/doc")
 def api_get_doc(project: str, agent: str | None = None):
+    _project(project)
     try:
         return _adapter(agent).get_doc(project)
     except UnsupportedCapability as e:
@@ -50,6 +67,7 @@ class DocRequest(BaseModel):
 
 @app.put("/api/projects/{project}/doc")
 def api_save_doc(project: str, req: DocRequest, agent: str | None = None):
+    _project(project)
     try:
         path = _adapter(agent).save_doc(project, req.content)
     except UnsupportedCapability as e:
@@ -74,6 +92,7 @@ def api_save_claude_md(project: str, req: DocRequest, agent: str | None = None):
 
 @app.get("/api/projects/{project}/memory")
 def api_memory(project: str, agent: str | None = None):
+    _project(project)
     try:
         return _adapter(agent).get_memory(project)
     except UnsupportedCapability as e:
@@ -87,9 +106,12 @@ class MemoryFileRequest(BaseModel):
 
 @app.put("/api/projects/{project}/memory")
 def api_save_memory_file(project: str, req: MemoryFileRequest, agent: str | None = None):
+    _project(project)
     try:
         path = _adapter(agent).save_memory_file(project, req.name, req.content)
     except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -98,6 +120,7 @@ def api_save_memory_file(project: str, req: MemoryFileRequest, agent: str | None
 
 @app.get("/api/projects/{project}/tasks")
 def api_project_tasks(project: str, agent: str | None = None):
+    _project(project)
     try:
         return _adapter(agent).project_tasks(project)
     except UnsupportedCapability as e:
@@ -107,6 +130,8 @@ def api_project_tasks(project: str, agent: str | None = None):
 @app.get("/api/projects/{project}/sessions/{session_id}")
 def api_conversation(project: str, session_id: str, offset: int = 0,
                      limit: int = 40, agent: str | None = None):
+    _project(project)
+    _ident(session_id, "session id")
     result = _adapter(agent).get_conversation(project, session_id,
                                               offset=offset, limit=limit)
     if result["total"] == 0:
@@ -117,6 +142,7 @@ def api_conversation(project: str, session_id: str, offset: int = 0,
 
 @app.get("/api/sessions/{session_id}/tasks")
 def api_tasks(session_id: str, agent: str | None = None):
+    _ident(session_id, "session id")
     try:
         return _adapter(agent).get_tasks(session_id)
     except UnsupportedCapability as e:
@@ -130,6 +156,8 @@ class TaskStatusRequest(BaseModel):
 @app.patch("/api/sessions/{session_id}/tasks/{task_id}")
 def api_update_task(session_id: str, task_id: str, req: TaskStatusRequest,
                     agent: str | None = None):
+    _ident(session_id, "session id")
+    _ident(task_id, "task id")
     try:
         return _adapter(agent).update_task_status(session_id, task_id, req.status)
     except UnsupportedCapability as e:
@@ -143,9 +171,13 @@ def api_update_task(session_id: str, task_id: str, req: TaskStatusRequest,
 @app.get("/api/projects/{project}/sessions/{session_id}/export",
          response_class=PlainTextResponse)
 def api_export_inline(project: str, session_id: str, agent: str | None = None):
+    _project(project)
+    _ident(session_id, "session id")
     try:
         md = _adapter(agent).export_session_markdown(project, session_id)
     except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     if not md.strip():
         raise HTTPException(status_code=404, detail="session not found or empty")
@@ -161,6 +193,8 @@ class DeleteRequest(BaseModel):
 @app.post("/api/projects/{project}/sessions/{session_id}/delete")
 def api_delete(project: str, session_id: str, req: DeleteRequest,
                agent: str | None = None):
+    _project(project)
+    _ident(session_id, "session id")
     ad = _adapter(agent)
     try:
         export_path = memory_path = None
@@ -171,6 +205,10 @@ def api_delete(project: str, session_id: str, req: DeleteRequest,
         result = ad.delete_session(project, session_id, hard=req.hard)
     except UnsupportedCapability as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     result["export"] = export_path
     result["memory"] = memory_path
     return result
@@ -178,6 +216,8 @@ def api_delete(project: str, session_id: str, req: DeleteRequest,
 
 @app.post("/api/projects/{project}/sessions/{session_id}/save-memory")
 def api_save_memory(project: str, session_id: str, agent: str | None = None):
+    _project(project)
+    _ident(session_id, "session id")
     try:
         return {"memory": str(_adapter(agent).save_session_as_memory(project, session_id))}
     except UnsupportedCapability as e:

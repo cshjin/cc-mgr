@@ -30,8 +30,8 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
-    SessionSummary, context_limit_for, read_doc_file,
-    read_git_info, save_doc_file, block_text,
+    SessionSummary, context_limit_for, default_export_dir, is_safe_id,
+    read_doc_file, read_git_info, save_doc_file, block_text,
 )
 
 
@@ -628,8 +628,10 @@ class OpencodeAdapter(AgentAdapter):
         return "\n".join(lines)
 
     def export_session_to_file(self, project: str, session_id: str, out_dir: Path | None = None) -> Path:
+        if not is_safe_id(session_id):
+            raise ValueError("invalid session id")
         if out_dir is None:
-            out_dir = Path.cwd() / "exports" / project
+            out_dir = default_export_dir(project)
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         out_path = out_dir / f"{session_id}.{stamp}.md"
@@ -637,6 +639,8 @@ class OpencodeAdapter(AgentAdapter):
         return out_path
 
     def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
+        if not is_safe_id(session_id):
+            raise ValueError("invalid session id")
         db_file = self._db_path()
         if not db_file:
             raise FileNotFoundError("opencode database not found")
