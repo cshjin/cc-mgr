@@ -36,6 +36,10 @@ def _isolate_from_real_agent_data(tmp_path_factory, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HOME", str(sandbox / "home"))
     monkeypatch.setenv("XDG_DATA_HOME", str(sandbox / "xdg_data"))
+    # The search index is cc_mgr's own cache under the repo's data/: never let
+    # a test (e.g. an API delete, which purges index rows) touch the real one.
+    from backend import index_db
+    monkeypatch.setattr(index_db, "db_path", lambda: sandbox / "cc_mgr.db")
 
     real_which = shutil.which
 

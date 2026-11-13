@@ -2,7 +2,7 @@
 
 The index is a derived cache: it can be rebuilt from the JSONL transcripts at
 any time. We track each session's file mtime/size so reindexing only re-reads
-changed sessions.
+changed sessions, and drop rows for sessions/projects that no longer exist.
 """
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ from typing import Any, Iterator
 
 from . import store
 from .agents import all_adapters
+
+# Snippet highlight markers: control characters can't collide with real text
+# (the old "[" / "]" also matched every bracket in code and Markdown).
+HL_START = "\x02"
+HL_END = "\x03"
 
 
 def db_path() -> Path:
@@ -35,9 +40,20 @@ def _has_fts5(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def _fts_tokenizer(conn: sqlite3.Connection) -> str:
+    """trigram (SQLite >= 3.34) matches any substring, which CJK text needs:
+    unicode61 treats an unbroken run of CJK characters as one token."""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE temp.__tri_probe USING fts5(x, tokenize='trigram')")
+        conn.execute("DROP TABLE temp.__tri_probe")
+        return "trigram"
+    except sqlite3.OperationalError:
+        return "unicode61"
+
+
 # Bump when the table/FTS schema changes; the DB is a rebuildable cache, so a
 # mismatch just drops and rebuilds everything.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _schema_outdated(conn: sqlite3.Connection) -> bool:
@@ -103,15 +119,16 @@ def init_db(conn: sqlite3.Connection) -> bool:
     if fts:
         # Standalone FTS tables (not external-content): deletes are a plain
         # DELETE, which keeps incremental reindexing simple and corruption-free.
+        tok = _fts_tokenizer(conn)
         conn.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5("
             "text, agent UNINDEXED, session_id UNINDEXED, project UNINDEXED, "
-            "seq UNINDEXED, role UNINDEXED, turn_id UNINDEXED)"
+            f"seq UNINDEXED, role UNINDEXED, turn_id UNINDEXED, tokenize='{tok}')"
         )
         conn.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5("
             "text, agent UNINDEXED, project UNINDEXED, source UNINDEXED, "
-            "ref UNINDEXED, path UNINDEXED)"
+            f"ref UNINDEXED, path UNINDEXED, tokenize='{tok}')"
         )
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -131,67 +148,121 @@ def _turn_text(turn: dict[str, Any]) -> str:
 
 
 def reindex(force: bool = False) -> dict[str, Any]:
-    """Walk every agent's projects/sessions and (re)index changed ones."""
+    """Walk every agent's projects/sessions, (re)index changed ones, and drop
+    rows for sessions and projects that no longer exist.
+
+    An adapter that fails is reported in `errors` and left untouched (neither
+    indexed further nor pruned) so one broken agent can't empty the index.
+    """
     conn = _connect()
     fts = init_db(conn)
-    indexed = skipped = total_turns = total_docs = 0
+    indexed = skipped = total_turns = total_docs = pruned = 0
+    errors: dict[str, str] = {}
 
     for adapter in all_adapters():
         agent = adapter.capabilities.agent_id
-        for proj in adapter.list_projects():
-            pname = proj["name"]
-            for summ in adapter.list_sessions(pname):
-                row = conn.execute(
-                    "SELECT mtime, size FROM sessions WHERE agent=? AND session_id=?",
-                    (agent, summ.session_id),
-                ).fetchone()
-                if (row and not force and row["mtime"] == summ.mtime
-                        and row["size"] == summ.size_bytes):
-                    skipped += 1
-                    continue
-
-                conn.execute("DELETE FROM turns WHERE agent=? AND session_id=?",
-                             (agent, summ.session_id))
-                if fts:
-                    conn.execute("DELETE FROM turns_fts WHERE agent=? AND session_id=?",
-                                 (agent, summ.session_id))
-
-                for turn in adapter.iter_turns(pname, summ.session_id):
-                    text = _turn_text(turn)
-                    if not text.strip():
+        seen_sessions: set[str] = set()
+        seen_projects: set[str] = set()
+        try:
+            for proj in adapter.list_projects():
+                pname = proj["name"]
+                seen_projects.add(pname)
+                for summ in adapter.list_sessions(pname):
+                    seen_sessions.add(summ.session_id)
+                    row = conn.execute(
+                        "SELECT mtime, size FROM sessions WHERE agent=? AND session_id=?",
+                        (agent, summ.session_id),
+                    ).fetchone()
+                    if (row and not force and row["mtime"] == summ.mtime
+                            and row["size"] == summ.size_bytes):
+                        skipped += 1
                         continue
-                    seq = turn["seq"]
-                    cur = conn.execute(
-                        "INSERT INTO turns(agent, session_id, project, seq, role, "
-                        "kind, timestamp, text) VALUES(?,?,?,?,?,?,?,?)",
-                        (agent, summ.session_id, pname, seq, turn["role"],
-                         turn["kind"], turn.get("timestamp", ""), text),
-                    )
+
+                    conn.execute("DELETE FROM turns WHERE agent=? AND session_id=?",
+                                 (agent, summ.session_id))
                     if fts:
-                        conn.execute(
-                            "INSERT INTO turns_fts(text, agent, session_id, project, "
-                            "seq, role, turn_id) VALUES(?,?,?,?,?,?,?)",
-                            (text, agent, summ.session_id, pname, seq,
-                             turn["role"], cur.lastrowid),
+                        conn.execute("DELETE FROM turns_fts WHERE agent=? AND session_id=?",
+                                     (agent, summ.session_id))
+
+                    for turn in adapter.iter_turns(pname, summ.session_id):
+                        text = _turn_text(turn)
+                        if not text.strip():
+                            continue
+                        seq = turn["seq"]
+                        cur = conn.execute(
+                            "INSERT INTO turns(agent, session_id, project, seq, role, "
+                            "kind, timestamp, text) VALUES(?,?,?,?,?,?,?,?)",
+                            (agent, summ.session_id, pname, seq, turn["role"],
+                             turn["kind"], turn.get("timestamp", ""), text),
                         )
-                    total_turns += 1
+                        if fts:
+                            conn.execute(
+                                "INSERT INTO turns_fts(text, agent, session_id, project, "
+                                "seq, role, turn_id) VALUES(?,?,?,?,?,?,?)",
+                                (text, agent, summ.session_id, pname, seq,
+                                 turn["role"], cur.lastrowid),
+                            )
+                        total_turns += 1
 
-                conn.execute(
-                    "INSERT OR REPLACE INTO sessions(agent, session_id, project, "
-                    "mtime, size, turns, context_tokens, last_prompt) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (agent, summ.session_id, pname, summ.mtime, summ.size_bytes,
-                     summ.message_count, summ.context_tokens, summ.last_prompt),
-                )
-                indexed += 1
+                    conn.execute(
+                        "INSERT OR REPLACE INTO sessions(agent, session_id, project, "
+                        "mtime, size, turns, context_tokens, last_prompt) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (agent, summ.session_id, pname, summ.mtime, summ.size_bytes,
+                         summ.message_count, summ.context_tokens, summ.last_prompt),
+                    )
+                    indexed += 1
 
-            total_docs += _index_docs(conn, fts, adapter, pname)
-            conn.commit()
+                total_docs += _index_docs(conn, fts, adapter, pname)
+                conn.commit()
+        except Exception as e:  # noqa: BLE001 — isolate one broken agent
+            conn.rollback()
+            errors[agent] = f"{type(e).__name__}: {e}"
+            continue
+        pruned += _prune(conn, fts, agent, seen_sessions, seen_projects)
+        conn.commit()
 
     conn.commit()
     conn.close()
-    return {"indexed": indexed, "skipped": skipped, "turns": total_turns,
-            "docs": total_docs, "fts": fts}
+    result = {"indexed": indexed, "skipped": skipped, "turns": total_turns,
+              "docs": total_docs, "pruned": pruned, "fts": fts}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def _delete_session_rows(conn, fts, agent: str, session_id: str) -> None:
+    conn.execute("DELETE FROM sessions WHERE agent=? AND session_id=?", (agent, session_id))
+    conn.execute("DELETE FROM turns WHERE agent=? AND session_id=?", (agent, session_id))
+    if fts:
+        conn.execute("DELETE FROM turns_fts WHERE agent=? AND session_id=?", (agent, session_id))
+
+
+def _prune(conn, fts, agent: str, seen_sessions: set[str], seen_projects: set[str]) -> int:
+    """Drop an agent's rows for sessions/projects its adapter no longer lists."""
+    stale = [r["session_id"] for r in
+             conn.execute("SELECT session_id FROM sessions WHERE agent=?", (agent,))
+             if r["session_id"] not in seen_sessions]
+    for sid in stale:
+        _delete_session_rows(conn, fts, agent, sid)
+    for r in conn.execute("SELECT DISTINCT project FROM docs WHERE agent=?", (agent,)).fetchall():
+        if r["project"] not in seen_projects:
+            conn.execute("DELETE FROM docs WHERE agent=? AND project=?", (agent, r["project"]))
+            if fts:
+                conn.execute("DELETE FROM docs_fts WHERE agent=? AND project=?",
+                             (agent, r["project"]))
+    return len(stale)
+
+
+def remove_session(agent: str, session_id: str) -> None:
+    """Drop one session from the index right away (after it was deleted)."""
+    conn = _connect()
+    try:
+        fts = init_db(conn)
+        _delete_session_rows(conn, fts, agent, session_id)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _index_docs(conn, fts, adapter, project) -> int:
@@ -238,30 +309,45 @@ def search(query, limit=50, project=None, agent=None):
     conn = _connect()
     fts = init_db(conn)
     try:
+        out = []
         if fts:
             try:
                 out = _fts_search(conn, query, limit, project, agent)
             except sqlite3.OperationalError:
-                out = _like_search(conn, query, limit, project, agent)
-        else:
+                out = []  # FTS query syntax the parser rejects (e.g. "foo-bar")
+        if not out:
+            # Also covers what the tokenizer can't see, e.g. trigram needs >= 3
+            # characters, so a 2-character CJK word only matches via LIKE.
             out = _like_search(conn, query, limit, project, agent)
     finally:
         conn.close()
     return out
 
 
-def _fts_search(conn, query, limit, project, agent=None):
-    out = []
+def _filters(project, agent):
     clauses, args = [], []
     if project:
         clauses.append("project = ?"); args.append(project)
     if agent:
         clauses.append("agent = ?"); args.append(agent)
-    extra = (" AND " + " AND ".join(clauses)) if clauses else ""
+    return (" AND " + " AND ".join(clauses)) if clauses else "", args
+
+
+def _snippet_tokens(conn) -> int:
+    """snippet() counts tokens; a trigram "token" is ~1 character, so it needs
+    a much larger window than word tokens to show useful context."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'turns_fts'").fetchone()
+    return 64 if row and "trigram" in (row[0] or "") else 16
+
+
+def _fts_search(conn, query, limit, project, agent=None):
+    out = []
+    extra, args = _filters(project, agent)
+    n = _snippet_tokens(conn)
 
     turn_rows = conn.execute(
         "SELECT agent, session_id, project, seq, role, "
-        "snippet(turns_fts, 0, '[', ']', ' … ', 12) AS snippet "
+        f"snippet(turns_fts, 0, char(2), char(3), ' … ', {n}) AS snippet "
         f"FROM turns_fts WHERE turns_fts MATCH ?{extra} ORDER BY rank LIMIT ?",
         (query, *args, limit),
     ).fetchall()
@@ -270,7 +356,7 @@ def _fts_search(conn, query, limit, project, agent=None):
 
     doc_rows = conn.execute(
         "SELECT agent, project, source, ref, path, "
-        "snippet(docs_fts, 0, '[', ']', ' … ', 12) AS snippet "
+        f"snippet(docs_fts, 0, char(2), char(3), ' … ', {n}) AS snippet "
         f"FROM docs_fts WHERE docs_fts MATCH ?{extra} ORDER BY rank LIMIT ?",
         (query, *args, limit),
     ).fetchall()
@@ -279,33 +365,43 @@ def _fts_search(conn, query, limit, project, agent=None):
     return out
 
 
+def _like_snippet(text: str, query: str, width: int = 80) -> str:
+    """A window of `text` around the first match, with the match marked."""
+    i = text.lower().find(query.lower())
+    if i < 0:
+        return text[:200]
+    j = i + len(query)
+    start, end = max(0, i - width), min(len(text), j + width)
+    return ("… " if start else "") + text[start:i] + HL_START + text[i:j] + HL_END \
+        + text[j:end] + (" …" if end < len(text) else "")
+
+
 def _like_search(conn, query, limit, project=None, agent=None):
-    like = f"%{query}%"
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = f"%{escaped}%"
     out = []
-    clauses, args = [], []
-    if project:
-        clauses.append("project = ?"); args.append(project)
-    if agent:
-        clauses.append("agent = ?"); args.append(agent)
-    extra = (" AND " + " AND ".join(clauses)) if clauses else ""
+    extra, args = _filters(project, agent)
 
     turn_rows = conn.execute(
-        "SELECT agent, session_id, project, seq, role, "
-        "substr(text, 1, 200) AS snippet FROM turns "
-        f"WHERE text LIKE ?{extra} LIMIT ?",
+        "SELECT agent, session_id, project, seq, role, text FROM turns "
+        f"WHERE text LIKE ? ESCAPE '\\'{extra} LIMIT ?",
         (like, *args, limit),
     ).fetchall()
     for r in turn_rows:
-        d = dict(r); d["source"] = "conversation"; out.append(d)
+        d = dict(r)
+        d["snippet"] = _like_snippet(d.pop("text"), query)
+        d["source"] = "conversation"
+        out.append(d)
 
     doc_rows = conn.execute(
-        "SELECT agent, project, source, ref, path, "
-        "substr(text, 1, 200) AS snippet FROM docs "
-        f"WHERE text LIKE ?{extra} LIMIT ?",
+        "SELECT agent, project, source, ref, path, text FROM docs "
+        f"WHERE text LIKE ? ESCAPE '\\'{extra} LIMIT ?",
         (like, *args, limit),
     ).fetchall()
     for r in doc_rows:
-        out.append(dict(r))
+        d = dict(r)
+        d["snippet"] = _like_snippet(d.pop("text"), query)
+        out.append(d)
     return out
 
 

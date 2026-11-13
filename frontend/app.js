@@ -936,7 +936,9 @@ function initSearch() {
       const r = await fetch("/api/reindex", { method: "POST" });
       if (!r.ok) throw await httpError(r);
       const res = await r.json();
-      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs across all agents.`);
+      const pruned = res.pruned ? `, ${res.pruned} stale removed` : "";
+      const errs = res.errors ? ` Failed: ${Object.entries(res.errors).map(([a, m]) => `${a} (${m})`).join("; ")}` : "";
+      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs${pruned} across all agents.${errs}`);
     } catch (e) {
       flash("Reindex failed: " + e.message);
     } finally {
@@ -967,7 +969,8 @@ function renderSearchResults(el, results, q, scopeProject) {
     return;
   }
   const html = results.map((r, i) => {
-    const snip = esc(r.snippet).replace(/\[/g, '<mark>').replace(/\]/g, '</mark>');
+    // \u0002 / \u0003 mark the match (the index never emits them otherwise).
+    const snip = esc(r.snippet).replace(/\u0002/g, "<mark>").replace(/\u0003/g, "</mark>");
     if (r.source === "conversation") {
       return `
         <div class="searchres" data-i="${i}">
