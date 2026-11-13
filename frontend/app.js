@@ -333,8 +333,10 @@ async function loadProjView() {
   // to another.
   const view = { agent: state.agent, project: state.activeProject, kind: state.projView };
   state.pendingView = view;
-  const current = () => state.agent === view.agent && state.activeProject === view.project
-    && state.projView === view.kind;
+  // only the latest request may render: an older one is stale even when the name it was
+  // for comes back (hashed → plain → hashed)
+  const current = () => state.pendingView === view && state.agent === view.agent
+    && state.activeProject === view.project && state.projView === view.kind;
   const path = (what) => `/api/projects/${encodeURIComponent(view.project)}/${what}` +
     `?agent=${encodeURIComponent(view.agent)}`;
   try {

@@ -27,6 +27,7 @@ const SESSION = { session_id: "s1", title: "kept session", mtime: 1700000100, co
 let releaseDelete;
 let deleteStatus = 200;
 let holdDoc = null;  // a promise the doc GET waits for, to deliver it late
+const gates = {};    // per project name: a promise that doc GETs for that name wait for
 const docPuts = [];
 w.fetch = async (u, opts = {}) => {
   const url = new w.URL(String(u), "http://localhost:8765");
@@ -51,6 +52,7 @@ w.fetch = async (u, opts = {}) => {
       return json({ saved: `${p.cwd}/CLAUDE.md` });
     }
     if (holdDoc) await holdDoc;
+    if (gates[name]) await gates[name];
     return json({ exists: true, path: `${p.cwd}/CLAUDE.md`, content: `doc of ${p.cwd}`, cwd: p.cwd });
   }
   if (url.pathname.endsWith("/sessions")) {  // like the server: only names that exist right now
@@ -202,6 +204,35 @@ const listLoads = () => calls.filter((c) => c === "GET /api/projects?agent=claud
   await until(() => $("#cmEditor"), "the view under the new name");
   check(calls.includes("GET /api/projects/-here~bbbbbbbbbbbb/doc?agent=claude")
         && $("#cmEditor").value === "doc of /new/here", "it loaded under the new name, not stuck loading");
+  projects.claude = [{ ...projects.claude[0], name: "-here" }];
+  await w.__loadProjects();
+
+  // a superseded answer never renders, not even once the name it was for comes back
+  // (hashed → plain → hashed), so it can't replace a draft
+  const H = "-here~cccccccccccc";
+  projects.claude = [{ ...projects.claude[0], name: H }];
+  await w.__loadProjects();
+  let releaseOld;
+  gates[H] = new Promise((r) => { releaseOld = r; });
+  $(".pnav-btn[data-view='claude']").click();  // asked for under H, held
+  await until(() => calls.includes(`GET /api/projects/${H}/doc?agent=claude`), "the held request under H");
+  projects.claude = [{ ...projects.claude[0], name: "-here" }];
+  await w.__loadProjects();  // followed to the plain name: asked again, answered at once
+  await until(() => calls.filter((c) => c === "GET /api/projects/-here/doc?agent=claude").length === 4,
+              "the request under the plain name");
+  await until(() => $("#cmEditor") && $("#cmEditor").value === "doc of /new/here", "its editor");
+  const draftEditor = $("#cmEditor");
+  draftEditor.value = "UNSAVED DRAFT";
+  projects.claude = [{ ...projects.claude[0], name: H }];
+  await w.__loadProjects();  // H again; nothing in flight for this view, so nothing is reloaded
+  check($("#cmEditor") === draftEditor && draftEditor.value === "UNSAVED DRAFT",
+        "the draft survives the name coming back");
+  delete gates[H];
+  releaseOld();  // the request made under H long ago answers now
+  await tick();
+  await tick();
+  check($("#cmEditor") === draftEditor && draftEditor.value === "UNSAVED DRAFT",
+        "the superseded answer didn't replace the draft");
   projects.claude = [{ ...projects.claude[0], name: "-here" }];
   await w.__loadProjects();
 
