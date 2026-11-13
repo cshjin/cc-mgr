@@ -30,9 +30,27 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PID_FILE = HERE / "data" / "cc_mgr.pid"
-LOG_FILE = HERE / "data" / "cc_mgr.log"
+# cc_mgr's own state (pidfile, log, search index); $CC_MGR_DATA_DIR relocates it,
+# e.g. off a slow network filesystem.
+DATA_DIR = Path(os.environ.get("CC_MGR_DATA_DIR") or HERE / "data").expanduser()
+LEGACY_PID_NAME = "cc_mgr.pid"  # pre-0.5 pidfile, which didn't record its host
 IS_WINDOWS = os.name == "nt"
+
+
+def _host_tag() -> str:
+    """This machine's short hostname, safe to use in a file name."""
+    name = socket.gethostname().split(".")[0] or "localhost"
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
+def _pid_file() -> Path:
+    # One pidfile per host: the repo (and data/) often lives on a filesystem
+    # every node mounts, and a PID only means something on the host that wrote it.
+    return DATA_DIR / f"cc_mgr.{_host_tag()}.pid"
+
+
+def _log_file() -> Path:
+    return DATA_DIR / f"cc_mgr.{_host_tag()}.log"
 
 # Sentinel default for --host: bind both loopback addresses (IPv4 127.0.0.1 and
 # IPv6 ::1) so both `localhost` and `127.0.0.1` work regardless of how the OS
@@ -69,31 +87,51 @@ def _security_env(host: str, token: str, read_only: bool) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def _write_pidfile(pid: int, host: str, port: int, token: str = "") -> None:
-    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    path = _pid_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
     # The pidfile holds the access token: create it owner-only.
-    fd = os.open(PID_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"pid": pid, "host": host, "port": port, "token": token}, fh)
+        json.dump({"pid": pid, "host": host, "port": port, "token": token,
+                   "hostname": _host_tag()}, fh)
     try:
-        os.chmod(PID_FILE, 0o600)
+        os.chmod(path, 0o600)
     except OSError:
         pass
 
 
-def _read_pidfile() -> dict | None:
-    if not PID_FILE.is_file():
+def _read_pidfile(path: Path | None = None) -> dict | None:
+    path = path or _pid_file()
+    if not path.is_file():
         return None
     try:
-        return json.loads(PID_FILE.read_text(encoding="utf-8"))
+        info = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+    return info if isinstance(info, dict) and isinstance(info.get("pid"), int) else None
 
 
-def _clear_pidfile() -> None:
+def _clear_pidfile(path: Path | None = None) -> None:
     try:
-        PID_FILE.unlink()
+        (path or _pid_file()).unlink()
     except FileNotFoundError:
         pass
+
+
+def _other_pidfiles() -> list[tuple[str, dict]]:
+    """Pidfiles this host can't check: other hosts' and the legacy host-less one."""
+    out: list[tuple[str, dict]] = []
+    if not DATA_DIR.is_dir():
+        return out
+    mine = _pid_file().name
+    for p in sorted(DATA_DIR.glob("cc_mgr*.pid")):
+        info = _read_pidfile(p)
+        if p.name == mine or not info:
+            continue
+        host = "an unknown host (old cc_mgr)" if p.name == LEGACY_PID_NAME \
+            else p.name[len("cc_mgr."):-len(".pid")]
+        out.append((host, info))
+    return out
 
 
 def _pid_alive(pid: int) -> bool:
@@ -117,6 +155,23 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _is_cc_mgr_process(pid: int) -> bool:
+    """True only if pid is alive here AND is a cc-mgr.py process.
+
+    A pidfile can outlive its server and the PID can be reused by anything,
+    so a bare "is the PID alive" check could make `stop` signal an unrelated
+    process. Where /proc exists, the command line must mention cc-mgr.py.
+    """
+    if not _pid_alive(pid):
+        return False
+    if Path("/proc/self/cmdline").exists():
+        try:
+            return b"cc-mgr.py" in Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return False
+    return True  # no /proc (macOS, Windows): best effort
+
+
 def _terminate(pid: int) -> None:
     """Terminate a process (and its children, e.g. uvicorn --reload workers)."""
     if IS_WINDOWS:
@@ -131,7 +186,7 @@ def _terminate(pid: int) -> None:
     except (ProcessLookupError, PermissionError):
         try:
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
 
@@ -295,8 +350,8 @@ def _die_port_in_use(port: int, holder: str | None, no_alt: bool = False) -> Non
 
 def cmd_run(args: argparse.Namespace) -> int:
     existing = _read_pidfile()
-    if existing and _pid_alive(existing["pid"]):
-        print(f"cc_mgr already running (pid {existing['pid']} on "
+    if existing and _is_cc_mgr_process(existing["pid"]):
+        print(f"cc_mgr already running on {_host_tag()} (pid {existing['pid']} on "
               f"{_url(existing['host'], existing['port'], existing.get('token', ''))}). "
               f"Use `stop` first.")
         return 1
@@ -319,67 +374,83 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd.append("--no-token")
     if args.read_only:
         cmd.append("--read-only")
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    logf = open(LOG_FILE, "ab")
-    if IS_WINDOWS:
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf,
-                                stdin=subprocess.DEVNULL, creationflags=flags,
-                                close_fds=True, cwd=str(HERE))
-    else:
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf,
-                                stdin=subprocess.DEVNULL, start_new_session=True,
-                                close_fds=True, cwd=str(HERE))
+    log_file = _log_file()
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "ab") as logf:  # the child keeps its own copy of the fd
+        if IS_WINDOWS:
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(cmd, stdout=logf, stderr=logf,
+                             stdin=subprocess.DEVNULL, creationflags=flags,
+                             close_fds=True, cwd=str(HERE))
+        else:
+            subprocess.Popen(cmd, stdout=logf, stderr=logf,
+                             stdin=subprocess.DEVNULL, start_new_session=True,
+                             close_fds=True, cwd=str(HERE))
     # The child writes its own pidfile at startup; give it a moment, then verify.
     time.sleep(1.5)
     info = _read_pidfile()
-    if info and _pid_alive(info["pid"]):
+    if info and _is_cc_mgr_process(info["pid"]):
         print(f"cc_mgr started in background (pid {info['pid']}) on "
               f"{_url(info['host'], info['port'], info.get('token', ''))}")
-        print(f"Logs: {LOG_FILE}")
+        print(f"Logs: {log_file}")
         print("Stop it with:  python cc-mgr.py stop")
         return 0
-    print(f"Failed to start in background. Check {LOG_FILE}.")
+    print(f"Failed to start in background. Check {log_file}.")
     return 1
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    info = _read_pidfile()
+    host = _host_tag()
+    path = _pid_file()
+    info = _read_pidfile(path)
     if not info:
-        print("No cc_mgr pidfile found — nothing to stop "
-              "(was it started by this script?).")
-        return 1
+        # An older cc_mgr wrote a host-less pidfile; only trust it if its PID
+        # is provably a cc_mgr process on *this* host.
+        legacy = DATA_DIR / LEGACY_PID_NAME
+        linfo = _read_pidfile(legacy)
+        if linfo and _is_cc_mgr_process(linfo["pid"]):
+            info, path = linfo, legacy
+        else:
+            print(f"No cc_mgr pidfile for this host ({host}) — nothing to stop "
+                  "(was it started by this script?).")
+            for other, oinfo in _other_pidfiles():
+                print(f"  A pidfile from {other} lists pid {oinfo['pid']}; "
+                      "run `stop` on that machine.")
+            return 1
     pid = info["pid"]
-    if not _pid_alive(pid):
-        print(f"cc_mgr not running (stale pidfile for pid {pid}); cleaning up.")
-        _clear_pidfile()
+    if not _is_cc_mgr_process(pid):
+        print(f"cc_mgr not running on {host} (stale pidfile for pid {pid}); cleaning up.")
+        _clear_pidfile(path)
         return 0
     print(f"Stopping cc_mgr (pid {pid})…")
     _terminate(pid)
     # wait briefly for it to die
     for _ in range(20):
-        if not _pid_alive(pid):
+        if not _is_cc_mgr_process(pid):
             break
         time.sleep(0.1)
-    if _pid_alive(pid):
+    if _is_cc_mgr_process(pid):
         print(f"Process {pid} did not exit; you may need to kill it manually.")
         return 1
-    _clear_pidfile()
+    _clear_pidfile(path)
     print("Stopped.")
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    host = _host_tag()
     info = _read_pidfile()
-    if info and _pid_alive(info["pid"]):
-        print(f"cc_mgr running (pid {info['pid']}) on "
+    if info and _is_cc_mgr_process(info["pid"]):
+        print(f"cc_mgr running on {host} (pid {info['pid']}) on "
               f"{_url(info['host'], info['port'], info.get('token', ''))}")
-        return 0
-    if info:
-        print("cc_mgr not running (stale pidfile present).")
+        rc = 0
     else:
-        print("cc_mgr not running.")
-    return 1
+        print(f"cc_mgr not running on {host}" + (" (stale pidfile present)." if info else "."))
+        rc = 1
+    for other, oinfo in _other_pidfiles():
+        print(f"  pidfile from {other}: pid {oinfo['pid']}, port {oinfo.get('port')} "
+              "(not checked from this host)")
+    return rc
 
 
 def main() -> int:

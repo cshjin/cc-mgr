@@ -61,6 +61,18 @@ def _isolate_from_real_agent_data(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(subprocess, "run", run)
 
 
+@pytest.fixture
+def launcher(tmp_path, monkeypatch):
+    """cc-mgr.py loaded as a module, with its data dir (pidfiles, logs) in tmp."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "cc_mgr_launcher", Path(__file__).resolve().parent.parent / "cc-mgr.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "DATA_DIR", tmp_path / "data")
+    return mod
+
+
 def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")

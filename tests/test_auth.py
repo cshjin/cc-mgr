@@ -1,5 +1,4 @@
 """Access control (#6), response hardening and attribute escaping (#7)."""
-import importlib.util
 import json
 import re
 import shutil
@@ -86,16 +85,6 @@ def test_esc_escapes_quotes_for_attributes():
     assert out == "x&quot; onmouseover=&quot;alert(1)&#39; &lt;b&gt;&amp;"
 
 
-@pytest.fixture
-def launcher(tmp_path, monkeypatch):
-    spec = importlib.util.spec_from_file_location("cc_mgr_launcher", ROOT / "cc-mgr.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(mod, "PID_FILE", tmp_path / "cc_mgr.pid")
-    monkeypatch.setattr(mod, "LOG_FILE", tmp_path / "cc_mgr.log")
-    return mod
-
-
 def test_launcher_security_env_and_url(launcher):
     env = launcher._security_env("loopback", "tok", read_only=False)
     assert env == {"CC_MGR_TOKEN": "tok", "CC_MGR_READ_ONLY": "",
@@ -108,5 +97,5 @@ def test_launcher_security_env_and_url(launcher):
 
 def test_launcher_pidfile_is_owner_only(launcher):
     launcher._write_pidfile(123, "loopback", 8765, "tok")
-    assert stat.S_IMODE(launcher.PID_FILE.stat().st_mode) == 0o600
+    assert stat.S_IMODE(launcher._pid_file().stat().st_mode) == 0o600
     assert launcher._read_pidfile()["token"] == "tok"
