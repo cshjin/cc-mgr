@@ -47,6 +47,7 @@ const state = {
   agents: [],
   caps: null,
   showSubagents: localStorage.getItem("cc_showSubagents") === "1",
+  pendingView: null, // the project view whose request is in flight (loadProjView)
 };
 
 const CONV_PAGE = 40;
@@ -169,10 +170,13 @@ async function loadProjects() {
       deselectProject();  // re-renders the list
       return;
     }
+    const renamed = p.name !== state.activeProject;
     state.activeProject = p.name;
     state.activeProjectMeta = p;
     renderProjNav();  // its counts come from the project row
     updateSearchPlaceholder();  // shows the project name
+    // a view still loading under the old name will be dropped when it answers: ask again
+    if (renamed && state.pendingView) loadProjView();
   }
   renderProjects();
 }
@@ -328,6 +332,7 @@ async function loadProjView() {
   // meanwhile) is dropped, so an editor never shows one project's file bound
   // to another.
   const view = { agent: state.agent, project: state.activeProject, kind: state.projView };
+  state.pendingView = view;
   const current = () => state.agent === view.agent && state.activeProject === view.project
     && state.projView === view.kind;
   const path = (what) => `/api/projects/${encodeURIComponent(view.project)}/${what}` +
@@ -350,6 +355,8 @@ async function loadProjView() {
     }
   } catch (e) {
     if (current()) el.innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`;
+  } finally {
+    if (state.pendingView === view) state.pendingView = null;
   }
 }
 

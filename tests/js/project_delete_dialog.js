@@ -189,6 +189,22 @@ const listLoads = () => calls.filter((c) => c === "GET /api/projects?agent=claud
   check(!$("#cmEditor") && $("#sessionPane").textContent.includes("kept session"),
         "the late doc didn't replace the sessions view");
 
+  // a view still loading when its project is renamed is asked for again under the new name
+  let releaseRenamed;
+  holdDoc = new Promise((r) => { releaseRenamed = r; });
+  $(".pnav-btn[data-view='claude']").click();
+  await until(() => calls.filter((c) => c === "GET /api/projects/-here/doc?agent=claude").length === 3,
+              "the doc request held while the project is renamed");
+  projects.claude = [{ ...projects.claude[0], name: "-here~bbbbbbbbbbbb" }];
+  await w.__loadProjects();
+  holdDoc = null;
+  releaseRenamed();
+  await until(() => $("#cmEditor"), "the view under the new name");
+  check(calls.includes("GET /api/projects/-here~bbbbbbbbbbbb/doc?agent=claude")
+        && $("#cmEditor").value === "doc of /new/here", "it loaded under the new name, not stuck loading");
+  projects.claude = [{ ...projects.claude[0], name: "-here" }];
+  await w.__loadProjects();
+
   // the open project's name comes to mean another directory, and its own is gone:
   // let go of it (an editor open on it must never write into the other directory)
   $(".pnav-btn[data-view='claude']").click();
