@@ -522,7 +522,8 @@ function openDeleteModal() {
       const mem = res.memory ? ` Saved to memory.` : "";
       const where = res.note ? ` ${res.note}`
         : (res.trash ? " Moved to trash." : " Permanently removed.");
-      flash(`Session deleted.${note}${mem}${where}`);
+      const warn = res.warnings && res.warnings.length ? ` Warning: ${res.warnings.join("; ")}` : "";
+      flash(`Session deleted.${note}${mem}${where}${warn}`);
     } catch (e) {
       $("#mStatus").textContent = "Failed: " + e.message;
     }
