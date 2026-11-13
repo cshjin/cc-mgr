@@ -186,6 +186,72 @@ def copilot_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def copilot_store_home(tmp_path, monkeypatch):
+    """GitHub Copilot CLI layout: session-store.db + session-state/<id>/events.jsonl."""
+    home = tmp_path / "copilot_store"
+    cwd1, cwd2 = tmp_path / "repo_cp", tmp_path / "repo_cp2"
+    cwd1.mkdir()
+    cwd2.mkdir()
+    (cwd1 / "AGENTS.md").write_text("# Copilot agents doc\nkappa\n", encoding="utf-8")
+    home.mkdir()
+    conn = sqlite3.connect(home / "session-store.db")
+    conn.executescript("""
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, repository TEXT, host_type TEXT,
+                               branch TEXT, summary TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE turns (id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER,
+                            user_message TEXT, assistant_response TEXT, timestamp TEXT);
+        CREATE TABLE assistant_usage_events (id INTEGER PRIMARY KEY, session_id TEXT,
+                            turn_index INTEGER, model TEXT, input_tokens INTEGER,
+                            output_tokens INTEGER, cache_read_tokens INTEGER, created_at TEXT);
+    """)
+    conn.execute("INSERT INTO sessions VALUES ('aaaa-1', ?, 'me/repo', 'github', 'main', "
+                 "'Fix the build', '2026-11-01T00:00:00.000Z', '2026-11-01T01:00:00.000Z')", (str(cwd1),))
+    conn.execute("INSERT INTO sessions VALUES ('bbbb-2', ?, 'me/repo', 'github', 'dev', "
+                 "'DB only', '2026-11-02T00:00:00.000Z', '2026-11-02T01:00:00.000Z')", (str(cwd1),))
+    conn.execute("INSERT INTO turns VALUES (1, 'aaaa-1', 0, 'please fix the build', NULL, "
+                 "'2026-11-01T00:00:01.000Z')")
+    conn.execute("INSERT INTO turns VALUES (2, 'bbbb-2', 0, 'db prompt', NULL, '2026-11-02T00:00:01.000Z')")
+    conn.execute("INSERT INTO turns VALUES (3, 'bbbb-2', 1, 'second', 'db reply', '2026-11-02T00:00:02.000Z')")
+    conn.execute("INSERT INTO assistant_usage_events VALUES (1, 'bbbb-2', 1, 'gemini-4-argon', "
+                 "45243, 391, 42740, '2026-11-02T00:00:03.000Z')")
+    conn.commit()
+    conn.close()
+
+    def events(sid, cwd, evs):
+        d = home / "session-state" / sid
+        d.mkdir(parents=True)
+        start = {"type": "session.start", "timestamp": "2026-11-01T00:00:00.000Z",
+                 "data": {"sessionId": sid, "context": {"cwd": str(cwd), "branch": "main"}}}
+        (d / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [start, *evs]),
+                                        encoding="utf-8")
+
+    events("aaaa-1", cwd1, [
+        {"type": "user.message", "id": "u1", "timestamp": "2026-11-01T00:00:01.000Z",
+         "data": {"content": "please fix the build", "attachments": []}},
+        {"type": "assistant.message", "id": "a1", "timestamp": "2026-11-01T00:00:02.000Z",
+         "data": {"model": "claude-sonnet-5.5", "reasoningText": "look at make", "content": "On it.",
+                  "toolRequests": [{"toolCallId": "t1", "name": "bash", "arguments": {"command": "make"}}]}},
+        {"type": "tool.execution_complete", "id": "r1",
+         "data": {"toolCallId": "t1", "success": True, "result": {"content": "build ok"}}},
+        {"type": "tool.execution_complete", "id": "r2",
+         "data": {"toolCallId": "t2", "success": False, "error": {"message": "permission denied"}}},
+        {"type": "session.usage_record",
+         "data": {"usage": {"model": "claude-sonnet-5.5", "inputTokens": 249_000, "outputTokens": 1_000}}},
+        {"type": "session.compaction_complete", "id": "c1",
+         "data": {"success": True, "summaryContent": "summary of earlier work"}},
+        {"type": "session.usage_record",
+         "data": {"usage": {"model": "claude-sonnet-5.5", "inputTokens": 50_000, "outputTokens": 100}}},
+        {"type": "system.message", "id": "s1", "data": {"content": "mode changed"}},
+        {"type": "assistant.turn_end", "data": {}},
+    ])
+    events("cccc-3", cwd2, [
+        {"type": "user.message", "id": "u9", "data": {"content": "events only"}},
+    ])
+    monkeypatch.setenv("COPILOT_HOME", str(home))
+    return home
+
+
+@pytest.fixture
 def agy_home(tmp_path, monkeypatch):
     import sqlite3
     home = tmp_path / "antigravity-cli"
