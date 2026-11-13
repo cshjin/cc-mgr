@@ -13,9 +13,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.agents import codex as cx
+from backend.agents import common
 from backend.agents import copilot as cp
 from backend.agents.codex import CodexAdapter
-from backend.agents.common import render_markdown
+from backend.agents.common import render_markdown, restore_dir
 from backend.agents.copilot import CopilotAdapter
 from backend.agents.gemini import GeminiAdapter
 from backend.app import app
@@ -371,25 +372,136 @@ def test_copilot_puts_everything_back_if_the_store_refuses(store):
                                       "search_index": ["aaaa-1", "bbbb-2"]}  # all rolled back
 
 
-def test_copilot_rollback_never_overwrites_a_folder_that_reappeared(store, monkeypatch):
+@pytest.mark.parametrize("recreated", [["new.txt"], []], ids=["with-files", "empty"])
+def test_copilot_rollback_never_overwrites_a_folder_that_reappeared(store, monkeypatch, recreated):
+    # os.rename would silently replace an *empty* directory: the restore must not
     _age(store, "aaaa-1")
     _refuse_deletes_from(store, "sessions")
     state = store / "session-state" / "aaaa-1"
     real_rename = os.rename
+    inode = []
 
     def rename_then_copilot_recreates_it(src, dst):
         real_rename(src, dst)
         if Path(src) == state:  # the forward move: Copilot writes the folder again meanwhile
             state.mkdir()
-            (state / "new.txt").write_text("new")
+            for name in recreated:
+                (state / name).write_text("new")
+            inode.append(state.stat().st_ino)
 
     monkeypatch.setattr(cp.os, "rename", rename_then_copilot_recreates_it)
     with pytest.raises(RuntimeError, match="previous copy is kept in"):
         CopilotAdapter().delete_session(_cp_project(store), "aaaa-1")
-    assert sorted(p.name for p in state.iterdir()) == ["new.txt"]  # not nested, not overwritten
+    assert sorted(p.name for p in state.iterdir()) == recreated  # not nested, not overwritten
+    assert state.stat().st_ino == inode[0]  # the very folder Copilot made, not a replacement
     kept = next((store / ".cc_mgr_trash").iterdir())
     assert (kept / "session-state" / "events.jsonl").is_file() and (kept / "db_rows.json").is_file()
     assert _rows(store, "aaaa-1")["sessions"] == 1
+
+
+def test_restore_dir_puts_everything_back(tmp_path):
+    src = tmp_path / "trash" / "s"
+    (src / "sub").mkdir(parents=True)
+    (src / "a.txt").write_text("a")
+    (src / "sub" / "b.txt").write_text("b")
+    os.chmod(src, 0o700)
+    os.utime(src, (1_000_000, 2_000_000))
+    dst = tmp_path / "state" / "s"
+    dst.parent.mkdir()
+    assert restore_dir(src, dst) is True
+    assert not src.exists()
+    assert (dst / "a.txt").read_text() == "a" and (dst / "sub" / "b.txt").read_text() == "b"
+    assert stat.S_IMODE(dst.stat().st_mode) == 0o700 and dst.stat().st_mtime == 2_000_000
+
+
+@pytest.mark.parametrize("existing", ["empty dir", "dir", "file"])
+def test_restore_dir_never_replaces_anything(tmp_path, existing):
+    src = tmp_path / "trash" / "s"
+    src.mkdir(parents=True)
+    (src / "a.txt").write_text("old")
+    dst = tmp_path / "s"
+    if existing == "file":
+        dst.write_text("theirs")
+    else:
+        dst.mkdir()
+        if existing == "dir":
+            (dst / "a.txt").write_text("theirs")
+    before = dst.stat().st_ino
+    assert restore_dir(src, dst) is False
+    assert dst.stat().st_ino == before and (src / "a.txt").read_text() == "old"
+    assert existing != "dir" or (dst / "a.txt").read_text() == "theirs"
+
+
+def test_restore_dir_skips_entries_that_appear_meanwhile(tmp_path, monkeypatch):
+    src = tmp_path / "trash" / "s"
+    src.mkdir(parents=True)
+    (src / "events.jsonl").write_text("old")
+    (src / "other.txt").write_text("other")
+    dst = tmp_path / "s"
+    real_mkdir = os.mkdir
+
+    def mkdir_then_copilot_writes(path, *args, **kwargs):
+        real_mkdir(path, *args, **kwargs)
+        if Path(path) == dst:  # right after the claim, Copilot writes into it
+            (dst / "events.jsonl").write_text("new")
+
+    monkeypatch.setattr(common.os, "mkdir", mkdir_then_copilot_writes)
+    assert restore_dir(src, dst) is False
+    assert (dst / "events.jsonl").read_text() == "new" and (dst / "other.txt").read_text() == "other"
+    assert (src / "events.jsonl").read_text() == "old"  # kept where it was, not lost
+
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+
+
+def test_copilot_checks_activity_again_once_it_holds_the_write_lock(store, monkeypatch):
+    # Copilot resumes the session after the first check, while cc_mgr waits for the lock.
+    _age(store, "aaaa-1")
+    real = cp._busy_reason
+    calls = []
+
+    def copilot_resumes_it_after_the_first_check(home, sid, updated=0.0):
+        calls.append(updated)
+        reason = real(home, sid, updated)
+        if len(calls) == 1:
+            conn = sqlite3.connect(store / "session-store.db")
+            conn.execute("UPDATE sessions SET updated_at = ? WHERE id = 'aaaa-1'", (_now_iso(),))
+            conn.commit()
+            conn.close()
+        return reason
+
+    monkeypatch.setattr(cp, "_busy_reason", copilot_resumes_it_after_the_first_check)
+    with pytest.raises(RuntimeError, match="active in the last two minutes"):
+        CopilotAdapter().delete_session(_cp_project(store), "aaaa-1", hard=True)
+    assert len(calls) == 2 and calls[1] > calls[0]  # the second check saw the store's new time
+    assert _rows(store, "aaaa-1")["sessions"] == 1 and (store / "session-state" / "aaaa-1").is_dir()
+    assert not (store / ".cc_mgr_trash").exists()
+
+
+@pytest.mark.skipif(not HAS_PROC, reason="needs /proc")
+def test_copilot_refuses_a_session_opened_while_it_waited_for_the_lock(store, monkeypatch):
+    _age(store, "aaaa-1")
+    holder = _spawn_copilot_stand_in()
+    real = cp._busy_reason
+    calls = []
+
+    def copilot_opens_it_after_the_first_check(home, sid, updated=0.0):
+        calls.append(sid)
+        reason = real(home, sid, updated)
+        if len(calls) == 1:
+            (store / "session-state" / sid / f"inuse.{holder.pid}.lock").write_text(str(holder.pid))
+        return reason
+
+    monkeypatch.setattr(cp, "_busy_reason", copilot_opens_it_after_the_first_check)
+    try:
+        with pytest.raises(RuntimeError, match=f"pid {holder.pid}"):
+            CopilotAdapter().delete_session(_cp_project(store), "aaaa-1", hard=True)
+        assert _rows(store, "aaaa-1")["sessions"] == 1
+        assert (store / "session-state" / "aaaa-1" / "events.jsonl").is_file()
+    finally:
+        holder.kill()
+        holder.wait()
 
 
 def test_copilot_backup_and_delete_see_the_same_rows(store, monkeypatch):

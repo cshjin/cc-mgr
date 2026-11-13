@@ -318,9 +318,12 @@ class GeminiAdapter(AgentAdapter):
         return preview
 
     def delete_project(self, project: str, hard: bool = False, include_memory: bool = False,
-                       export_first: bool = False) -> dict[str, Any]:
+                       export_first: bool = False, expect_cwd: str | None = None,
+                       guard=None) -> dict[str, Any]:
         """Remove the project's whole tmp/<project>/ folder (chats, logs, the
-        prompt history in logs.json) and history/<project>/."""
+        prompt history in logs.json) and history/<project>/. The name is that
+        folder, so it can't come to mean another directory (the route checks
+        expect_cwd)."""
         if not is_safe_name(project):
             raise ValueError("invalid project name")
         home = self._home()

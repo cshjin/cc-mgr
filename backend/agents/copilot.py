@@ -49,7 +49,7 @@ from . import AgentAdapter, Capabilities
 from .common import (
     SessionSummary, block_text, connect_sqlite_ro, context_window, is_safe_id,
     is_safe_name, iter_jsonl, new_trash_dir, pid_alive, project_names, read_doc_file,
-    read_git_info, resolves_inside, safe_join, save_doc_file, structured_blocks,
+    read_git_info, resolves_inside, restore_dir, safe_join, save_doc_file, structured_blocks,
 )
 
 
@@ -271,10 +271,12 @@ def _delete_store_session(home: Path, db: Path | None, state_dir: Path, session_
                           hard: bool) -> dict[str, Any]:
     """Remove a session's rows (one transaction) and its session-state folder.
 
-    The write transaction is taken *before* the backup is read, so no writer can
-    slip rows in between: a soft delete saves exactly what it deletes. If anything
-    fails before the commit, the transaction rolls back and the folder is put back
-    (never over a folder that reappeared meanwhile — then the trash copy is kept).
+    The write transaction is taken first. Holding it, the session is checked
+    for activity once more (anything Copilot did while we waited for the lock
+    is visible now), and the backup is read: no writer can slip rows in
+    between, so a soft delete saves exactly what it deletes. If anything fails
+    before the commit, the transaction rolls back and the folder is put back
+    (never over one that reappeared meanwhile — then the trash copy is kept).
     """
     conn = None
     if db is not None:
@@ -289,6 +291,13 @@ def _delete_store_session(home: Path, db: Path | None, state_dir: Path, session_
     moved = False
     deleted: list[str] = []
     try:
+        if conn is not None:
+            row = conn.execute("SELECT updated_at, created_at FROM sessions WHERE id = ?",
+                               (session_id,)).fetchone()
+            busy = _busy_reason(home, session_id,
+                                _iso_to_epoch(row["updated_at"] or row["created_at"]) if row else 0.0)
+            if busy:
+                raise RuntimeError(f"not deleting Copilot session {session_id}: {busy}")
         tables = _session_tables(conn) if conn is not None else []
         if not hard:
             backup = {}
@@ -315,9 +324,12 @@ def _delete_store_session(home: Path, db: Path | None, state_dir: Path, session_
         kept = ""
         if moved:
             try:
-                os.rename(trash / "session-state", state_dir)  # fails rather than overwrite
+                restored = restore_dir(trash / "session-state", state_dir)
             except OSError:
-                kept = f"; the session folder reappeared meanwhile, so its previous copy is kept in {trash}"
+                restored = False
+            if not restored:
+                kept = (f"; the session folder reappeared meanwhile (or couldn't be put back), "
+                        f"so its previous copy is kept in {trash}")
         if trash is not None and not kept:
             shutil.rmtree(trash, ignore_errors=True)
         if isinstance(e, (sqlite3.Error, OSError)):

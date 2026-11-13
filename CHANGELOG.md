@@ -14,7 +14,11 @@ Session and project management for every agent (#24–#26).
 - Project delete (#25): the 🗑 on a project in the sidebar removes all its sessions.
   The confirmation shows counts and last activity. Everything is exported to Markdown
   first by default. Deletes are soft by default; a permanent delete requires typing
-  the folder name. Claude memory is kept unless ticked.
+  the folder name. Claude memory is kept unless ticked. The delete only acts on the
+  directory the confirmation showed (409 otherwise).
+- Directories whose paths mangle alike (e.g. `rlsa-paper` and `rlsa/paper`) are no
+  longer merged into one Codex/Copilot/OpenCode/agy project: each gets its own name,
+  with a short hash where they clash.
 - Project rows match the session list (#25): `session_count` skips transcripts with
   no messages, and `has_memory` means the memory dir holds files.
 - Projects whose directory no longer exists (#26) — renamed, moved, or synced from

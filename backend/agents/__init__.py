@@ -10,7 +10,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .common import (  # SessionSummary is re-exported
     SessionSummary, default_export_dir, is_safe_id, private_mkdir, render_markdown,
@@ -20,6 +20,11 @@ from .common import (  # SessionSummary is re-exported
 
 class UnsupportedCapability(Exception):
     """Raised when an adapter is asked for a feature it doesn't support."""
+
+
+class ProjectChanged(Exception):
+    """The project name now stands for a different directory than the caller
+    saw (names can shift when a colliding directory appears or goes)."""
 
 
 @dataclass(frozen=True)
@@ -125,9 +130,15 @@ class AgentAdapter(ABC):
                 "hidden": 0, "memory_files": 0}
 
     def delete_project(self, project: str, hard: bool = False, include_memory: bool = False,
-                       export_first: bool = False) -> dict[str, Any]:
+                       export_first: bool = False, expect_cwd: str | None = None,
+                       guard: Callable[[str], None] | None = None) -> dict[str, Any]:
         """Delete every session of a project through delete_session (soft by
         default), optionally exporting them all first.
+
+        expect_cwd: the directory the caller confirmed; if any session to delete
+        lives elsewhere, ProjectChanged is raised before anything happens.
+        guard(session_id), if given, runs right before each delete and may
+        raise to refuse that session.
 
         Exports all happen before any delete, and parents go first, so a
         permanent delete that cascades (OpenCode) takes its subagent sessions
@@ -141,6 +152,11 @@ class AgentAdapter(ABC):
         sessions = sorted(self.list_sessions(project), key=lambda s: bool(s.parent_id))
         if not sessions:
             raise FileNotFoundError(f"no sessions to delete in {project}")
+        if expect_cwd is not None:
+            elsewhere = sorted({s.cwd for s in sessions if s.cwd and s.cwd != expect_cwd})
+            if elsewhere:
+                raise ProjectChanged(f"project {project} now refers to {', '.join(elsewhere)}, "
+                                     f"not {expect_cwd}; reload and try again")
         result: dict[str, Any] = {"sessions": [], "deleted": [], "trash": [], "exported": [],
                                   "errors": {}, "warnings": []}
         if export_first:  # all of them before any delete: a cascade must not outrun its export
@@ -155,6 +171,8 @@ class AgentAdapter(ABC):
             if sid in gone:
                 continue
             try:
+                if guard is not None:
+                    guard(sid)
                 res = self.delete_session(project, sid, hard=hard)
             except FileNotFoundError:  # already removed, e.g. along with its parent
                 gone.add(sid)

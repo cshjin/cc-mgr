@@ -35,7 +35,9 @@ Each agent's data root can be relocated via an env var: `CLAUDE_HOME` /
   empty transcripts, last activity. Export-everything-first is on by default; soft
   (reversible) by default, and a permanent delete asks you to type the folder name.
   A Claude project's memory is only removed if you tick it. Files in the working
-  directory itself (CLAUDE.md, AGENTS.md, …) are never touched.
+  directory itself (CLAUDE.md, AGENTS.md, …) are never touched. The delete is bound
+  to the directory the dialog showed: if the project changed meanwhile, it is
+  refused and the list reloads.
 - **Project-level nav** — jump straight to a project's aggregated Tasks board
   (kanban across all its sessions), project Memory, or root doc (CLAUDE.md /
   AGENTS.md / GEMINI.md) without opening a session.

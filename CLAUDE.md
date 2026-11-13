@@ -81,24 +81,32 @@ Three layers, all under `backend/` + `frontend/`:
   **Only the transcript parser truly differs per agent** — paths, doc filename, and
   capability flags are data on each adapter (`Capabilities.delete_note` explains
   what a delete does, for the dialogs). Agents that group sessions by working
-  directory name projects with `common.project_names`: the mangled path, plus a
-  short hash of the path when two directories mangle alike (`repo-x` vs `repo/x`),
-  so a project name never stands for two directories and a project delete can't
-  reach into another one. The base class provides a generic Markdown export
-  (`get_conversation` → `render_markdown`) and a generic project delete
-  (`delete_project`: exports everything first, then every listed session through
-  `delete_session`, parents first so cascades are skipped, per-session failures in
+  directory name projects with `common.project_names`: the mangled path, unless
+  another directory mangles alike (`repo-x` vs `repo/x`) or the mangled path itself
+  ends like a generated name; then the mangled path plus `~` and 12 hex digits of
+  the path's sha256 (longer where even those clash). Plain names never end in
+  `~<12+ hex>` and generated ones always do, so a name never stands for two
+  directories and a project delete can't reach into another one. Names depend on
+  which directories exist: when a collision appears or goes, a name can move to
+  another directory — so a project delete is bound to the directory the user
+  confirmed (`expect_cwd`, below). The base class provides a generic Markdown
+  export (`get_conversation` → `render_markdown`) and a generic project delete
+  (`delete_project`: checks every listed session is under `expect_cwd`
+  (`ProjectChanged` otherwise), exports everything first, then deletes every listed
+  session through `delete_session` — parents first so cascades are skipped, an
+  optional `guard(session_id)` right before each, per-session failures in
   `errors`), plus `project_delete_preview`; Claude and Gemini override both to
-  remove the whole project folder. Adapters without a feature leave the base method,
-  which raises `UnsupportedCapability` (mapped to HTTP 404 in `app.py`). Each
-  adapter's module docstring documents the real on-disk format it was verified
-  against.
+  remove the whole project folder (their names are folders, so they can't move).
+  Adapters without a feature leave the base method, which raises
+  `UnsupportedCapability` (mapped to HTTP 404 in `app.py`). Each adapter's module
+  docstring documents the real on-disk format it was verified against.
 - **`backend/index_db.py`** — SQLite + FTS5 full-text index over every conversation
   turn (`turns`/`turns_fts`) **and** every project's memory files + root doc
   (`docs`/`docs_fts`), across **all agents**. A **rebuildable cache** at
   `$CC_MGR_DATA_DIR/cc_mgr.db` (default `data/`). `reindex()` loops the adapter
   registry, stamping each row with `agent`; incremental for sessions (skips
-  unchanged mtime+size), fully refreshes docs each run, and **prunes** rows for
+  unchanged mtime+size under an unchanged project name), fully refreshes docs each
+  run, and **prunes** rows for
   sessions/projects an adapter no longer lists (an adapter that raises is reported
   and left untouched). Search results carry `agent` + a `source` field
   (`conversation` | `memory` | `claude_md` | `agent_doc`); conversation hits include
@@ -116,10 +124,11 @@ Three layers, all under `backend/` + `frontend/`:
   agent-agnostic root-doc endpoint (`/claude-md` kept as an alias).
   `GET /api/projects` adds `cwd_missing` (the recorded working directory is gone:
   renamed, moved, or another machine). `GET /api/projects/{p}/delete-preview` and
-  `POST /api/projects/{p}/delete` (`export_first`, `include_memory`, `hard`) delete a
-  whole project and purge its sessions (and, when the project is gone, its docs) from
-  the index. Pydantic models guard request bodies; every route validates
-  `project`/`session_id`/`task_id`
+  `POST /api/projects/{p}/delete` (`export_first`, `include_memory`, `hard`, and the
+  required `expect_cwd`: the directory the confirmation showed — 409 if the name
+  means another directory now) delete a whole project and purge its sessions (and,
+  when the project is gone, its docs) from the index. Pydantic models guard request
+  bodies; every route validates `project`/`session_id`/`task_id`
   (`is_safe_name`/`is_safe_id`). A middleware enforces the access token
   (`CC_MGR_TOKEN`), the loopback Host allowlist (`CC_MGR_ALLOWED_HOSTS`), read-only
   mode (`CC_MGR_READ_ONLY`), and adds CSP/hardening headers.
@@ -132,7 +141,10 @@ Three layers, all under `backend/` + `frontend/`:
   value goes through `esc()` (which also escapes quotes for attributes). Subagent
   sessions (`parent_id`) fold under their parent (`sessionTree`). Three-pane layout
   (projects / sessions / detail) with draggable splitters and a collapsible sidebar;
-  widths + active agent persist in `localStorage`.
+  widths + active agent persist in `localStorage`. Delete dialogs bind the agent,
+  project (and its `cwd`, sent as `expect_cwd`) and session when they open. When the
+  project list reloads, the open project is followed by its directory if its name
+  changed (`followProject`).
 
 ## On-disk data model (what `store.py` reads — verified, not assumed)
 
@@ -190,8 +202,11 @@ Three layers, all under `backend/` + `frontend/`:
   prove that (it inherits `OPENCODE_DB`). `opencode session delete` also removes a
   session's descendants, so a permanent *project* delete first walks that tree:
   archived subagents in the directory are previewed and exported, and descendants
-  under other directories make it refuse (archiving is still possible). Doc:
-  `AGENTS.md`.
+  under other directories make it refuse (archiving is still possible). It then
+  only deletes what was approved (the listed sessions + those archived subagents):
+  right before each `opencode session delete` the session's subtree is looked up
+  again, and if anything else joined it meanwhile (a new subagent) that session is
+  refused and kept. Doc: `AGENTS.md`.
 - **Codex** (`$CODEX_HOME` or `~/.codex`): sessions under
   `sessions/YYYY/MM/DD/rollout-*.jsonl`, grouped into projects by mangled cwd. **Each
   line is a `{timestamp,type,payload}` envelope.** cwd from `session_meta.payload`,
@@ -214,10 +229,13 @@ Three layers, all under `backend/` + `frontend/`:
   can't delete sessions (`copilot sessions` only imports), so cc_mgr does: every
   table with a `session_id` column (FTS5 `search_index` included, its shadow tables
   not) plus the `sessions` row, and `session-state/<id>/`. The `BEGIN IMMEDIATE`
-  transaction is taken *before* the backup is read, so a soft delete saves exactly
-  the rows it deletes (`db_rows.json`, with the folder, in `.cc_mgr_trash/`); on a
-  failure it rolls back and moves the folder back — never over one that reappeared
-  (then the trash copy is kept and reported). A `session-store.db` that resolves
+  transaction is taken first; holding it, the session is checked for activity again
+  (whatever Copilot did while we waited for the lock is visible now) and the backup
+  is read, so a soft delete saves exactly the rows it deletes (`db_rows.json`, with
+  the folder, in `.cc_mgr_trash/`). On a failure it rolls back and moves the folder
+  back with `common.restore_dir` — never over one that reappeared, not even an empty
+  one (a plain `os.rename` would replace that); then the trash copy is kept and
+  reported. A `session-store.db` that resolves
   outside the Copilot home is refused. Refused too while
   `session-state/<id>/inuse.<pid>.lock` names a live copilot process, or the session
   (folder, events.jsonl or the store's `updated_at`) was active in the last two

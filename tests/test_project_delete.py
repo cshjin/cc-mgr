@@ -1,4 +1,6 @@
 """#25 project-level delete; #26 projects whose working directory no longer exists."""
+import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -9,9 +11,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import index_db, store
+from backend.agents import ProjectChanged, common
 from backend.agents import copilot as cp
 from backend.agents import opencode as oc
 from backend.agents.agy import AgyAdapter
+from backend.agents.common import mangle, project_names
 from backend.agents.copilot import CopilotAdapter
 from backend.agents.gemini import GeminiAdapter
 from backend.agents.opencode import OpencodeAdapter
@@ -33,7 +37,16 @@ def _claude_extras(claude_home, memory=True):
     return proj
 
 
+def _cwd(project, agent="claude"):
+    """The directory the sidebar shows for a project ("" if none or unknown)."""
+    projects = client.get("/api/projects", params={"agent": agent}).json()
+    return next((p.get("cwd") or "" for p in projects if p["name"] == project), "")
+
+
 def _delete(project, agent="claude", **body):
+    """POST a project delete the way the dialog does: confirming the directory
+    the sidebar shows for the project, unless the test says otherwise."""
+    body.setdefault("expect_cwd", _cwd(project, agent))
     return client.post(f"/api/projects/{project}/delete", params={"agent": agent},
                        json={"export_first": False, **body})
 
@@ -246,21 +259,14 @@ def test_opencode_archived_subagents_are_counted_and_exported(fake_opencode, ope
 
 
 def test_directories_that_mangle_alike_get_distinct_projects(copilot_store_home, tmp_path):
-    from backend.agents.common import project_names
     names = project_names(["/w/repo-x", "/w/repo/x", "/w/other"])
     assert names["/w/other"] == "-w-other"  # a unique path keeps its plain name
     assert names["/w/repo-x"] != names["/w/repo/x"]
     assert project_names(["/w/repo/x", "/w/repo-x"]) == {k: names[k] for k in ("/w/repo/x", "/w/repo-x")}
 
     a_b, a_slash_b = str(tmp_path / "a-b"), str(tmp_path / "a" / "b")
-    conn = sqlite3.connect(copilot_store_home / "session-store.db")
-    for sid, cwd in (("cc-1", a_b), ("dd-2", a_slash_b)):
-        conn.execute("INSERT INTO sessions VALUES (?, ?, NULL, NULL, NULL, ?, "
-                     "'2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')", (sid, cwd, sid))
-        conn.execute("INSERT INTO turns (session_id, turn_index, user_message, timestamp) "
-                     "VALUES (?, 0, 'hi', '2026-01-01T00:00:00.000Z')", (sid,))
-    conn.commit()
-    conn.close()
+    _cp_add(copilot_store_home, "cc-1", a_b)
+    _cp_add(copilot_store_home, "dd-2", a_slash_b)
     by_cwd = {p["cwd"]: p["name"] for p in CopilotAdapter().list_projects()}
     assert by_cwd[a_b] != by_cwd[a_slash_b]
     res = _delete(by_cwd[a_b], agent="copilot").json()
@@ -269,6 +275,145 @@ def test_directories_that_mangle_alike_get_distinct_projects(copilot_store_home,
     after = {p["cwd"]: p["name"] for p in CopilotAdapter().list_projects()}
     assert after[a_slash_b] == project_names([a_slash_b])[a_slash_b] and a_b not in after
     assert [s.session_id for s in CopilotAdapter().list_sessions(after[a_slash_b])] == ["dd-2"]
+
+
+def _cp_add(home, sid, cwd, text="hi"):
+    """A DB-only Copilot session (idle: last active long ago) in directory cwd."""
+    conn = sqlite3.connect(home / "session-store.db")
+    conn.execute("INSERT INTO sessions VALUES (?, ?, NULL, NULL, NULL, ?, "
+                 "'2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')", (sid, cwd, sid))
+    conn.execute("INSERT INTO turns (session_id, turn_index, user_message, timestamp) "
+                 "VALUES (?, 0, ?, '2026-01-01T00:00:00.000Z')", (sid, text))
+    conn.commit()
+    conn.close()
+
+
+def test_generated_names_never_meet_plain_ones():
+    a, b = "/w/repo-x", "/w/repo/x"
+    # a real directory named exactly like a's generated name, and one that merely looks generated
+    c = a + "~" + hashlib.sha256(a.encode()).hexdigest()[:12]
+    lone = "/w/notes~0123456789abcdef"
+    expected = project_names([a, b, c, lone])
+    for order in itertools.permutations([a, b, c, lone]):
+        assert project_names(order) == expected  # the order doesn't matter
+    assert len(set(expected.values())) == 4
+    assert expected[a] == mangle(c)  # a's generated name is c's mangled path...
+    assert expected[c] != mangle(c)  # ...so c can't have it: it looks generated, so it is hashed
+    assert expected[lone].startswith(mangle(lone) + "~") and expected[lone] != mangle(lone)
+    assert project_names(["/w/plain~notes"]) == {"/w/plain~notes": "-w-plain~notes"}
+
+
+def test_clashing_hashes_grow_until_the_names_are_unique(monkeypatch):
+    real = hashlib.sha256
+
+    class Weak:  # the first 12 hex digits are the same for every path
+        def __init__(self, data):
+            self.digest = real(data).hexdigest()
+
+        def hexdigest(self):
+            return "0" * 12 + self.digest[12:]
+
+    monkeypatch.setattr(common.hashlib, "sha256", Weak)
+    names = project_names(["/w/repo-x", "/w/repo/x"])
+    assert len(set(names.values())) == 2
+    assert {len(n.rsplit("~", 1)[1]) for n in names.values()} == {16}
+
+    class Constant:
+        def __init__(self, data):
+            pass
+
+        def hexdigest(self):
+            return "0" * 64
+
+    monkeypatch.setattr(common.hashlib, "sha256", Constant)
+    with pytest.raises(ValueError, match="not unique"):
+        project_names(["/w/repo-x", "/w/repo/x"])
+
+
+def test_a_stale_confirmation_never_deletes_another_directory(copilot_store_home, tmp_path):
+    a, b = str(tmp_path / "a-b"), str(tmp_path / "a" / "b")
+    _cp_add(copilot_store_home, "cc-1", a)
+    name = next(p["name"] for p in CopilotAdapter().list_projects() if p["cwd"] == a)
+    assert name == mangle(a)  # the dialog shows a under its plain name...
+    _cp_add(copilot_store_home, "dd-2", b)  # ...then a directory that mangles alike appears
+    hashed_a = next(p["name"] for p in CopilotAdapter().list_projects() if p["cwd"] == a)
+    CopilotAdapter().delete_project(hashed_a, hard=True)  # and another client deletes a
+    assert next(p["name"] for p in CopilotAdapter().list_projects() if p["cwd"] == b) == name
+    r = _delete(name, agent="copilot", hard=True, expect_cwd=a)  # the old confirmation
+    assert r.status_code == 409 and "reload" in r.json()["detail"]
+    assert [s.session_id for s in CopilotAdapter().list_sessions(name)] == ["dd-2"]
+
+
+def test_the_adapter_checks_the_directory_again_while_listing(copilot_store_home, monkeypatch):
+    pname = str(copilot_store_home.parent / "repo_cp").replace("/", "-")
+    with pytest.raises(ProjectChanged):
+        CopilotAdapter().delete_project(pname, hard=True, expect_cwd="/somewhere/else")
+    # the name moves between the route's check and the adapter's listing
+    real = CopilotAdapter.list_projects
+    monkeypatch.setattr(CopilotAdapter, "list_projects",
+                        lambda self: [{**p, "cwd": "/confirmed"} for p in real(self)])
+    r = _delete(pname, agent="copilot", hard=True, expect_cwd="/confirmed")
+    assert r.status_code == 409
+    assert sorted(s.session_id for s in CopilotAdapter().list_sessions(pname)) == ["aaaa-1", "bbbb-2"]
+
+
+def test_opencode_checks_the_directory_before_anything(fake_opencode, tmp_path, monkeypatch):
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(tmp_path / "exports"))
+    for hard in (False, True):
+        with pytest.raises(ProjectChanged):
+            OpencodeAdapter().delete_project(_oc_project(), hard=hard, export_first=True,
+                                             expect_cwd="/somewhere/else")
+    assert fake_opencode == [] and not (tmp_path / "exports").exists()
+
+
+def _clone_session(db, src, **changes):
+    """Another session_v2 row, like src but with changes (e.g. a new subagent)."""
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    row = {**dict(conn.execute("SELECT * FROM session_v2 WHERE id = ?", (src,)).fetchone()), **changes}
+    conn.execute(f"INSERT INTO session_v2 ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                 list(row.values()))
+    conn.commit()
+    conn.close()
+
+
+def test_opencode_refuses_subagents_that_joined_after_the_check(fake_opencode, opencode_v2_home,
+                                                                tmp_path, monkeypatch):
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(tmp_path / "exports"))
+    db = opencode_v2_home / "opencode.db"
+    real_export = OpencodeAdapter.export_session_to_file
+
+    def export_while_opencode_spawns_subagents(self, project, sid, out_dir=None):
+        if sid == "ses_v2_parent":  # after the up-front cascade check, during the exports
+            _clone_session(db, "ses_v2_child", id="ses_late_out", directory="/elsewhere")
+            _clone_session(db, "ses_v2_child", id="ses_late_in", parent_id="ses_v2_child")
+        return real_export(self, project, sid, out_dir)
+
+    monkeypatch.setattr(OpencodeAdapter, "export_session_to_file", export_while_opencode_spawns_subagents)
+    r = _delete(_oc_project(), agent="opencode", hard=True, export_first=True)
+    assert r.status_code == 200, r.text
+    res = r.json()
+    assert sorted(res["errors"]) == ["ses_v2_child", "ses_v2_parent"]
+    assert "ses_late_out" in res["errors"]["ses_v2_parent"]
+    assert "ses_late_in" in res["errors"]["ses_v2_child"]
+    assert fake_opencode == [["session", "delete", "ses_old"]] and res["sessions"] == ["ses_old"]
+    conn = sqlite3.connect(db)
+    left = {r[0] for r in conn.execute("SELECT id FROM session_v2")}
+    conn.close()
+    assert {"ses_v2_parent", "ses_v2_child", "ses_late_out", "ses_late_in"} <= left
+
+
+def test_the_index_follows_a_renamed_project(copilot_store_home, tmp_path):
+    a, b = str(tmp_path / "a-b"), str(tmp_path / "a" / "b")
+    _cp_add(copilot_store_home, "cc-1", a)
+    _cp_add(copilot_store_home, "dd-2", b, text="zebrafish")
+    index_db.reindex()
+    hashed = {p["cwd"]: p["name"] for p in CopilotAdapter().list_projects()}
+    assert [h["project"] for h in index_db.search("zebrafish", agent="copilot")] == [hashed[b]]
+    CopilotAdapter().delete_project(hashed[a], hard=True)  # without a, b's name is plain again
+    index_db.reindex()  # b's session is unchanged, but its project is now called mangle(b)
+    assert [h["project"] for h in index_db.search("zebrafish", agent="copilot")] == [mangle(b)]
+    assert index_db.search("zebrafish", agent="copilot", project=mangle(b))
 
 
 def test_a_removed_projects_docs_leave_the_index(agy_home):

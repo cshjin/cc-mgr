@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import stat
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,19 +143,66 @@ def mangle(cwd: str) -> str:
     return cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
 
 
+# How every generated project name ends; no plain name may end like this.
+_GENERATED_NAME = re.compile(r"~[0-9a-f]{12,}$")
+
+
 def project_names(cwds: Iterable[str]) -> dict[str, str]:
-    """A unique project name for each working directory: its mangled path,
-    plus a short hash of the path when two directories mangle to the same
-    name (e.g. repo-x and repo/x), so a name never stands for two directories."""
-    groups: dict[str, set[str]] = {}
-    for cwd in cwds:
-        groups.setdefault(mangle(cwd), set()).add(cwd)
-    out: dict[str, str] = {}
-    for name, members in groups.items():
-        for cwd in members:
-            out[cwd] = name if len(members) == 1 else \
-                f"{name}~{hashlib.sha1(cwd.encode('utf-8')).hexdigest()[:8]}"
-    return out
+    """A unique project name for each working directory.
+
+    The name is the mangled path, unless another directory mangles alike
+    (repo-x vs repo/x) or the mangled path itself ends like a generated name;
+    then it is the mangled path plus "~" and 12 hex digits of the path's
+    sha256. Plain names never end in "~<12+ hex digits>" and generated ones
+    always do, so the two kinds can't meet; generated names that still clash
+    get longer hashes. Every final name is unique (else ValueError), and the
+    result doesn't depend on the order of cwds.
+    """
+    cwds = sorted(set(cwds))
+    mangled = {cwd: mangle(cwd) for cwd in cwds}
+    count = Counter(mangled.values())
+    names = dict(mangled)
+    pending = [c for c in cwds if count[mangled[c]] > 1 or _GENERATED_NAME.search(mangled[c])]
+    for length in (12, 16, 24, 32, 64):
+        if not pending:
+            return names
+        for cwd in pending:
+            digest = hashlib.sha256(cwd.encode("utf-8", "surrogatepass")).hexdigest()
+            names[cwd] = f"{mangled[cwd]}~{digest[:length]}"
+        taken = Counter(names.values())
+        pending = [c for c in cwds if taken[names[c]] > 1]
+    if pending:  # needs equal 256-bit hashes of distinct paths
+        raise ValueError("project names are not unique")
+    return names
+
+
+def restore_dir(src: Path, dst: Path) -> bool:
+    """Move the directory src back to dst without ever replacing anything there.
+
+    os.rename alone would silently replace an *empty* directory at dst (POSIX),
+    so dst is claimed with mkdir first: if anything exists there, nothing moves
+    and False is returned. The entries then move into the claimed directory one
+    by one, each one skipped if an entry of that name appeared meanwhile; src
+    is removed only once it is empty, and dst gets src's mode and times back.
+    True when everything went back.
+    """
+    try:
+        os.mkdir(dst)
+    except FileExistsError:
+        return False
+    st = os.stat(src)
+    complete = True
+    for name in sorted(os.listdir(src)):
+        target = os.path.join(dst, name)
+        if os.path.lexists(target):
+            complete = False
+            continue
+        os.rename(os.path.join(src, name), target)
+    os.chmod(dst, stat.S_IMODE(st.st_mode))
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    if complete:
+        os.rmdir(src)
+    return complete
 
 
 def _fenced(text: str, lang: str = "") -> str:

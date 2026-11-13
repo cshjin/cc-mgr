@@ -45,9 +45,9 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
-from . import AgentAdapter, Capabilities, UnsupportedCapability
+from . import AgentAdapter, Capabilities, ProjectChanged, UnsupportedCapability
 from .common import (
     STD_WINDOW, SessionSummary, connect_sqlite_ro, default_export_dir,
     is_claude_model, is_safe_id, private_mkdir, project_names, read_doc_file,
@@ -214,6 +214,14 @@ def _dir_names(conn: sqlite3.Connection, table: str) -> dict[str, str]:
     the names don't change when a session is archived)."""
     return project_names(r[0] for r in conn.execute(
         f"SELECT DISTINCT directory FROM {table} WHERE directory IS NOT NULL AND directory != ''"))
+
+
+def _descendants(conn: sqlite3.Connection, session_id: str) -> list[str]:
+    """A v2 session and all its descendants (archived ones too)."""
+    return [r[0] for r in conn.execute(
+        "WITH RECURSIVE tree(id) AS (SELECT ? UNION "
+        "SELECT s.id FROM session_v2 s JOIN tree t ON s.parent_id = t.id) "
+        "SELECT id FROM tree", (session_id,))]
 
 
 def _json(raw: Any) -> dict[str, Any]:
@@ -943,12 +951,11 @@ class OpencodeAdapter(AgentAdapter):
             return self._delete_v2(db_file, session_id, hard)
         return self._delete_v1(db_file, session_id, hard)
 
-    def _cascade(self, project: str) -> tuple[list[str], list[str]]:
-        """What a permanent delete of the project's listed sessions takes along
+    def _cascade(self, cwd: str) -> tuple[list[str], list[str]]:
+        """What a permanent delete of the sessions listed under cwd takes along
         (`opencode session delete` removes a session's descendants): (archived
         sessions in this directory, sessions under other directories)."""
         db_file = self._db_path()
-        cwd = self._project_cwd(project)
         if not db_file or not cwd:
             return [], []
         conn = _connect_ro(db_file)
@@ -970,26 +977,69 @@ class OpencodeAdapter(AgentAdapter):
 
     def project_delete_preview(self, project: str) -> dict[str, Any]:
         preview = super().project_delete_preview(project)
-        here, elsewhere = self._cascade(project)
+        here, elsewhere = self._cascade(self._project_cwd(project))
         preview["hidden"] = len(here)          # archived subagents, removed by a permanent delete
         preview["outside"] = len(elsewhere)    # ...and ones under other directories
         return preview
 
     def delete_project(self, project: str, hard: bool = False, include_memory: bool = False,
-                       export_first: bool = False) -> dict[str, Any]:
+                       export_first: bool = False, expect_cwd: str | None = None,
+                       guard: Callable[[str], None] | None = None) -> dict[str, Any]:
+        """Archive (soft) or delete every session of the project.
+
+        A permanent delete takes each session's descendants along, so it is
+        bounded to what was approved: the listed sessions and the archived
+        subagents in this directory (exported first). Descendants elsewhere
+        refuse the whole delete up front, and right before each session goes
+        its subtree is looked up again: if anything else joined it meanwhile
+        (e.g. a new subagent), that session is refused and kept."""
+        cwd = self._project_cwd(project)
+        if expect_cwd is not None and cwd != expect_cwd:
+            raise ProjectChanged(f"project {project} now refers to {cwd or 'no directory'}, "
+                                 f"not {expect_cwd or 'no directory'}; reload and try again")
+        if not hard:  # archiving touches only the session itself
+            return super().delete_project(project, export_first=export_first,
+                                          expect_cwd=expect_cwd, guard=guard)
+        here, elsewhere = self._cascade(cwd)
+        if elsewhere:
+            raise ValueError(
+                f"a permanent delete would also remove {len(elsewhere)} subagent session(s) "
+                f"stored under other directories (OpenCode deletes a session's "
+                f"descendants); archive this project instead, or delete those first")
+        approved = set(here) | {s.session_id for s in self.list_sessions(project)}
         exported: list[str] = []
-        if hard:
-            here, elsewhere = self._cascade(project)
-            if elsewhere:
-                raise ValueError(
-                    f"a permanent delete would also remove {len(elsewhere)} subagent session(s) "
-                    f"stored under other directories (OpenCode deletes a session's "
-                    f"descendants); archive this project instead, or delete those first")
-            if export_first:  # the archived subagents go too: export them before anything is deleted
-                exported = [str(self.export_session_to_file(project, sid)) for sid in here]
-        result = super().delete_project(project, hard=hard, export_first=export_first)
+        if export_first:  # the archived subagents go too: export them before anything is deleted
+            exported = [str(self.export_session_to_file(project, sid)) for sid in here]
+
+        def bounded(session_id: str) -> None:
+            if guard is not None:
+                guard(session_id)
+            extra = sorted(set(self._subtree(session_id)) - approved)
+            if extra:
+                raise RuntimeError(
+                    f"not deleting {session_id}: OpenCode would also delete "
+                    f"{len(extra)} session(s) that weren't part of this delete "
+                    f"({', '.join(extra[:3])}{', …' if len(extra) > 3 else ''}); "
+                    f"reload and try again")
+
+        result = super().delete_project(project, hard=True, export_first=export_first,
+                                        expect_cwd=expect_cwd, guard=bounded)
         result["exported"] = exported + result["exported"]
         return result
+
+    def _subtree(self, session_id: str) -> list[str]:
+        """The session and every descendant: what `opencode session delete`
+        removes (v1 deletes one session only)."""
+        db_file = self._db_path()
+        if not db_file:
+            return [session_id]
+        conn = _connect_ro(db_file)
+        try:
+            if not _is_v2(conn):
+                return [session_id]
+            return _descendants(conn, session_id)
+        finally:
+            conn.close()
 
     def _delete_v2(self, db_file: Path, session_id: str, hard: bool) -> dict[str, Any]:
         if not _opencode_cli() or not _is_cli_managed(db_file):
@@ -998,10 +1048,7 @@ class OpencodeAdapter(AgentAdapter):
                 "has open, so cc_mgr shows it read-only")
         conn = _connect_ro(db_file)
         try:  # `opencode session delete` also removes every descendant session
-            tree = [r[0] for r in conn.execute(
-                "WITH RECURSIVE tree(id) AS (SELECT ? UNION "
-                "SELECT s.id FROM session_v2 s JOIN tree t ON s.parent_id = t.id) "
-                "SELECT id FROM tree", (session_id,))]
+            tree = _descendants(conn, session_id)
         finally:
             conn.close()
         if hard:

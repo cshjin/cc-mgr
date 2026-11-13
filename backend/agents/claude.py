@@ -74,6 +74,9 @@ class ClaudeAdapter(AgentAdapter):
     def project_delete_preview(self, project):
         return store.project_delete_preview(project)
 
-    def delete_project(self, project, hard=False, include_memory=False, export_first=False):
+    def delete_project(self, project, hard=False, include_memory=False, export_first=False,
+                       expect_cwd=None, guard=None):
+        # The name is the folder under projects/: it can't come to mean another
+        # directory, so the route's expect_cwd check covers this agent.
         return store.delete_project(project, hard=hard, include_memory=include_memory,
                                     export_first=export_first)

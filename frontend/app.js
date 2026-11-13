@@ -163,7 +163,27 @@ function updateSubLabel() {
 
 async function loadProjects() {
   state.projects = await api("/api/projects");
+  if (state.activeProject) {
+    const p = followProject(state.projects, state.activeProject, (state.activeProjectMeta || {}).cwd);
+    if (!p) {
+      deselectProject();  // re-renders the list
+      return;
+    }
+    state.activeProject = p.name;
+    state.activeProjectMeta = p;
+    renderProjNav();  // its counts come from the project row
+    updateSearchPlaceholder();  // shows the project name
+  }
   renderProjects();
+}
+
+// The row that is still the open project after the list reloads: the same name
+// and directory; else the same directory under its new name (names change when
+// a directory that mangles alike appears or goes); else the same name.
+function followProject(projects, name, cwd) {
+  const byName = projects.find((p) => p.name === name);
+  if (byName && (byName.cwd || "") === (cwd || "")) return byName;
+  return (cwd && projects.find((p) => p.cwd === cwd)) || byName || null;
 }
 
 // Projects to show, filtered (only those whose directory is gone) and sorted.
@@ -729,15 +749,18 @@ async function openProjectDeleteModal(name) {
   const what = total ? plural(total, "session")
     : (pv.hidden ? `${pv.hidden} unlisted` : "the project");
   let busy = false;  // a request is running: nothing may re-enable the button
+  let stale = false;  // the server says the project changed since this dialog opened
   const sync = () => {
     const hard = hardBox.checked;
     body.querySelector("#pdTypeRow").hidden = !hard;
-    body.querySelectorAll("input").forEach((i) => { i.disabled = busy || (i === hardBox && Boolean(pv.outside)); });
+    body.querySelectorAll("input").forEach((i) => {
+      i.disabled = busy || stale || (i === hardBox && Boolean(pv.outside));
+    });
     // A project whose only content is memory that is being kept: nothing would change.
     const nothing = !total && !pv.hidden && pv.memory_files && !(memBox && memBox.checked);
     confirmBtn.textContent = nothing ? "Nothing to remove unless the memory goes too"
       : (hard ? `Delete ${what} permanently` : `Remove ${what}`);
-    confirmBtn.disabled = busy || Boolean(nothing) || (hard && typed.value.trim() !== word);
+    confirmBtn.disabled = busy || stale || Boolean(nothing) || (hard && typed.value.trim() !== word);
   };
   hardBox.addEventListener("change", sync);
   if (memBox) memBox.addEventListener("change", sync);
@@ -745,7 +768,7 @@ async function openProjectDeleteModal(name) {
   sync();
   body.querySelector("#pdCancel").addEventListener("click", close);
   confirmBtn.addEventListener("click", async () => {
-    if (busy) return;
+    if (busy || stale) return;
     const hard = hardBox.checked;
     const exportFirst = Boolean(body.querySelector("#pdExport") && body.querySelector("#pdExport").checked);
     const includeMemory = Boolean(memBox && memBox.checked);
@@ -758,9 +781,18 @@ async function openProjectDeleteModal(name) {
       u.searchParams.set("agent", agent);
       const r = await fetch(u, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ export_first: exportFirst, include_memory: includeMemory, hard }),
+        // the directory this dialog showed: the server refuses if the name means another one now
+        body: JSON.stringify({ export_first: exportFirst, include_memory: includeMemory, hard,
+                               expect_cwd: p.cwd || "" }),
       });
-      if (!r.ok) throw await httpError(r);
+      if (!r.ok) {
+        const err = await httpError(r);
+        if (r.status === 409) {
+          stale = true;
+          if (state.agent === agent) await loadProjects().catch(() => {});
+        }
+        throw err;
+      }
       const res = await r.json();
       close();
       if (state.agent === agent) {
@@ -769,7 +801,8 @@ async function openProjectDeleteModal(name) {
       }
       flash(projectDeleteResultText(res, hard));
     } catch (e) {
-      body.querySelector("#pdStatus").textContent = "Failed: " + e.message;
+      body.querySelector("#pdStatus").textContent = "Failed: " + e.message +
+        (stale ? " The list has been refreshed: open this dialog again from it." : "");
       busy = false;
       sync();
     }

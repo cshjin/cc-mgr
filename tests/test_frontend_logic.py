@@ -129,3 +129,22 @@ def test_project_delete_dialog_texts():
                          "Not deleted (1): cccccccc: busy")
     assert r["archived"] == "Removed 1 session (reversible)."
     assert r["hard"] == "Permanently deleted 1 session. Exported 1 to Markdown first."
+
+
+def test_follow_project_after_the_list_reloads():
+    projects = [{"name": "-w-repo-x", "cwd": "/w/repo/x"}, {"name": "-w-a", "cwd": "/w/a"},
+                {"name": "-mem-only", "cwd": ""}]
+    r = run_js(["followProject"], f"""
+        const ps = {json.dumps(projects)};
+        const name = (p) => p ? p.name : null;
+        process.stdout.write(JSON.stringify({{
+          same: name(followProject(ps, "-w-a", "/w/a")),
+          renamed: name(followProject(ps, "-w-repo-x~0123456789ab", "/w/repo/x")),
+          gone: name(followProject(ps, "-w-old", "/w/old")),
+          noCwd: name(followProject(ps, "-mem-only", "")),
+          cwdChanged: name(followProject(ps, "-w-a", "/w/a-before")) }}));""")
+    assert r == {"same": "-w-a",
+                 "renamed": "-w-repo-x",    # the name changed: follow the directory
+                 "gone": None,              # deselect
+                 "noCwd": "-mem-only",
+                 "cwdChanged": "-w-a"}      # e.g. a Claude folder whose newest session moved

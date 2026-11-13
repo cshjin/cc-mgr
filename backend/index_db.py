@@ -181,11 +181,13 @@ def reindex(force: bool = False) -> dict[str, Any]:
                 for summ in adapter.list_sessions(pname):
                     seen_sessions.add(summ.session_id)
                     row = conn.execute(
-                        "SELECT mtime, size FROM sessions WHERE agent=? AND session_id=?",
+                        "SELECT mtime, size, project FROM sessions WHERE agent=? AND session_id=?",
                         (agent, summ.session_id),
                     ).fetchone()
+                    # unchanged, and still under the same project name (names can
+                    # change when a directory that mangles alike appears or goes)
                     if (row and not force and row["mtime"] == summ.mtime
-                            and row["size"] == summ.size_bytes):
+                            and row["size"] == summ.size_bytes and row["project"] == pname):
                         skipped += 1
                         continue
 

@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import index_db, store
-from .agents import UnsupportedCapability, get_adapter, list_agents
+from .agents import ProjectChanged, UnsupportedCapability, get_adapter, list_agents
 from .agents.common import is_safe_id, is_safe_name
 
 app = FastAPI(title="cc_mgr", version="0.6.0")
@@ -354,17 +354,35 @@ class ProjectDeleteRequest(BaseModel):
     export_first: bool = True
     include_memory: bool = False
     hard: bool = False
+    # The working directory the confirmation showed ("" if none). A project
+    # name can come to mean another directory (names change when one that
+    # mangles alike appears or goes), so the delete only goes ahead while the
+    # name still means this one.
+    expect_cwd: str
 
 
 @app.post("/api/projects/{project}/delete")
 def api_project_delete(project: str, req: ProjectDeleteRequest, agent: str | None = None):
     """Delete every session of a project (soft by default); per-session
-    failures come back in `errors`, the rest still go."""
+    failures come back in `errors`, the rest still go. 409 if the project
+    name no longer means the directory the caller confirmed."""
     _project(project)
     ad = _adapter(agent)
+    if not ad.capabilities.can_delete:
+        raise HTTPException(status_code=404, detail="delete not supported")
+    current = {p["name"]: p.get("cwd") or "" for p in ad.list_projects()}
+    if project not in current:
+        raise HTTPException(status_code=404, detail=f"project {project} not found; reload the list")
+    if current[project] != req.expect_cwd:
+        raise HTTPException(
+            status_code=409,
+            detail=f"project {project} now refers to {current[project] or 'no directory'}, "
+                   f"not {req.expect_cwd or 'no directory'}; reload the list and try again")
     try:
         result = ad.delete_project(project, hard=req.hard, include_memory=req.include_memory,
-                                   export_first=req.export_first)
+                                   export_first=req.export_first, expect_cwd=req.expect_cwd)
+    except ProjectChanged as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except UnsupportedCapability as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
