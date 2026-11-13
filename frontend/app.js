@@ -45,6 +45,7 @@ const state = {
   agent: localStorage.getItem("cc_agent") || "claude",
   agents: [],
   caps: null,
+  showSubagents: localStorage.getItem("cc_showSubagents") === "1",
 };
 
 const CONV_PAGE = 40;
@@ -314,13 +315,35 @@ function ctxLabel(s) {
   };
 }
 
+// Top-level sessions, plus (when shown) their subagent children depth-first.
+function sessionTree(sessions, showSubagents) {
+  const ids = new Set(sessions.map((s) => s.session_id));
+  const isChild = (s) => Boolean(s.parent_id) && ids.has(s.parent_id);
+  const kids = {};
+  for (const s of sessions) if (isChild(s)) (kids[s.parent_id] = kids[s.parent_id] || []).push(s);
+  const tops = sessions.filter((s) => !isChild(s));
+  const visible = [];
+  const seen = new Set();
+  const pushTree = (s, depth) => {
+    if (seen.has(s.session_id)) return;
+    seen.add(s.session_id);
+    visible.push({ s, depth });
+    if (showSubagents) for (const k of kids[s.session_id] || []) pushTree(k, depth + 1);
+  };
+  for (const s of tops) pushTree(s, 0);
+  return { visible, kids, topCount: tops.length, childTotal: sessions.length - tops.length };
+}
+
 function renderSessions() {
   const el = $("#sessionPane");
   if (!state.sessions.length) {
     el.innerHTML = '<div class="empty">No sessions in this project.</div>';
     return;
   }
-  const rows = state.sessions.map((s) => {
+  // Subagent (child) sessions hide under their parent unless toggled on.
+  const { visible, kids, topCount, childTotal } = sessionTree(state.sessions, state.showSubagents);
+
+  const rows = visible.map(({ s, depth }) => {
     const pct = ctxPct(s);
     const ctx = ctxLabel(s);
     const taskBadge = s.total_tasks
@@ -330,10 +353,12 @@ function renderSessions() {
       : "";
     const memBadge = s.has_memory ? '<span class="badge mem">◆ memory</span>' : "";
     const modelBadge = s.model ? `<span class="badge model">${esc(shortModel(s.model))}</span>` : "";
+    const nKids = (kids[s.session_id] || []).length;
+    const subBadge = nKids ? `<span class="badge sub" title="subagent sessions">⑂ ${nKids} subagent${nKids === 1 ? "" : "s"}</span>` : "";
     return `
-      <div class="session ${s.session_id === state.activeSession ? "active" : ""}" data-id="${esc(s.session_id)}">
+      <div class="session ${s.session_id === state.activeSession ? "active" : ""} ${depth ? "child" : ""}" data-id="${esc(s.session_id)}" style="margin-left:${depth * 18}px">
         <div class="session-head">
-          <span class="session-id" title="${esc(s.session_id)}">${esc(s.title || s.session_id.slice(0, 8))}</span>
+          <span class="session-id" title="${esc(s.session_id)}">${depth ? "↳ " : ""}${esc(s.title || s.session_id.slice(0, 8))}</span>
           <span class="session-time">${fmtTime(s.mtime)}</span>
         </div>
         <div class="session-prompt ${state.showPrompts ? "" : "hidden"}">${esc(s.last_prompt || s.first_prompt || "(no prompt)")}</div>
@@ -343,14 +368,25 @@ function renderSessions() {
         </div>
         <div class="badges">
           <span class="badge">${s.user_turns}↗ ${s.assistant_turns}↙</span>
-          ${modelBadge}${memBadge}${taskBadge}
+          ${modelBadge}${subBadge}${memBadge}${taskBadge}
         </div>
       </div>`;
   }).join("");
-  el.innerHTML = `<h2 class="pane-title">${state.sessions.length} sessions · newest first</h2>` + rows;
+  const toggle = childTotal
+    ? `<label class="subtoggle"><input type="checkbox" id="showSubagents" ${state.showSubagents ? "checked" : ""} /> show ${childTotal} subagent session${childTotal === 1 ? "" : "s"}</label>`
+    : "";
+  el.innerHTML = `<h2 class="pane-title">${topCount} sessions · newest first ${toggle}</h2>` + rows;
   el.querySelectorAll(".session").forEach((node) => {
     node.addEventListener("click", () => openSession(node.dataset.id));
   });
+  const tg = $("#showSubagents");
+  if (tg) {
+    tg.addEventListener("change", () => {
+      state.showSubagents = tg.checked;
+      localStorage.setItem("cc_showSubagents", tg.checked ? "1" : "0");
+      renderSessions();
+    });
+  }
 }
 
 // Aggregated task board across all sessions in the project

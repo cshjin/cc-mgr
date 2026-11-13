@@ -222,6 +222,9 @@ body {
 .badge.task-open { color: var(--amber); border-color: #d9a44144; }
 .badge.task-done { color: var(--green); border-color: #5fb87a44; }
 .badge.model { color: var(--accent); border-color: #d9775744; }
+.badge.sub { color: var(--fg-dim); }
+.session.child { border-left: 2px solid var(--border); }
+.subtoggle { float: right; text-transform: none; letter-spacing: 0; font-size: 12px; cursor: pointer; }
 
 /* context size bar */
 .ctxbar { margin-top: 9px; }
