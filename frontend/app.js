@@ -737,10 +737,14 @@ function renderTasks(body, tasks) {
 // opts.sid: fixed session for all cards (session view).
 // opts.perCard: read session id from each card's data-sid (project view).
 function wireKanban(scope, opts = {}) {
+  // Remember the dragged element itself: task ids repeat across sessions on the
+  // project board, so looking a card up by data-id can find the wrong one.
+  let dragCard = null;
   let dragId = null;
   let dragSid = null;
   scope.querySelectorAll(".kcard").forEach((card) => {
     card.addEventListener("dragstart", (e) => {
+      dragCard = card;
       dragId = card.dataset.id;
       dragSid = opts.perCard ? card.dataset.sid : opts.sid;
       card.classList.add("dragging");
@@ -755,12 +759,12 @@ function wireKanban(scope, opts = {}) {
       e.preventDefault();
       drop.classList.remove("over");
       const newStatus = drop.dataset.status;
-      if (!dragId || !dragSid) return;
-      const card = scope.querySelector(`.kcard[data-id="${CSS.escape(dragId)}"]`);
-      if (card && card.parentElement !== drop) {
+      const card = dragCard;
+      if (!card || !dragId || !dragSid) return;
+      if (card.parentElement !== drop) {
         drop.appendChild(card);
         try {
-          const tu = new URL(`/api/sessions/${dragSid}/tasks/${encodeURIComponent(dragId)}`,
+          const tu = new URL(`/api/sessions/${encodeURIComponent(dragSid)}/tasks/${encodeURIComponent(dragId)}`,
                              location.origin);
           tu.searchParams.set("agent", state.agent);
           const r = await fetch(tu, {
@@ -774,7 +778,7 @@ function wireKanban(scope, opts = {}) {
           reloadTasksView();
         }
       }
-      dragId = null; dragSid = null;
+      dragCard = null; dragId = null; dragSid = null;
     });
   });
 }

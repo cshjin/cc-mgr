@@ -42,3 +42,44 @@ def test_session_tree_hides_and_nests_subagents():
     assert r["hidden"] == ["p1", "p2", "orphan"]  # an orphan (parent not listed) stays reachable
     assert r["shown"] == [["p1", 0], ["c1", 1], ["g1", 2], ["p2", 0], ["orphan", 0]]
     assert (r["tops"], r["kids"], r["p1kids"]) == (3, 2, 1)
+
+
+KANBAN_HARNESS = """
+const state = { agent: "claude" };
+const location = { origin: "http://localhost" };
+const calls = [];
+async function fetch(u, opts) { calls.push([String(u), opts.method, opts.body]); return { ok: true }; }
+async function httpError(r) { return new Error("http"); }
+function flash(msg) { calls.push(["flash", msg]); }
+function reloadTasksView() {}
+function el(data, parent) {
+  return { dataset: data, parentElement: parent || null, listeners: {},
+           classList: { add() {}, remove() {} },
+           addEventListener(t, f) { this.listeners[t] = f; },
+           appendChild(c) { c.parentElement = this; } };
+}
+"""
+
+
+def test_project_board_moves_the_dragged_card_even_when_task_ids_repeat():
+    # Session A's task "1" is already completed; session B's task "1" is pending.
+    # The old drop handler re-found the card by data-id, got A's card (already in
+    # the target column), and silently skipped the PATCH.
+    r = run_js(["wireKanban"], KANBAN_HARNESS + """
+        const pending = el({ status: "pending" }), done = el({ status: "completed" });
+        const cardA = el({ id: "1", sid: "A" }, done), cardB = el({ id: "1", sid: "B" }, pending);
+        const scope = {
+          querySelectorAll(sel) { return sel === ".kcard" ? [cardA, cardB] : [pending, done]; },
+          querySelector() { return cardA; },
+        };
+        wireKanban(scope, { perCard: true });
+        const ev = { preventDefault() {}, dataTransfer: {} };
+        cardB.listeners.dragstart(ev);
+        (async () => {
+          await done.listeners.drop(ev);
+          process.stdout.write(JSON.stringify({ moved: cardB.parentElement === done,
+                                                untouched: cardA.parentElement === done, calls }));
+        })();""")
+    assert r["moved"] and r["untouched"]
+    assert r["calls"] == [["http://localhost/api/sessions/B/tasks/1?agent=claude", "PATCH",
+                           '{"status":"completed"}']]
