@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -42,15 +43,28 @@ def safe_join(root: Path, *parts: str) -> Path:
 
 
 def private_mkdir(path: Path) -> Path:
-    """mkdir -p, creating missing directories owner-only (0700)."""
+    """mkdir -p owner-only (0700). An existing directory we own is tightened
+    too (an upgrade may find it 0755), unless it's a shared sticky dir like /tmp."""
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        st = path.stat()
+        if st.st_uid == os.getuid() and not st.st_mode & stat.S_ISVTX:
+            os.chmod(path, 0o700)
+    except (OSError, AttributeError):  # AttributeError: no os.getuid on Windows
+        pass
     return path
 
 
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 def write_private(path: Path, text: str) -> Path:
-    """Write text to a file only its owner can read (0600)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Write text to a file only its owner can read (0600): never through a
+    symlink, and tightening a file an older version left world-readable."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fh.fileno(), 0o600)
         fh.write(text)
     return path
 
@@ -270,7 +284,7 @@ def save_doc_file(cwd: str, filename: str, content: str) -> Path:
     base = Path(cwd)
     if not base.is_dir():
         raise FileNotFoundError(f"working directory does not exist: {cwd}")
-    path = base / filename
+    path = safe_join(base, filename)  # refuses a doc symlinked outside the project
     path.write_text(content, encoding="utf-8")
     return path
 

@@ -169,38 +169,57 @@ def test_v2_delete_refuses_a_db_the_service_does_not_hold(opencode_v2_home, monk
         OpencodeAdapter().delete_session(_pname(), "ses_v2_parent", hard=True)
 
 
+HOLDER = """
+import sqlite3, sys, time
+handles = [open(p, "rb") for p in sys.argv[1].split(",") if p]        # read-only, e.g. a backup
+conns = []
+for p in [p for p in sys.argv[2].split(",") if p]:                    # live WAL databases
+    c = sqlite3.connect(p)
+    c.execute("PRAGMA journal_mode=WAL"); c.execute("CREATE TABLE IF NOT EXISTS t(x)")
+    c.execute("INSERT INTO t VALUES (1)"); c.commit(); conns.append(c)
+print("ready", flush=True)
+time.sleep(60)
+"""
+
+
+def _service(read_only, live):
+    proc = subprocess.Popen([sys.executable, "-c", HOLDER, ",".join(map(str, read_only)),
+                             ",".join(map(str, live))], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "ready"
+    return proc
+
+
 @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc")
 def test_service_db_identity_comes_from_the_running_process(opencode_v2_home, monkeypatch, tmp_path):
-    # OPENCODE_DB points cc_mgr at the fixture DB, while "the service" (a real
-    # process) holds a different database open — writes must be refused.
-    other = tmp_path / "service.db"
-    sqlite3.connect(other).close()
-    holder = subprocess.Popen(
-        [sys.executable, "-c", f"import sys, time; f = open({str(other)!r}, 'rb'); "
-                               "print('ready', flush=True); time.sleep(60)"],
-        stdout=subprocess.PIPE, text=True)
-    try:
-        assert holder.stdout.readline().strip() == "ready"
-        info = {"pid": holder.pid, "hostname": socket.gethostname()}
+    # OPENCODE_DB points cc_mgr at the fixture DB; "the service" (a real process)
+    # writes live.db and merely reads backup.db — only live.db may be mutated.
+    live, backup, live2 = tmp_path / "live.db", tmp_path / "backup.db", tmp_path / "live2.db"
+    sqlite3.connect(backup).close()
 
-        class Proc:
-            returncode = 0
-            stderr = ""
-            stdout = json.dumps(info)
+    class Proc:
+        returncode = 0
+        stderr = ""
+        stdout = ""
 
-        monkeypatch.setattr(oc, "_opencode_cli", lambda: "/fake/bin/opencode")
-        monkeypatch.setattr(oc.subprocess, "run", lambda *a, **k: Proc())
-        monkeypatch.setattr(oc, "_run_opencode", lambda args: pytest.fail("must not call opencode"))
-        assert oc._service_db_files() == {os.path.realpath(other)}
-        assert oc._is_cli_managed(other)
-        assert not oc._is_cli_managed(opencode_v2_home / "opencode.db")
-        with pytest.raises(UnsupportedCapability):
-            OpencodeAdapter().delete_session(_pname(), "ses_v2_parent", hard=True)
-        Proc.stdout = json.dumps({**info, "hostname": "another-node"})
-        assert oc._service_db_files() is None  # a service elsewhere can't be verified
-    finally:
-        holder.kill()
-        holder.wait()
+    monkeypatch.setattr(oc, "_opencode_cli", lambda: "/fake/bin/opencode")
+    monkeypatch.setattr(oc.subprocess, "run", lambda *a, **k: Proc())
+    monkeypatch.setattr(oc, "_run_opencode", lambda args: pytest.fail("must not call opencode"))
+    for read_only, live_dbs, expected in (([backup], [live], {live}),
+                                          ([], [live, live2], {live, live2})):
+        holder = _service(read_only, live_dbs)
+        try:
+            Proc.stdout = json.dumps({"pid": holder.pid, "hostname": socket.gethostname()})
+            assert oc._service_db_files() == {os.path.realpath(p) for p in expected}
+            assert not oc._is_cli_managed(backup)  # only read: not the service's database
+            assert oc._is_cli_managed(live) is (len(expected) == 1)  # two live DBs: ambiguous
+            assert not oc._is_cli_managed(opencode_v2_home / "opencode.db")
+            with pytest.raises(UnsupportedCapability):
+                OpencodeAdapter().delete_session(_pname(), "ses_v2_parent", hard=True)
+            Proc.stdout = json.dumps({"pid": holder.pid, "hostname": "another-node"})
+            assert oc._service_db_files() is None  # a service elsewhere can't be verified
+        finally:
+            holder.kill()
+            holder.wait()
 
 
 # ---- context statistics (review follow-up) ----
@@ -236,6 +255,8 @@ def _turn(model, ctx=None):
     ([("compaction", {"summary": "s", "model": {"id": "gpt-6-astra"},
                       "tokens": {"input": 300_000}}), _turn("claude-opus-5.5", 100_000)],
      (100_000, False)),
+    # an earlier Claude peak proves nothing once the session runs on GPT
+    ([_turn("claude-opus-5.5", 250_000), _turn("gpt-6-astra", 100_000)], (100_000, False)),
     # unfinished (token-less) turns don't hide the last real context
     ([_turn("claude-opus-5.5", 120_000)] + [_turn("claude-opus-5.5")] * 6, (120_000, False)),
 ])
@@ -245,6 +266,25 @@ def test_v2_context_uses_full_history_per_model(tmp_path, monkeypatch, messages,
     monkeypatch.setenv("OPENCODE_DB", str(db))
     s = OpencodeAdapter().list_sessions("-w")[0]
     assert (s.context_tokens, s.context_limit_known) == expected
+
+
+def test_v2_context_follows_turns_completed_in_place(tmp_path, monkeypatch):
+    # OpenCode writes an assistant row while it streams and fills in its tokens
+    # when the turn finishes, without changing the row's seq.
+    db = tmp_path / "live.db"
+    _v2_db(db, [_turn("claude-opus-5.5")])
+    monkeypatch.setenv("OPENCODE_DB", str(db))
+    a = OpencodeAdapter()
+    assert a.list_sessions("-w")[0].context_tokens == 0
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE session_message SET time_updated = time_updated + 10, data = json_set(data, "
+                 "'$.tokens', json('{\"input\": 250000, \"output\": 0}')) WHERE id = 'm1'")
+    conn.execute("INSERT INTO session_message VALUES ('m2', 's', 'assistant', 2, 20, 20, ?)",
+                 (json.dumps(_turn("claude-opus-5.5")[1]),))  # next turn already streaming
+    conn.commit()
+    conn.close()
+    s = a.list_sessions("-w")[0]  # same process: the context cache must notice
+    assert (s.context_tokens, s.context_limit_known) == (250_000, True)
 
 
 def test_v2_mixed_part_storage_keeps_both(tmp_path, monkeypatch):

@@ -65,6 +65,20 @@ def test_security_headers(claude_home):
     assert r.headers["referrer-policy"] == "no-referrer"
 
 
+def test_access_log_never_records_the_token():
+    import logging
+    filters = logging.getLogger("uvicorn.access").filters
+    assert any(getattr(f, "_cc_mgr_redact", False) for f in filters)
+    # the shape of uvicorn's access record: client, method, path, http version, status
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1,
+                               '%s - "%s %s HTTP/%s" %d',
+                               ("127.0.0.1:5", "GET", "/?token=s3cret&x=1", "1.1", 303), None)
+    for f in filters:
+        f.filter(record)
+    msg = record.getMessage()
+    assert "s3cret" not in msg and "token=<redacted>&x=1" in msg
+
+
 def _node():
     node = shutil.which("node")
     if not node:

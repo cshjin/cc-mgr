@@ -24,6 +24,7 @@ import os
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -86,11 +87,34 @@ def _security_env(host: str, token: str, read_only: bool) -> dict[str, str]:
 # PID-file helpers
 # ---------------------------------------------------------------------------
 
+def _secure_state() -> None:
+    """Make cc_mgr's own state private before serving: the data dir (pidfiles,
+    logs, the search index — a copy of every conversation) and the exports.
+    Fresh files are created that way; this also tightens what an older
+    version left world-readable. Shared sticky dirs (e.g. /tmp) are left alone.
+    """
+    exports = Path(os.environ.get("CC_MGR_EXPORT_DIR") or HERE / "exports").expanduser()
+    for root, pattern in ((DATA_DIR, "cc_mgr*"), (exports, "**/*")):
+        if not root.is_dir():
+            continue
+        try:
+            st = root.stat()
+            if IS_WINDOWS or st.st_uid != os.getuid() or st.st_mode & stat.S_ISVTX:
+                continue
+            os.chmod(root, 0o700)
+            for p in root.glob(pattern):
+                if p.is_symlink():
+                    continue
+                os.chmod(p, 0o700 if p.is_dir() else 0o600)
+        except OSError:
+            continue
+
+
 def _write_pidfile(pid: int, host: str, port: int, token: str = "") -> None:
     path = _pid_file()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # The pidfile holds the access token: create it owner-only.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # The pidfile holds the access token: create it owner-only, never via a symlink.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump({"pid": pid, "host": host, "port": port, "token": token,
                    "hostname": _host_tag(), "start": _proc_start(pid)}, fh)
@@ -170,8 +194,12 @@ def _proc_start(pid: int) -> int | None:
 
 def _looks_like_server(argv: list[str]) -> bool:
     """argv of `python …/cc-mgr.py run …` (not merely any mention of the file)."""
-    return any(Path(a).name == "cc-mgr.py" and argv[i + 1] == "run"
+    return any(a.replace("\\", "/").rsplit("/", 1)[-1] == "cc-mgr.py" and argv[i + 1] == "run"
                for i, a in enumerate(argv[:-1]))
+
+
+def _has_proc() -> bool:
+    return Path("/proc/self/cmdline").exists()
 
 
 def _is_cc_mgr_process(pid: int, start: int | None = None) -> bool:
@@ -180,11 +208,12 @@ def _is_cc_mgr_process(pid: int, start: int | None = None) -> bool:
     A pidfile can outlive its server and the PID can be reused by anything,
     so a bare "is the PID alive" check could make `stop` signal an unrelated
     process. The command line must be `… cc-mgr.py run …` and, when the
-    pidfile recorded one, the process start time must match.
+    pidfile recorded one, the process start time must match. If identity
+    can't be established, the answer is no.
     """
     if not _pid_alive(pid):
         return False
-    if Path("/proc/self/cmdline").exists():  # Linux
+    if _has_proc():  # Linux
         try:
             raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
@@ -200,7 +229,15 @@ def _is_cc_mgr_process(pid: int, start: int | None = None) -> bool:
         except (OSError, subprocess.SubprocessError):
             return False
         return _looks_like_server(out.split())
-    return True  # Windows: tasklist can't show the command line; best effort
+    # Windows: tasklist can't show command lines; ask CIM. Unverifiable -> no.
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
+            capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return _looks_like_server([a.strip('"') for a in out.split()])
 
 
 def _terminate(pid: int) -> None:
@@ -338,6 +375,7 @@ def _serve(host: str, port: int, reload: bool, auto_port: bool = False,
 
     token = "" if no_token else (os.environ.get("CC_MGR_TOKEN") or secrets.token_urlsafe(24))
     os.environ.update(_security_env(host, token, read_only))
+    _secure_state()
     if not token:
         exposure = ("anyone who can reach it over the network" if host not in LOOPBACK_NAMES
                     else "every user logged into this machine")
@@ -380,7 +418,8 @@ def _open_log() -> int:
     left a world-readable log behind."""
     log_file = _log_file()
     log_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                 0o600)
     try:
         os.chmod(log_file, 0o600)
     except OSError:

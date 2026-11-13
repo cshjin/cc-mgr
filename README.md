@@ -87,12 +87,13 @@ CLAUDE_HOME=/path/to/.claude python cc-mgr.py run   # point at a different data 
 ```
 
 `--background` writes a per-host pidfile (`data/cc_mgr.<host>.pid`, 0600 — it
-holds the token) and logs to `data/cc_mgr.<host>.log` (0600, without the token);
-`stop` uses that pidfile and only signals the process if it really is this
-host's cc_mgr server (command line and start time) — handy when the repo sits on
-a filesystem shared by many nodes. `CC_MGR_DATA_DIR` relocates `data/`
-(pidfiles, logs, search index) and `CC_MGR_EXPORT_DIR` the Markdown exports
-(default `exports/`); both are kept owner-only since they hold conversations.
+holds the token) and logs to `data/cc_mgr.<host>.log` (0600; the token is never
+logged); `stop` uses that pidfile and only signals the process if it really is
+this host's cc_mgr server (command line, and start time on Linux) — handy when
+the repo sits on a filesystem shared by many nodes. `CC_MGR_DATA_DIR` relocates
+`data/` (pidfiles, logs, search index) and `CC_MGR_EXPORT_DIR` the Markdown
+exports (default `exports/`); both are kept owner-only since they hold
+conversations.
 
 ## Stack
 

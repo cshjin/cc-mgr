@@ -121,6 +121,53 @@ def test_exports_are_owner_only(claude_home, tmp_path, monkeypatch):
     assert stat.S_IMODE((tmp_path / "exports").stat().st_mode) == 0o700
 
 
+def test_other_write_paths_cannot_follow_symlinks_out(claude_home, tmp_path):
+    proj = claude_home / "projects" / "-tmp-repo_claude"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.md").write_text("original")
+    # 1. save-memory writing a session summary through a symlinked file
+    (proj / "memory").mkdir()
+    (proj / "memory" / "session_sess-c1.md").symlink_to(outside / "victim.md")
+    r = client.post("/api/projects/-tmp-repo_claude/sessions/sess-c1/save-memory")
+    assert r.status_code == 400, r.text
+    # 2. the root doc symlinked outside the project's working directory
+    repo = claude_home.parent / "repo_claude"
+    (repo / "CLAUDE.md").unlink()
+    (repo / "CLAUDE.md").symlink_to(outside / "victim.md")
+    r = client.put("/api/projects/-tmp-repo_claude/doc", json={"content": "overwritten"})
+    assert r.status_code == 400, r.text
+    # 3. the whole memory/ directory symlinked outside the project
+    (proj / "memory" / "session_sess-c1.md").unlink()
+    (proj / "memory").rmdir()
+    (proj / "memory").symlink_to(outside, target_is_directory=True)
+    r = client.put("/api/projects/-tmp-repo_claude/memory",
+                   json={"name": "victim.md", "content": "overwritten"})
+    assert r.status_code == 400, r.text
+    assert (outside / "victim.md").read_text() == "original"
+    assert sorted(p.name for p in outside.iterdir()) == ["victim.md"]
+
+
+@pytest.mark.parametrize("agent", ["claude", "agy"])
+def test_inline_export_of_an_unknown_session_is_404(claude_home, agy_home, agent):
+    r = client.get("/api/projects/-tmp-repo_claude/sessions/unknown/export", params={"agent": agent})
+    assert r.status_code == 404
+
+
+def test_write_private_tightens_and_refuses_symlinks(tmp_path):
+    import stat
+    from backend.agents.common import write_private
+    old = tmp_path / "old.md"
+    old.write_text("x")
+    old.chmod(0o644)
+    write_private(old, "y")
+    assert stat.S_IMODE(old.stat().st_mode) == 0o600 and old.read_text() == "y"
+    (tmp_path / "link.md").symlink_to(tmp_path / "target.md")
+    with pytest.raises(OSError):
+        write_private(tmp_path / "link.md", "z")
+    assert not (tmp_path / "target.md").exists()
+
+
 def test_validators():
     assert is_safe_id("ses_e2e98941fffez5mDfexIFBs9vS")
     assert is_safe_id("session-2026-06-03T23-38-ab4cc0f2")

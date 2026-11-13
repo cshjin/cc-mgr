@@ -33,14 +33,17 @@ python -m pytest                                     # test suite (pip install -
 `http://localhost:PORT/?token=…`: the API requires that token (exchanged for an
 HttpOnly cookie on first visit) because loopback is shared by every user on a
 multi-user host. `$CC_MGR_TOKEN` pins it; `--no-token` disables it (warns).
-State lives in `$CC_MGR_DATA_DIR` (default `data/`, created 0700): a **per-host**
+State lives in `$CC_MGR_DATA_DIR` (default `data/`, kept 0700): a **per-host**
 pidfile `cc_mgr.<host>.pid` (0600, holds the token) and log `cc_mgr.<host>.log`
-(0600; the background server never prints the token into it) — the repo often
-sits on a filesystem every node mounts, and a PID only means something on its own
-host. `stop` signals a PID only if its command line is `… cc-mgr.py run …` and its
-start time matches the one recorded in the pidfile, then kills the process group
-(Windows: `taskkill /T`, POSIX: `killpg`). Note `_pid_alive` uses `tasklist` on
-Windows — never `os.kill(pid, 0)`, which would terminate the process there.
+(0600; neither the banner nor uvicorn's access log ever records the token) — the
+repo often sits on a filesystem every node mounts, and a PID only means something
+on its own host. Startup also tightens state/exports an older version left
+world-readable. `stop` signals a PID only if its command line is
+`… cc-mgr.py run …` and (Linux) its start time matches the pidfile — via `/proc`,
+`ps` on macOS/BSD, PowerShell/CIM on Windows; if identity can't be established it
+refuses. It then kills the process group (Windows: `taskkill /T`, POSIX:
+`killpg`). Note `_pid_alive` uses `tasklist` on Windows — never `os.kill(pid, 0)`,
+which would terminate the process there.
 
 There is **no build step** (vanilla JS frontend). Tests are pytest under `tests/`
 with synthetic per-agent homes (`tests/conftest.py`). An autouse fixture points
@@ -155,9 +158,10 @@ Three layers, all under `backend/` + `frontend/`:
   `part`, `todo`. v2 migrated every v1 session; `todo` stays readable for old
   sessions (v2 has no todo tool). Archive/delete go through OpenCode itself
   (`opencode api session.update`, `opencode session delete`) and only when the
-  running OpenCode service on this host has exactly this DB file open
-  (`opencode api server.info` → pid → `/proc/<pid>/fd`); `opencode debug paths`
-  can't prove that (it inherits `OPENCODE_DB`). Doc: `AGENTS.md`.
+  running OpenCode service on this host is writing exactly this DB — the unique
+  `.db` it has open read-write with its `-wal` open too (`opencode api
+  server.info` → pid → `/proc/<pid>/fd` + `fdinfo`). `opencode debug paths` can't
+  prove that (it inherits `OPENCODE_DB`). Doc: `AGENTS.md`.
 - **Codex** (`$CODEX_HOME` or `~/.codex`): sessions under
   `sessions/YYYY/MM/DD/rollout-*.jsonl`, grouped into projects by mangled cwd. **Each
   line is a `{timestamp,type,payload}` envelope.** cwd from `session_meta.payload`,
@@ -200,10 +204,12 @@ Three layers, all under `backend/` + `frontend/`:
   `<claude_home>/.cc_mgr_trash/<ts>/` (reversible) unless `hard=True`. It only
   removes the transcript, the `<session-uuid>/` sidecar dir, and the tasks dir.
 - **Ids from the URL are untrusted**: routes validate them, and destructive code
-  re-checks (`is_safe_id`, `is_safe_name`, `safe_join` — which resolves symlinks)
-  and only acts on sessions that exist (`memory` is reserved). Never join a raw id
-  into a path or build a glob from it (`session_id='..'` once wiped
-  `~/.claude/projects`, `'*'` every agy conversation, `'memory'` a project's memory).
+  re-checks (`is_safe_id`, `is_safe_name`, `safe_join` — which resolves symlinks;
+  anchor it at a trusted root such as `projects/` or the project cwd, never at a
+  directory that could itself be a symlink) and only acts on sessions that exist
+  (`memory` is reserved). Never join a raw id into a path or build a glob from it
+  (`session_id='..'` once wiped `~/.claude/projects`, `'*'` every agy
+  conversation, `'memory'` a project's memory).
 - **cc_mgr's own files are private**: the search index (it copies every
   conversation), exports, pidfile and log are created owner-only.
 - **Mutating writes are path-guarded**: `save_memory_file` rejects path components /

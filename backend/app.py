@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import hmac
+import logging
 import os
+import re
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
@@ -39,6 +41,25 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
 
 def _token() -> str:
     return os.environ.get("CC_MGR_TOKEN", "")
+
+
+class _RedactToken(logging.Filter):
+    """uvicorn's access log records the request line; keep `?token=…` out of it."""
+    _cc_mgr_redact = True
+    _pattern = re.compile(r"(token=)[^&\s\"]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._pattern.sub(r"\1<redacted>", a) if isinstance(a, str) else a
+                                for a in record.args)
+        elif isinstance(record.msg, str):
+            record.msg = self._pattern.sub(r"\1<redacted>", record.msg)
+        return True
+
+
+_access_log = logging.getLogger("uvicorn.access")
+if not any(getattr(f, "_cc_mgr_redact", False) for f in _access_log.filters):
+    _access_log.addFilter(_RedactToken())
 
 
 def _token_cookie(request: Request) -> str:
@@ -305,6 +326,8 @@ def api_save_memory(project: str, session_id: str, agent: str | None = None):
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="session not found")
+    except ValueError as e:  # e.g. a memory path that would escape the project
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/search")

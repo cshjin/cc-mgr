@@ -107,3 +107,39 @@ def test_log_is_owner_only_even_if_it_existed(launcher):
     log.chmod(0o644)
     os.close(launcher._open_log())
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+def test_secure_state_tightens_what_an_older_version_left_open(launcher, tmp_path, monkeypatch):
+    import stat
+    exports = tmp_path / "exports"
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(exports))
+    launcher.DATA_DIR.mkdir(parents=True)
+    (exports / "proj").mkdir(parents=True)
+    files = [launcher.DATA_DIR / "cc_mgr.db", launcher.DATA_DIR / "cc_mgr.log",
+             exports / "proj" / "s.20260101T000000Z.md"]
+    for f in files:
+        f.write_text("private")
+        f.chmod(0o644)
+    for d in (launcher.DATA_DIR, exports, exports / "proj"):
+        d.chmod(0o755)
+    launcher._secure_state()
+    assert all(stat.S_IMODE(f.stat().st_mode) == 0o600 for f in files)
+    assert all(stat.S_IMODE(d.stat().st_mode) == 0o700
+               for d in (launcher.DATA_DIR, exports, exports / "proj"))
+
+
+@pytest.mark.parametrize("cmdline, expected", [
+    ('"C:\\Python\\python.exe" C:\\cc\\cc-mgr.py run --port 8765', True),
+    ("notepad.exe C:\\cc\\cc-mgr.py", False),  # merely mentions the file
+    ("", False),                               # couldn't be read
+])
+def test_windows_identity_is_verified_not_assumed(launcher, monkeypatch, cmdline, expected):
+    monkeypatch.setattr(launcher, "IS_WINDOWS", True)
+    monkeypatch.setattr(launcher, "_has_proc", lambda: False)
+    monkeypatch.setattr(launcher, "_pid_alive", lambda pid: True)
+
+    class Out:
+        stdout = cmdline
+
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: Out())
+    assert launcher._is_cc_mgr_process(4242, start=123) is expected

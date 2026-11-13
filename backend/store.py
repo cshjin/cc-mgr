@@ -423,9 +423,10 @@ def save_memory_file(project: str, name: str, content: str) -> Path:
         raise ValueError("invalid memory file name")
     if not name.endswith(".md"):
         raise ValueError("memory files must end in .md")
-    mem_dir = _project_dir(project) / "memory"
-    mem_dir.mkdir(parents=True, exist_ok=True)
-    out = safe_join(mem_dir, name)  # also refuses a symlink pointing outside memory/
+    # Anchored at projects/, so neither a symlinked memory/ dir nor a symlinked
+    # file can point the write outside the Claude data root.
+    out = safe_join(projects_dir(), _project_dir(project).name, "memory", name)
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content, encoding="utf-8")
     return out
 
@@ -463,7 +464,7 @@ def save_claude_md(project: str, content: str) -> Path:
     base = Path(cwd)
     if not base.is_dir():
         raise FileNotFoundError(f"working directory does not exist: {cwd}")
-    path = base / "CLAUDE.md"
+    path = safe_join(base, "CLAUDE.md")  # refuses a CLAUDE.md symlinked outside the project
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -533,6 +534,7 @@ def get_conversation(
 
 def export_session_markdown(project: str, session_id: str) -> str:
     """Render a full session transcript to Markdown text."""
+    _transcript(project, session_id)  # unknown sessions are a 404, not an empty document
     data = get_conversation(project, session_id, offset=0, limit=None)
     lines = [f"# Session {session_id}", f"_Project: {project}_", ""]
     for t in data["turns"]:
@@ -619,13 +621,13 @@ def save_session_as_memory(project: str, session_id: str) -> Path:
             body.append(f"- [{t.get('status','?')}] {t.get('subject','(untitled)')}")
     body.append("")
 
-    mem_dir = _project_dir(project) / "memory"
-    mem_dir.mkdir(parents=True, exist_ok=True)
-    out = mem_dir / f"session_{short}.md"
+    mem_root = (projects_dir(), _project_dir(project).name, "memory")
+    out = safe_join(*mem_root, f"session_{short}.md")
+    idx = safe_join(*mem_root, "MEMORY.md")
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(body), encoding="utf-8")
 
     # register in MEMORY.md (create if absent)
-    idx = mem_dir / "MEMORY.md"
     line = f"- [Session {short}](session_{short}.md) — archived session summary saved by cc_mgr"
     if idx.is_file():
         existing = idx.read_text(encoding="utf-8")

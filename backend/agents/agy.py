@@ -638,13 +638,15 @@ class AgyAdapter(AgentAdapter):
         cwd = self._project_cwd(project)
         if not cwd:
             raise FileNotFoundError("no working directory known for this project")
-        target_dir = Path(cwd) / ".agents" / "rules"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        out = safe_join(target_dir, name)  # refuses a symlink pointing outside rules/
+        # Anchored at the project cwd: a symlinked .agents/ or rules file can't
+        # point the write elsewhere.
+        out = safe_join(Path(cwd), ".agents", "rules", name)
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(content, encoding="utf-8")
         return out
 
     def export_session_markdown(self, project: str, session_id: str) -> str:
+        self._transcript(session_id)  # unknown sessions are a 404, not an empty document
         data = self.get_conversation(project, session_id, offset=0, limit=None)
         cwd = self._project_cwd(project)
         lines = [f"# Session {session_id}", f"_Project: {project}_", f"_Working Directory: {cwd}_", ""]
@@ -724,9 +726,8 @@ class AgyAdapter(AgentAdapter):
             "",
         ]
 
-        target_dir = Path(cwd) / ".agents" / "rules"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        out = safe_join(target_dir, f"session_{short}.md")
+        out = safe_join(Path(cwd), ".agents", "rules", f"session_{short}.md")
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(body), encoding="utf-8")
         return out
 

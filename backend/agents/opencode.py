@@ -107,23 +107,25 @@ def opencode_db_path() -> Path | None:
 
 
 def _is_cli_managed(db_file: Path) -> bool:
-    """True only if the running OpenCode service — the process `opencode
-    session delete` / `opencode api` talk to — has exactly db_file open.
+    """True only if db_file is *the* database the running OpenCode service — the
+    process `opencode session delete` / `opencode api` talk to — is writing.
 
     `opencode debug paths` can't tell: it inherits our environment, so with
     OPENCODE_DB set it just echoes our override back, while the shared
     service may be using a different database.
     """
     files = _service_db_files()
-    return bool(files) and os.path.realpath(db_file) in files
+    return files == {os.path.realpath(db_file)}
 
 
 def _service_db_files() -> set[str] | None:
-    """Real paths of the *.db files the running OpenCode service has open.
+    """The SQLite databases the running OpenCode service is actively writing.
 
-    Asks the service for its pid and host (`opencode api server.info`) and
-    reads /proc/<pid>/fd. None when that can't be established: no CLI, no
-    service, a service on another host, or no /proc.
+    Asks the service for its pid and host (`opencode api server.info`), then
+    keeps the *.db files it has open read-write *and* whose -wal file it has
+    open too (a live WAL database), so a backup it merely reads doesn't count.
+    None when that can't be established: no CLI, no service, a service on
+    another host, or no /proc.
     """
     cli = _opencode_cli()
     if not cli:
@@ -140,20 +142,25 @@ def _service_db_files() -> set[str] | None:
         return None
     if str(info.get("hostname", "")).split(".")[0] != socket.gethostname().split(".")[0]:
         return None
-    fd_dir = Path(f"/proc/{info['pid']}/fd")
+    pid = info["pid"]
     try:
-        fds = list(fd_dir.iterdir())
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
     except OSError:
         return None
-    files = set()
+    writable: set[str] = set()
+    open_files: set[str] = set()
     for fd in fds:
         try:
-            target = os.readlink(fd)
-        except OSError:
+            target = os.path.realpath(os.readlink(fd))
+            flags = next((int(line.split()[1], 8) for line in
+                          Path(f"/proc/{pid}/fdinfo/{fd.name}").read_text().splitlines()
+                          if line.startswith("flags:")), 0)
+        except (OSError, ValueError, IndexError):
             continue
-        if target.endswith(".db"):
-            files.add(os.path.realpath(target))
-    return files
+        open_files.add(target)
+        if target.endswith(".db") and flags & os.O_ACCMODE == os.O_RDWR:
+            writable.add(target)
+    return {db for db in writable if db + "-wal" in open_files}
 
 
 def _run_opencode(args: list[str]) -> None:
@@ -437,40 +444,48 @@ def _v2_session_stats(conn: sqlite3.Connection, ids: list[str],
     return stats
 
 
-# (db, session) -> (highest seq scanned, context stats). Reading every turn's
-# tokens means parsing every message's JSON (seconds on big sessions), so it is
-# done once and then only for rows added since.
-_CTX_CACHE: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
+# (db, session) -> (highest seq, newest time_updated, context stats). Reading
+# every turn's tokens means parsing every message's JSON (seconds on big
+# sessions), so it is done once; afterwards only rows appended or updated in
+# place since (OpenCode fills in a turn's tokens when it finishes) are re-read.
+_CTX_CACHE: dict[tuple[str, str], tuple[int, int, dict[str, Any]]] = {}
 
 
 def _v2_context(conn: sqlite3.Connection, db_key: str, sid: str) -> dict[str, Any]:
-    """context = the newest finished assistant turn's tokens; peak_claude = the
-    largest context any Claude turn (or Claude compaction) reached — only that
-    can prove the 1M tier; peak = the largest context overall."""
-    top = conn.execute("SELECT MAX(seq) FROM session_message WHERE session_id = ? "
-                       "AND type IN ('assistant', 'compaction')", (sid,)).fetchone()[0] or 0
+    """context = the newest finished assistant turn's tokens; model = the newest
+    assistant turn's model; peak_claude = the largest context any Claude turn
+    (or Claude compaction) reached — only that can prove the 1M tier; peak =
+    the largest context overall."""
+    top, updated = conn.execute(
+        "SELECT MAX(seq), MAX(time_updated) FROM session_message "
+        "WHERE session_id = ? AND type IN ('assistant', 'compaction')", (sid,)).fetchone()
+    top, updated = top or 0, updated or 0
     cached = _CTX_CACHE.get((db_key, sid))
-    if cached and cached[0] == top:
-        return dict(cached[1])
-    after, st = -1, {"context": 0, "peak": 0, "peak_claude": 0, "model": ""}
-    if cached and cached[0] < top:
-        after, st = cached[0], dict(cached[1])
-    for r in conn.execute(
-            "SELECT type, json_extract(data, '$.tokens') AS tokens, "
-            "json_extract(data, '$.model') AS model FROM session_message "
-            "WHERE session_id = ? AND type IN ('assistant', 'compaction') AND seq > ? "
-            "ORDER BY seq", (sid, after)):
+    if cached and cached[:2] == (top, updated):
+        return dict(cached[2])
+    st = {"context": 0, "context_seq": -1, "model": "", "model_seq": -1,
+          "peak": 0, "peak_claude": 0}
+    query = ("SELECT type, seq, json_extract(data, '$.tokens') AS tokens, "
+             "json_extract(data, '$.model') AS model FROM session_message "
+             "WHERE session_id = ? AND type IN ('assistant', 'compaction')")
+    args: tuple = (sid,)
+    if cached:  # only rows appended or updated since the last read
+        st = dict(cached[2])
+        query += " AND (seq > ? OR time_updated >= ?)"
+        args = (sid, cached[0], cached[1])
+    for r in conn.execute(query + " ORDER BY seq", args):
         ctx = _context_from_tokens(r["tokens"])
         model = _format_model_name(r["model"])
         if r["type"] == "assistant":
-            st["model"] = model or st["model"]
-            if ctx:
-                st["context"] = ctx
+            if model and r["seq"] >= st["model_seq"]:
+                st["model"], st["model_seq"] = model, r["seq"]
+            if ctx and r["seq"] >= st["context_seq"]:
+                st["context"], st["context_seq"] = ctx, r["seq"]
         if ctx:
             st["peak"] = max(st["peak"], ctx)
             if is_claude_model(model):
                 st["peak_claude"] = max(st["peak_claude"], ctx)
-    _CTX_CACHE[(db_key, sid)] = (top, dict(st))
+    _CTX_CACHE[(db_key, sid)] = (top, updated, dict(st))
     return st
 
 
@@ -694,10 +709,10 @@ class OpencodeAdapter(AgentAdapter):
             ctx = st.get("context", 0)
             total, opn = todos.get(sid, (0, 0))
             model = st.get("model") or _format_model_name(s["model"] if "model" in keys else "")
-            # Only a Claude turn's usage can prove the 1M tier (context_window's rule).
+            # Only Claude usage proves the 1M tier, and only for a Claude session.
             peak = max(ctx, st.get("peak", 0))
             win = {"limit": 1_000_000 if peak > STD_WINDOW else STD_WINDOW,
-                   "known": st.get("peak_claude", 0) > STD_WINDOW}
+                   "known": is_claude_model(model) and st.get("peak_claude", 0) > STD_WINDOW}
             updated = s["time_updated"] or s["time_created"] or 0
             summaries.append(SessionSummary(
                 session_id=sid,
