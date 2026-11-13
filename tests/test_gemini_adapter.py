@@ -4,8 +4,9 @@ from backend.agents.gemini import GeminiAdapter
 def test_caps(gemini_home):
     c = GeminiAdapter().capabilities
     assert c.agent_id == "gemini"
+    assert c.label == "Gemini CLI (legacy)"
     assert c.doc_filename == "GEMINI.md"
-    assert c.can_edit_doc is True
+    assert c.can_edit_doc is False  # retired CLI: read-only; agy edits GEMINI.md
     assert c.has_tasks is False and c.has_memory is False
     assert c.can_delete is False and c.can_export is False
 
@@ -46,12 +47,26 @@ def test_iter_turns_yields_text(gemini_home):
     assert any("gemini" in t for t in texts)
 
 
-def test_get_and_save_doc(gemini_home):
+def test_get_doc_and_saving_is_refused(gemini_home):
+    import pytest
+    from backend.agents import UnsupportedCapability
     a = GeminiAdapter()
     pname = a.list_projects()[0]["name"]
     assert "beta" in a.get_doc(pname)["content"]
-    a.save_doc(pname, "# g\nomega\n")
-    assert "omega" in a.get_doc(pname)["content"]
+    with pytest.raises(UnsupportedCapability):
+        a.save_doc(pname, "# g\nomega\n")
+
+
+def test_prelude_only_sessions_are_not_listed(gemini_home):
+    import json
+    chats = gemini_home / "tmp" / "repo_gemini" / "chats"
+    (chats / "session-2026-06-04T00-00-0000beef.jsonl").write_text("\n".join([
+        json.dumps({"sessionId": "0000beef", "kind": "main"}),
+        json.dumps({"$set": {"messages": [{"id": "p0", "type": "user",
+                                           "content": [{"text": "<session_context>…"}]}]}}),
+    ]), encoding="utf-8")
+    ids = {s.session_id for s in GeminiAdapter().list_sessions("repo_gemini")}
+    assert "session-2026-06-04T00-00-0000beef" not in ids and len(ids) == 1
 
 
 def test_prelude_session_context_excluded(gemini_home):

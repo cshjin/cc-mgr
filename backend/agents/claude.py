@@ -19,6 +19,10 @@ class ClaudeAdapter(AgentAdapter):
     def list_projects(self) -> list[dict[str, Any]]:
         return store.list_projects()
 
+    def has_data(self) -> bool:
+        root = store.projects_dir()
+        return root.is_dir() and any(p.is_dir() for p in root.iterdir())
+
     def list_sessions(self, project: str) -> list[SessionSummary]:
         return store.list_sessions(project)
 

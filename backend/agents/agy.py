@@ -339,6 +339,10 @@ class AgyAdapter(AgentAdapter):
     def _home(self) -> Path:
         return agy_home()
 
+    def has_data(self) -> bool:
+        brain = self._home() / "brain"
+        return brain.is_dir() and any(brain.iterdir())
+
     def _project_cwd(self, project: str) -> str:
         """Resolve a project name (mangled cwd) back to its working directory.
 

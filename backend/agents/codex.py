@@ -142,6 +142,10 @@ class CodexAdapter(AgentAdapter):
     def _home(self) -> Path:
         return codex_home()
 
+    def has_data(self) -> bool:
+        root = self._home() / "sessions"
+        return root.is_dir() and any(root.rglob("rollout-*.jsonl"))
+
     def _project_map(self) -> dict[str, list[Path]]:
         """mangled-cwd -> [session paths]."""
         out: dict[str, list[Path]] = {}

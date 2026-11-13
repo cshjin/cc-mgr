@@ -42,11 +42,20 @@ def test_doc_get_and_put_gemini(gemini_home, claude_home):
     pname = client.get("/api/projects", params={"agent": "gemini"}).json()[0]["name"]
     g = client.get(f"/api/projects/{pname}/doc", params={"agent": "gemini"})
     assert g.status_code == 200 and "beta" in g.json()["content"]
+    # Gemini CLI is retired: its view is read-only (agy edits GEMINI.md)
     p = client.put(f"/api/projects/{pname}/doc", params={"agent": "gemini"},
                    json={"content": "# g\nsigma\n"})
-    assert p.status_code == 200
-    assert "sigma" in client.get(f"/api/projects/{pname}/doc",
-                                 params={"agent": "gemini"}).json()["content"]
+    assert p.status_code == 404
+    assert "sigma" not in client.get(f"/api/projects/{pname}/doc",
+                                     params={"agent": "gemini"}).json()["content"]
+
+
+def test_agents_report_has_data_and_gemini_is_last(gemini_home, claude_home):
+    agents = client.get("/api/agents").json()
+    assert agents[-1]["agent_id"] == "gemini" and agents[-1]["label"].endswith("(legacy)")
+    has = {a["agent_id"]: a["has_data"] for a in agents}
+    assert has == {"claude": True, "agy": False, "opencode": False, "codex": False,
+                   "copilot": False, "gemini": True}
 
 
 def test_unsupported_tasks_on_gemini_404(gemini_home):

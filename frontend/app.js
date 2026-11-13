@@ -42,7 +42,7 @@ const state = {
   sortBy: "time", // time | name
   convOffset: 0,
   convTotal: 0,
-  agent: localStorage.getItem("cc_agent") || "claude",
+  agent: localStorage.getItem("cc_agent") || "",
   agents: [],
   caps: null,
   showSubagents: localStorage.getItem("cc_showSubagents") === "1",
@@ -106,11 +106,17 @@ function currentCaps() {
   return state.agents.find((a) => a.agent_id === state.agent) || null;
 }
 
+// Agents with data first (stable), so the dropdown leads with what's in use.
+function orderAgents(agents) {
+  const noData = (a) => (a.has_data === false ? 1 : 0);
+  return [...agents].sort((a, b) => noData(a) - noData(b));
+}
+
 async function loadAgents() {
   try {
     const r = await fetch("/api/agents");
     if (!r.ok) throw await httpError(r);
-    state.agents = await r.json();
+    state.agents = orderAgents(await r.json());
   } catch (e) {
     if (e.message.startsWith("401")) throw e;  // not logged in: show the hint
     state.agents = [{ agent_id: "claude", label: "Claude", doc_filename: "CLAUDE.md",
@@ -119,12 +125,14 @@ async function loadAgents() {
   }
   state.caps = currentCaps();
   if (!state.caps && state.agents.length) {
-    state.agent = state.agents[0].agent_id;
-    state.caps = state.agents[0];
+    const first = state.agents.find((a) => a.has_data !== false) || state.agents[0];
+    state.agent = first.agent_id;
+    state.caps = first;
   }
   const sel = $("#agentSel");
   sel.innerHTML = state.agents
-    .map((a) => `<option value="${esc(a.agent_id)}">${esc(a.label)}</option>`).join("");
+    .map((a) => `<option value="${esc(a.agent_id)}">${esc(a.label)}${a.has_data === false ? " — no data" : ""}</option>`)
+    .join("");
   sel.value = state.agent;
   sel.addEventListener("change", async () => {
     state.agent = sel.value;
@@ -414,6 +422,21 @@ function renderClaudeMd(el, cm) {
   const docName = (state.caps && state.caps.doc_filename) || "CLAUDE.md";
   if (!cm.cwd) {
     el.innerHTML = '<div class="empty">No working directory known for this project (no session has a cwd yet).</div>';
+    return;
+  }
+  if (state.caps && state.caps.can_edit_doc === false) {
+    el.innerHTML = `
+      <div class="editor-wrap">
+        <div class="editor-head">
+          <strong>${esc(docName)}</strong>
+          <span class="ehpath">${esc(cm.path)}</span>
+        </div>
+        ${cm.exists ? `<pre class="editor readonly">${esc(cm.content)}</pre>`
+                    : `<div class="empty">${esc(docName)} does not exist.</div>`}
+        <div class="editor-actions">
+          <span class="editor-status">Read-only for ${esc(state.caps.label)}.</span>
+        </div>
+      </div>`;
     return;
   }
   const status = cm.exists ? "" : `${docName} does not exist yet — saving will create it.`;

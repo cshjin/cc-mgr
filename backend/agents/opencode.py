@@ -526,6 +526,9 @@ class OpencodeAdapter(AgentAdapter):
     def _db_path(self) -> Path | None:
         return opencode_db_path()
 
+    def has_data(self) -> bool:
+        return self._db_path() is not None
+
     def _project_cwd(self, project: str) -> str:
         """Resolve a project name (mangled cwd) back to its real directory."""
         db_file = self._db_path()

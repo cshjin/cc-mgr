@@ -27,7 +27,6 @@ from typing import Any, Iterator
 from . import AgentAdapter, Capabilities
 from .common import (
     SessionSummary, context_window, iter_jsonl, read_doc_file, read_git_info,
-    save_doc_file,
 )
 
 
@@ -130,14 +129,20 @@ def _turn_text_preview(turn: dict) -> str:
 
 
 class GeminiAdapter(AgentAdapter):
+    # Gemini CLI is retired; Antigravity CLI (agy) replaces it. Its history
+    # stays browsable, read-only. GEMINI.md is shared with agy, which edits it.
     capabilities = Capabilities(
-        agent_id="gemini", label="Gemini", doc_filename="GEMINI.md",
-        has_memory=False, has_tasks=False, can_edit_doc=True,
+        agent_id="gemini", label="Gemini CLI (legacy)", doc_filename="GEMINI.md",
+        has_memory=False, has_tasks=False, can_edit_doc=False,
         can_delete=False, can_export=False,
     )
 
     def _home(self) -> Path:
         return gemini_home()
+
+    def has_data(self) -> bool:
+        root = self._home() / "tmp"
+        return root.is_dir() and any(root.glob("*/chats/session-*.jsonl"))
 
     def list_projects(self) -> list[dict[str, Any]]:
         home = self._home()
@@ -191,6 +196,8 @@ class GeminiAdapter(AgentAdapter):
         for s in chats.glob("session-*.jsonl"):
             st = s.stat()
             turns = [t for t in _read_turns(s) if not t.get("_prelude")]
+            if not turns:
+                continue  # started and quit: only the <session_context> prelude
             user_turns = sum(1 for t in turns if t.get("type") == "user")
             asst_turns = len(turns) - user_turns
             # first/last *displayable* user prompt (skip tool-result-only turns)
@@ -268,6 +275,3 @@ class GeminiAdapter(AgentAdapter):
 
     def get_doc(self, project):
         return read_doc_file(_project_cwd(self._home(), project), "GEMINI.md")
-
-    def save_doc(self, project, content):
-        return save_doc_file(_project_cwd(self._home(), project), "GEMINI.md", content)

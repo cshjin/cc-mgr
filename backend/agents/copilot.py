@@ -241,6 +241,13 @@ class CopilotAdapter(AgentAdapter):
     def _home(self) -> Path:
         return copilot_home()
 
+    def has_data(self) -> bool:
+        home = self._home()
+        state, history = home / "session-state", self._history_root()
+        return (_store_db(home) is not None
+                or (state.is_dir() and any(state.glob("*/events.jsonl")))
+                or (history.is_dir() and any(history.glob("*/*.jsonl"))))
+
     def _history_root(self) -> Path:
         return self._home() / "history"
 

@@ -44,6 +44,15 @@ def test_session_tree_hides_and_nests_subagents():
     assert (r["tops"], r["kids"], r["p1kids"]) == (3, 2, 1)
 
 
+def test_order_agents_puts_agents_with_data_first():
+    agents = [{"agent_id": "claude", "has_data": True}, {"agent_id": "agy", "has_data": False},
+              {"agent_id": "opencode", "has_data": True}, {"agent_id": "gemini", "has_data": False},
+              {"agent_id": "legacy-fallback"}]
+    r = run_js(["orderAgents"], f"""
+        process.stdout.write(JSON.stringify(orderAgents({json.dumps(agents)}).map(a => a.agent_id)));""")
+    assert r == ["claude", "opencode", "legacy-fallback", "agy", "gemini"]
+
+
 KANBAN_HARNESS = """
 const state = { agent: "claude" };
 const location = { origin: "http://localhost" };
