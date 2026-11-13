@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.0 — 2026-11-13
+
+Session and project management for every agent (#24–#26).
+
+- Export and delete for Codex, Copilot CLI and Gemini CLI (#24); every agent now
+  exports to Markdown and deletes sessions.
+  - Codex goes through `codex archive` / `codex delete`.
+  - Copilot has no delete command, so cc_mgr edits its store. The rows are backed
+    up first, and sessions that Copilot has open are refused.
+  - Gemini CLI (retired) moves files to a trash folder.
+  - The delete dialog explains what each agent's soft delete does.
+- Project delete (#25): the 🗑 on a project in the sidebar removes all its sessions.
+  The confirmation shows counts and last activity. Everything is exported to Markdown
+  first by default. Deletes are soft by default; a permanent delete requires typing
+  the folder name. Claude memory is kept unless ticked.
+- Project rows match the session list (#25): `session_count` skips transcripts with
+  no messages, and `has_memory` means the memory dir holds files.
+- Projects whose directory no longer exists (#26) — renamed, moved, or synced from
+  another machine — get a "⚠ dir missing" badge and a sidebar filter (`cwd_missing`
+  in `/api/projects`).
+
 ## v0.5.0 — 2026-11-13
 
 Review fixes (#5–#21); see #22 for the full list.

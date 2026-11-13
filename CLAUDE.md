@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `cc_mgr` is a local, portable web UI for browsing coding agents' own on-disk data —
 Claude Code (`~/.claude/projects/`, `~/.claude/tasks/`, per-project `memory/`),
 Antigravity CLI (agy), OpenCode, Codex, GitHub Copilot CLI, and the retired Gemini
-CLI (legacy, read-only). It reads that data for viewing, and writes only in narrow,
-explicit cases (task status, root-doc/memory edits, session export/delete). No
+CLI (legacy). It reads that data for viewing, and writes only in narrow, explicit
+cases (task status, root-doc/memory edits, session/project export and delete). No
 account or network access.
 
 ## Commands
@@ -67,18 +67,25 @@ Three layers, all under `backend/` + `frontend/`:
 - **`backend/agents/`** — the multi-agent layer (v0.3.0). `AgentAdapter` (ABC) +
   `Capabilities` + a registry in `__init__.py`; `common.py` holds agent-neutral
   helpers (`SessionSummary`, jsonl iter, context windows, git info, path-guarded doc
-  read/write, id validators, `connect_sqlite_ro`, data/export dirs). Adapters:
-  `claude.py` (delegates to `store.py`, full features), `agy.py` (Antigravity CLI:
-  full browsing, memory/artifacts, export, delete), `opencode.py` (v1 + v2 schemas,
-  export, archive/delete via OpenCode), `codex.py`, `copilot.py`, and `gemini.py`
-  (legacy, read-only). `get_adapter(agent_id)` returns the adapter (defaults to
-  claude; supports "antigravity" alias for "agy"); `all_adapters()` / `list_agents()`
-  enumerate (`list_agents` adds a cheap `has_data` probe per adapter).
+  read/write, id validators, `connect_sqlite_ro`, data/export dirs, `new_trash_dir`,
+  `pid_alive`, `render_markdown`). Adapters: `claude.py` (delegates to `store.py`,
+  full features), `agy.py` (Antigravity CLI: memory/artifacts), `opencode.py` (v1 + v2
+  schemas, archive/delete via OpenCode), `codex.py` (archive/delete via the codex
+  CLI), `copilot.py` (delete by editing its store), and `gemini.py` (legacy; delete
+  moves files). Every adapter exports and deletes. `get_adapter(agent_id)` returns
+  the adapter (defaults to claude; supports "antigravity" alias for "agy");
+  `all_adapters()` / `list_agents()` enumerate (`list_agents` adds a cheap
+  `has_data` probe per adapter).
   **Only the transcript parser truly differs per agent** — paths, doc filename, and
-  capability flags are data on each adapter. Adapters without a feature leave the
-  base method, which raises `UnsupportedCapability` (mapped to HTTP 404 in
-  `app.py`). Each adapter's module docstring documents the real on-disk format it
-  was verified against.
+  capability flags are data on each adapter (`Capabilities.delete_note` explains
+  what a delete does, for the dialogs). The base class provides a generic Markdown
+  export (`get_conversation` → `render_markdown`) and a generic project delete
+  (`delete_project`: every listed session through `delete_session`, parents first
+  so cascades are skipped, per-session failures in `errors`), plus
+  `project_delete_preview`; Claude and Gemini override both to remove the whole
+  project folder. Adapters without a feature leave the base method, which raises
+  `UnsupportedCapability` (mapped to HTTP 404 in `app.py`). Each adapter's module
+  docstring documents the real on-disk format it was verified against.
 - **`backend/index_db.py`** — SQLite + FTS5 full-text index over every conversation
   turn (`turns`/`turns_fts`) **and** every project's memory files + root doc
   (`docs`/`docs_fts`), across **all agents**. A **rebuildable cache** at
@@ -99,8 +106,13 @@ Three layers, all under `backend/` + `frontend/`:
 - **`backend/app.py`** — thin FastAPI layer: every route takes an `?agent=` query
   param, resolves the adapter via `get_adapter`, and calls it (defaults to claude).
   `GET /api/agents` returns capabilities; `GET|PUT /api/projects/{p}/doc` is the
-  agent-agnostic root-doc endpoint (`/claude-md` kept as an alias). Pydantic models
-  guard request bodies; every route validates `project`/`session_id`/`task_id`
+  agent-agnostic root-doc endpoint (`/claude-md` kept as an alias).
+  `GET /api/projects` adds `cwd_missing` (the recorded working directory is gone:
+  renamed, moved, or another machine). `GET /api/projects/{p}/delete-preview` and
+  `POST /api/projects/{p}/delete` (`export_first`, `include_memory`, `hard`) delete a
+  whole project and purge its sessions (and, when the project is gone, its docs) from
+  the index. Pydantic models guard request bodies; every route validates
+  `project`/`session_id`/`task_id`
   (`is_safe_name`/`is_safe_id`). A middleware enforces the access token
   (`CC_MGR_TOKEN`), the loopback Host allowlist (`CC_MGR_ALLOWED_HOSTS`), read-only
   mode (`CC_MGR_READ_ONLY`), and adds CSP/hardening headers.
@@ -132,7 +144,12 @@ Three layers, all under `backend/` + `frontend/`:
 - `assistant.message.usage` → context size = `input + cache_read + cache_creation +
   output` of the **last** assistant turn.
 - `~/.claude/projects/<mangled>/memory/` — `MEMORY.md` + `*.md`. **Project-level and
-  shared by all sessions in that folder.** Session deletion must never touch it.
+  shared by all sessions in that folder.** Session deletion must never touch it; a
+  project delete only removes it when asked (`include_memory`). An empty `memory/`
+  dir doesn't count as memory (`has_memory` means it holds files).
+- Project rows count only transcripts with at least one user/assistant record
+  (`_has_messages`: reads up to the first one, cached by mtime/size), so
+  `session_count` matches the session list.
 - `~/.claude/tasks/<session-uuid>/N.json` — tasks `{id, subject, status, blocks,
   blockedBy, owner, metadata}`, keyed by session, separate from the projects tree.
 
@@ -171,15 +188,25 @@ Three layers, all under `backend/` + `frontend/`:
   `payload.type` ∈ `message` (role user/assistant/developer; content parts
   `input_text`/`output_text`) / `function_call` / `function_call_output`; context =
   `last_token_usage.total_tokens` (NOT the cumulative `total_token_usage`).
-  Doc: `AGENTS.md`.
+  Delete goes through the codex CLI with cc_mgr's `CODEX_HOME`: `codex archive <uuid>`
+  (moves the rollout to `archived_sessions/`, flags `threads` in `state_*.sqlite`;
+  undo with `codex unarchive`) / `codex delete --force <uuid>`; the uuid comes from
+  `session_meta.payload.id`. Doc: `AGENTS.md`.
 - **Copilot CLI** (`$COPILOT_HOME` or `~/.copilot`): `session-store.db` (`sessions`
   with cwd/summary/branch, `turns`, `assistant_usage_events`) plus
   `session-state/<id>/events.jsonl` (the full transcript: `user.message`,
   `assistant.message`, `tool.execution_complete`, `session.compaction_complete`,
   `session.usage_record`, …). events.jsonl wins for the conversation; the DB gives
-  title/branch. The old `history/<mangled-cwd>/*.jsonl` guess is a fallback. Doc:
-  `AGENTS.md`.
-- **Gemini CLI — legacy, read-only** (`$GEMINI_HOME` or `~/.gemini`): the CLI is
+  title/branch. The old `history/<mangled-cwd>/*.jsonl` guess is a fallback. The CLI
+  can't delete sessions (`copilot sessions` only imports), so cc_mgr does: every
+  table with a `session_id` column (FTS5 `search_index` included, its shadow tables
+  not) plus the `sessions` row, in one `BEGIN IMMEDIATE` transaction, and
+  `session-state/<id>/`. Soft delete first saves the rows (`db_rows.json`) and the
+  folder in `.cc_mgr_trash/`, and puts the folder back if the transaction fails.
+  Refused while `session-state/<id>/inuse.<pid>.lock` names a live copilot process,
+  or the session was active in the last two minutes (the home is often on a shared
+  filesystem, so Copilot may run it on another node). Doc: `AGENTS.md`.
+- **Gemini CLI — legacy** (`$GEMINI_HOME` or `~/.gemini`): the CLI is
   retired (agy replaces it). Projects under `tmp/<project>/`, true cwd from
   `tmp/<project>/.project_root` (fallback `history/<project>/.project_root`,
   non-lossy). Sessions: `tmp/<project>/chats/session-*.jsonl`. **The conversation is
@@ -187,7 +214,9 @@ Three layers, all under `backend/` + `frontend/`:
   prelude) — real turns are **bare top-level records** appended one per line
   (`{id,type,content,thoughts,tokens,toolCalls}`), `type` ∈ `user`/`gemini`,
   `content` polymorphic (str / `[{text}]` / `[{functionResponse}]`). Prelude-only
-  sessions aren't listed. Doc: `GEMINI.md` (edited from the agy view).
+  sessions aren't listed or counted. Delete moves the files (no CLI left): a session
+  is its chat file; a project is `tmp/<project>/` + `history/<project>/`. Doc:
+  `GEMINI.md` (read-only here; edited from the agy view).
 
 ## Conventions and gotchas specific to this codebase
 
@@ -205,6 +234,10 @@ Three layers, all under `backend/` + `frontend/`:
 - **Deletion is soft by default**: `delete_session` moves artifacts to
   `<claude_home>/.cc_mgr_trash/<ts>/` (reversible) unless `hard=True`. It only
   removes the transcript, the `<session-uuid>/` sidecar dir, and the tasks dir.
+  Every agent's soft delete is reversible in its own way (trash folder, or the
+  agent's archive for OpenCode/Codex); where the agent has a CLI command for it,
+  go through that rather than editing its files. A project delete never touches
+  the working directory (CLAUDE.md, AGENTS.md, `.agents/`).
 - **Ids from the URL are untrusted**: routes validate them, and destructive code
   re-checks (`is_safe_id`, `is_safe_name`, `safe_join` — which resolves symlinks;
   anchor it at a trusted root such as `projects/` or the project cwd, never at a
