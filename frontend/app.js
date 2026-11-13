@@ -50,17 +50,26 @@ const state = {
 const CONV_PAGE = 40;
 const $ = (sel) => document.querySelector(sel);
 
+// Error carrying the server's `detail` (e.g. the 401 hint about ?token=…).
+async function httpError(r) {
+  let detail = r.statusText;
+  try { detail = (await r.json()).detail || detail; } catch { /* not JSON */ }
+  return new Error(`${r.status} ${detail}`);
+}
+
 async function api(path) {
   const u = new URL(path, location.origin);
   if (!u.searchParams.has("agent")) u.searchParams.set("agent", state.agent);
   const r = await fetch(u);
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  if (!r.ok) throw await httpError(r);
   return r.json();
 }
 
+// Escapes for both text and quoted-attribute contexts.
 function esc(s) {
   return String(s == null ? "" : s)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function fmtTokens(n) {
@@ -98,8 +107,11 @@ function currentCaps() {
 
 async function loadAgents() {
   try {
-    state.agents = await fetch("/api/agents").then((r) => r.json());
-  } catch {
+    const r = await fetch("/api/agents");
+    if (!r.ok) throw await httpError(r);
+    state.agents = await r.json();
+  } catch (e) {
+    if (e.message.startsWith("401")) throw e;  // not logged in: show the hint
     state.agents = [{ agent_id: "claude", label: "Claude", doc_filename: "CLAUDE.md",
       has_memory: true, has_tasks: true, can_edit_doc: true,
       can_delete: true, can_export: true }];
@@ -391,7 +403,7 @@ function renderClaudeMd(el, cm) {
         method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: $("#cmEditor").value }),
       });
-      if (!r.ok) throw new Error(`${r.status}`);
+      if (!r.ok) throw await httpError(r);
       const res = await r.json();
       $("#cmStatus").textContent = "saved ✓";
       flash(docName + " saved to " + res.saved);
@@ -498,7 +510,7 @@ function openDeleteModal() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ export_first: exportFirst, save_memory: saveMemory, hard }),
       });
-      if (!r.ok) throw new Error(`${r.status}`);
+      if (!r.ok) throw await httpError(r);
       const res = await r.json();
       close();
       closeDetail();
@@ -715,7 +727,7 @@ function wireKanban(scope, opts = {}) {
             method: "PATCH", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ status: newStatus }),
           });
-          if (!r.ok) throw new Error(`${r.status}`);
+          if (!r.ok) throw await httpError(r);
           reloadTasksView();
         } catch (err) {
           flash("Failed to update task: " + err.message);
@@ -794,7 +806,7 @@ function wireMemoryEditors(scope) {
           method: "PUT", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, content }),
         });
-        if (!r.ok) throw new Error(`${r.status}`);
+        if (!r.ok) throw await httpError(r);
         status.textContent = "saved ✓";
       } catch (e) {
         status.textContent = "failed: " + e.message;
@@ -878,6 +890,7 @@ function initSearch() {
     btn.textContent = "indexing…";
     try {
       const r = await fetch("/api/reindex", { method: "POST" });
+      if (!r.ok) throw await httpError(r);
       const res = await r.json();
       flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs across all agents.`);
     } catch (e) {

@@ -3,18 +3,25 @@
 
 Usage:
     python cc-mgr.py run [--host H] [--port P] [--reload] [--background]
+                         [--read-only] [--no-token]
     python cc-mgr.py stop [--port P]
     python cc-mgr.py status [--port P]
 
 `run` serves the app (foreground; Ctrl+C to stop). Add --background to detach
 the server and return to the shell. `stop` terminates a server previously
 started by this script. Cross-platform (Windows + Linux).
+
+Every start generates a random access token (or uses $CC_MGR_TOKEN) and prints
+http://localhost:PORT/?token=… — the API refuses requests without it, so other
+users on a shared machine (loopback is shared by everyone on the host) can't
+read or change your data.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -30,22 +37,47 @@ IS_WINDOWS = os.name == "nt"
 # Sentinel default for --host: bind both loopback addresses (IPv4 127.0.0.1 and
 # IPv6 ::1) so both `localhost` and `127.0.0.1` work regardless of how the OS
 # resolves `localhost`, while staying loopback-only (not exposed to the network).
+# Note: loopback is still shared by every user on the same machine, hence the
+# access token.
 LOOPBACK = "loopback"
+LOOPBACK_NAMES = (LOOPBACK, "127.0.0.1", "::1", "localhost")
 
 
 def _display_host(host: str) -> str:
-    return "localhost" if host == LOOPBACK else host
+    if host == LOOPBACK:
+        return "localhost"
+    return f"[{host}]" if ":" in host else host
+
+
+def _url(host: str, port: int, token: str = "") -> str:
+    return f"http://{_display_host(host)}:{port}/" + (f"?token={token}" if token else "")
+
+
+def _security_env(host: str, token: str, read_only: bool) -> dict[str, str]:
+    """Env vars backend/app.py reads for access control."""
+    return {
+        "CC_MGR_TOKEN": token,
+        "CC_MGR_READ_ONLY": "1" if read_only else "",
+        # Host-header allowlist (DNS-rebinding guard) only makes sense when the
+        # server is reachable solely through loopback names.
+        "CC_MGR_ALLOWED_HOSTS": "localhost,127.0.0.1,::1" if host in LOOPBACK_NAMES else "",
+    }
 
 
 # ---------------------------------------------------------------------------
 # PID-file helpers
 # ---------------------------------------------------------------------------
 
-def _write_pidfile(pid: int, host: str, port: int) -> None:
+def _write_pidfile(pid: int, host: str, port: int, token: str = "") -> None:
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(
-        json.dumps({"pid": pid, "host": host, "port": port}), encoding="utf-8"
-    )
+    # The pidfile holds the access token: create it owner-only.
+    fd = os.open(PID_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"pid": pid, "host": host, "port": port, "token": token}, fh)
+    try:
+        os.chmod(PID_FILE, 0o600)
+    except OSError:
+        pass
 
 
 def _read_pidfile() -> dict | None:
@@ -195,7 +227,8 @@ def _loopback_sockets(port: int) -> list[socket.socket]:
     return socks
 
 
-def _serve(host: str, port: int, reload: bool, auto_port: bool = False) -> None:
+def _serve(host: str, port: int, reload: bool, auto_port: bool = False,
+           no_token: bool = False, read_only: bool = False) -> None:
     """Run uvicorn in the foreground (blocking). Manages the pidfile."""
     # Ensure imports + data paths resolve regardless of the caller's cwd.
     os.chdir(HERE)
@@ -217,10 +250,20 @@ def _serve(host: str, port: int, reload: bool, auto_port: bool = False) -> None:
         else:
             _die_port_in_use(port, holder)
 
-    _write_pidfile(os.getpid(), host, port)
-    print(f"cc_mgr serving on http://{_display_host(host)}:{port}  "
-          f"(pid {os.getpid()})")
-    print("Press Ctrl+C to stop." if sys.stdout.isatty() else "")
+    token = "" if no_token else (os.environ.get("CC_MGR_TOKEN") or secrets.token_urlsafe(24))
+    os.environ.update(_security_env(host, token, read_only))
+    if not token:
+        exposure = ("anyone who can reach it over the network" if host not in LOOPBACK_NAMES
+                    else "every user logged into this machine")
+        print(f"WARNING: --no-token: the API is open to {exposure}.", file=sys.stderr)
+    elif host not in LOOPBACK_NAMES:
+        print("WARNING: serving on a non-loopback address over plain HTTP; the token "
+              "travels unencrypted. Prefer the default bind plus `ssh -L`.", file=sys.stderr)
+
+    _write_pidfile(os.getpid(), host, port, token)
+    print(f"cc_mgr serving on {_url(host, port, token)}  (pid {os.getpid()})"
+          + ("  [read-only]" if read_only else ""))
+    print("Press Ctrl+C to stop." if sys.stdout.isatty() else "", flush=True)
     try:
         # The dual-loopback default needs two listening sockets, which the
         # uvicorn.run() convenience can't express — drive a Server directly.
@@ -254,14 +297,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     existing = _read_pidfile()
     if existing and _pid_alive(existing["pid"]):
         print(f"cc_mgr already running (pid {existing['pid']} on "
-              f"http://{_display_host(existing['host'])}:{existing['port']}). "
+              f"{_url(existing['host'], existing['port'], existing.get('token', ''))}). "
               f"Use `stop` first.")
         return 1
     if existing:
         _clear_pidfile()  # stale
 
     if not args.background:
-        _serve(args.host, args.port, args.reload, auto_port=args.auto_port)
+        _serve(args.host, args.port, args.reload, auto_port=args.auto_port,
+               no_token=args.no_token, read_only=args.read_only)
         return 0
 
     # --- background: spawn a detached copy running in the foreground ---
@@ -271,6 +315,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd.append("--reload")
     if args.auto_port:
         cmd.append("--auto-port")
+    if args.no_token:
+        cmd.append("--no-token")
+    if args.read_only:
+        cmd.append("--read-only")
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     logf = open(LOG_FILE, "ab")
     if IS_WINDOWS:
@@ -287,7 +335,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     info = _read_pidfile()
     if info and _pid_alive(info["pid"]):
         print(f"cc_mgr started in background (pid {info['pid']}) on "
-              f"http://{_display_host(args.host)}:{args.port}")
+              f"{_url(info['host'], info['port'], info.get('token', ''))}")
         print(f"Logs: {LOG_FILE}")
         print("Stop it with:  python cc-mgr.py stop")
         return 0
@@ -325,7 +373,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     info = _read_pidfile()
     if info and _pid_alive(info["pid"]):
         print(f"cc_mgr running (pid {info['pid']}) on "
-              f"http://{_display_host(info['host'])}:{info['port']}")
+              f"{_url(info['host'], info['port'], info.get('token', ''))}")
         return 0
     if info:
         print("cc_mgr not running (stale pidfile present).")
@@ -351,6 +399,11 @@ def main() -> int:
                        help="detach and run in the background")
     p_run.add_argument("--auto-port", action="store_true",
                        help="if --port is taken, try the next free one")
+    p_run.add_argument("--read-only", action="store_true",
+                       help="disable every endpoint that writes or deletes data")
+    p_run.add_argument("--no-token", action="store_true",
+                       help="serve the API without an access token (unsafe on "
+                            "shared machines: loopback is shared by all users)")
     p_run.set_defaults(func=cmd_run)
 
     p_stop = sub.add_parser("stop", help="stop a server started by this script")
