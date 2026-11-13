@@ -37,7 +37,8 @@ def test_project_traversal_rejected(claude_home, project):
     for path in (f"/api/projects/{project}/sessions", f"/api/projects/{project}/memory",
                  f"/api/projects/{project}/doc", f"/api/projects/{project}/tasks"):
         assert client.get(path).status_code == 400, path
-    r = client.put(f"/api/projects/{project}/memory", json={"name": "x.md", "content": "pwned"})
+    r = client.put(f"/api/projects/{project}/memory",
+                   json={"name": "x.md", "content": "pwned", "expect_dir": ""})
     assert r.status_code == 400
     assert not (claude_home / "memory").exists()
 
@@ -108,7 +109,7 @@ def test_symlinked_memory_file_cannot_redirect_a_write(claude_home, tmp_path):
     mem.mkdir()
     (mem / "linked.md").symlink_to(outside)
     r = client.put("/api/projects/-tmp-repo_claude/memory",
-                   json={"name": "linked.md", "content": "overwritten"})
+                   json={"name": "linked.md", "content": "overwritten", "expect_dir": str(mem)})
     assert r.status_code == 400
     assert outside.read_text() == "original"
 
@@ -135,14 +136,16 @@ def test_other_write_paths_cannot_follow_symlinks_out(claude_home, tmp_path):
     repo = claude_home.parent / "repo_claude"
     (repo / "CLAUDE.md").unlink()
     (repo / "CLAUDE.md").symlink_to(outside / "victim.md")
-    r = client.put("/api/projects/-tmp-repo_claude/doc", json={"content": "overwritten"})
+    r = client.put("/api/projects/-tmp-repo_claude/doc",
+                   json={"content": "overwritten", "expect_cwd": str(repo)})
     assert r.status_code == 400, r.text
     # 3. the whole memory/ directory symlinked outside the project
     (proj / "memory" / "session_sess-c1.md").unlink()
     (proj / "memory").rmdir()
     (proj / "memory").symlink_to(outside, target_is_directory=True)
     r = client.put("/api/projects/-tmp-repo_claude/memory",
-                   json={"name": "victim.md", "content": "overwritten"})
+                   json={"name": "victim.md", "content": "overwritten",
+                         "expect_dir": str(proj / "memory")})
     assert r.status_code == 400, r.text
     assert (outside / "victim.md").read_text() == "original"
     assert sorted(p.name for p in outside.iterdir()) == ["victim.md"]

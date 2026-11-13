@@ -127,7 +127,12 @@ Three layers, all under `backend/` + `frontend/`:
   `POST /api/projects/{p}/delete` (`export_first`, `include_memory`, `hard`, and the
   required `expect_cwd`: the directory the confirmation showed — 409 if the name
   means another directory now) delete a whole project and purge its sessions (and,
-  when the project is gone, its docs) from the index. Pydantic models guard request
+  when the project is gone, its docs) from the index. The writes into a project's
+  directory are bound the same way: `PUT /api/projects/{p}/doc` requires
+  `expect_cwd` (the doc GET's `cwd`) and `PUT /api/projects/{p}/memory` requires
+  `expect_dir` (the memory GET's `dir`); the adapter compares them with the
+  directory it is about to write (`common.check_cwd` → `ProjectChanged` → 409).
+  Pydantic models guard request
   bodies; every route validates `project`/`session_id`/`task_id`
   (`is_safe_name`/`is_safe_id`). A middleware enforces the access token
   (`CC_MGR_TOKEN`), the loopback Host allowlist (`CC_MGR_ALLOWED_HOSTS`), read-only
@@ -142,9 +147,12 @@ Three layers, all under `backend/` + `frontend/`:
   sessions (`parent_id`) fold under their parent (`sessionTree`). Three-pane layout
   (projects / sessions / detail) with draggable splitters and a collapsible sidebar;
   widths + active agent persist in `localStorage`. Delete dialogs bind the agent,
-  project (and its `cwd`, sent as `expect_cwd`) and session when they open. When the
-  project list reloads, the open project is followed by its directory if its name
-  changed (`followProject`).
+  project (and its `cwd`, sent as `expect_cwd`) and session when they open; the doc
+  and memory editors bind the project they were loaded for and send the directory
+  they showed; a project view drops a response that arrives after the user moved
+  on. When the project list reloads, the open project is followed by its directory
+  if its name changed (`followProject`), and let go of if its directory is gone —
+  even when its old name now means another directory.
 
 ## On-disk data model (what `store.py` reads — verified, not assumed)
 
@@ -203,10 +211,11 @@ Three layers, all under `backend/` + `frontend/`:
   session's descendants, so a permanent *project* delete first walks that tree:
   archived subagents in the directory are previewed and exported, and descendants
   under other directories make it refuse (archiving is still possible). It then
-  only deletes what was approved (the listed sessions + those archived subagents):
-  right before each `opencode session delete` the session's subtree is looked up
-  again, and if anything else joined it meanwhile (a new subagent) that session is
-  refused and kept. Doc: `AGENTS.md`.
+  only touches what was approved (the listed sessions + those archived subagents):
+  right before each `opencode session delete` (or archive) the session — and for a
+  delete its whole subtree — is looked up again, and anything that isn't approved
+  or isn't in this directory any more (a new subagent, a session moved away) makes
+  that session refused and kept. Doc: `AGENTS.md`.
 - **Codex** (`$CODEX_HOME` or `~/.codex`): sessions under
   `sessions/YYYY/MM/DD/rollout-*.jsonl`, grouped into projects by mangled cwd. **Each
   line is a `{timestamp,type,payload}` envelope.** cwd from `session_meta.payload`,
@@ -233,9 +242,13 @@ Three layers, all under `backend/` + `frontend/`:
   (whatever Copilot did while we waited for the lock is visible now) and the backup
   is read, so a soft delete saves exactly the rows it deletes (`db_rows.json`, with
   the folder, in `.cc_mgr_trash/`). On a failure it rolls back and moves the folder
-  back with `common.restore_dir` — never over one that reappeared, not even an empty
-  one (a plain `os.rename` would replace that); then the trash copy is kept and
-  reported. A `session-store.db` that resolves
+  back with `common.restore_dir`, which never replaces anything, not even an empty
+  directory (a plain `os.rename` would): one atomic `renameat2(RENAME_NOREPLACE)`
+  where supported, else (Lustre — where the Copilot home lives on Perlmutter —
+  answers EINVAL) a mkdir claim plus hard links entry by entry, which refuse names
+  that appeared meanwhile. Whatever can't go back stays in the trash copy, which is
+  then kept and reported. A session folder that is a symlink is refused (it could
+  point at another session's folder). A `session-store.db` that resolves
   outside the Copilot home is refused. Refused too while
   `session-state/<id>/inuse.<pid>.lock` names a live copilot process, or the session
   (folder, events.jsonl or the store's `updated_at`) was active in the last two

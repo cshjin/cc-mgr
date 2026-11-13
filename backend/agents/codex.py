@@ -316,8 +316,8 @@ class CodexAdapter(AgentAdapter):
     def get_doc(self, project):
         return read_doc_file(self._project_cwd(project), "AGENTS.md")
 
-    def save_doc(self, project, content):
-        return save_doc_file(self._project_cwd(project), "AGENTS.md", content)
+    def save_doc(self, project, content, expect_cwd=None):
+        return save_doc_file(self._project_cwd(project), "AGENTS.md", content, expect_cwd)
 
     def _codex_target(self, path: Path) -> str:
         """The id to hand the codex CLI, only if it unambiguously means this

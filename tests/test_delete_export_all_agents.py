@@ -1,4 +1,5 @@
 """#24: Markdown export for every agent; delete for Codex, Copilot CLI and Gemini CLI."""
+import errno
 import json
 import os
 import shutil
@@ -373,7 +374,8 @@ def test_copilot_puts_everything_back_if_the_store_refuses(store):
 
 
 @pytest.mark.parametrize("recreated", [["new.txt"], []], ids=["with-files", "empty"])
-def test_copilot_rollback_never_overwrites_a_folder_that_reappeared(store, monkeypatch, recreated):
+def test_copilot_rollback_never_overwrites_a_folder_that_reappeared(store, monkeypatch, recreated,
+                                                                    restore_path):
     # os.rename would silently replace an *empty* directory: the restore must not
     _age(store, "aaaa-1")
     _refuse_deletes_from(store, "sessions")
@@ -399,56 +401,186 @@ def test_copilot_rollback_never_overwrites_a_folder_that_reappeared(store, monke
     assert _rows(store, "aaaa-1")["sessions"] == 1
 
 
-def test_restore_dir_puts_everything_back(tmp_path):
+@pytest.mark.parametrize("restore_path", ["no-renameat2", "lustre-like"], indirect=True)
+def test_copilot_rollback_never_replaces_a_file_written_meanwhile(store, monkeypatch, restore_path):
+    # Copilot writes events.jsonl again right before cc_mgr would put its copy back
+    _age(store, "aaaa-1")
+    _refuse_deletes_from(store, "sessions")
+    state = store / "session-state" / "aaaa-1"
+    real_link = os.link
+
+    def link_after_copilot_wrote(s, d, **kw):
+        if Path(d) == state / "events.jsonl":
+            Path(d).write_text("new")
+        return real_link(s, d, **kw)
+
+    monkeypatch.setattr(common.os, "link", link_after_copilot_wrote)
+    with pytest.raises(RuntimeError, match="previous copy is kept in"):
+        CopilotAdapter().delete_session(_cp_project(store), "aaaa-1")
+    assert (state / "events.jsonl").read_text() == "new"
+    kept = next((store / ".cc_mgr_trash").iterdir())
+    assert (kept / "session-state" / "events.jsonl").is_file() and (kept / "db_rows.json").is_file()
+    assert _rows(store, "aaaa-1")["sessions"] == 1
+
+
+def _other_session_folder(store):
+    other = store / "session-state" / "zzzz-9"
+    other.mkdir()
+    (other / "notes.txt").write_text("another session's")
+    return other
+
+
+def test_copilot_refuses_a_symlinked_session_folder(store):
+    other = _other_session_folder(store)
+    state = store / "session-state" / "aaaa-1"
+    state.rename(store / "aside")
+    state.symlink_to(other, target_is_directory=True)
+    _age(store, "aaaa-1")
+    for hard in (False, True):
+        r = client.post(f"/api/projects/{_cp_project(store)}/sessions/aaaa-1/delete",
+                        params={"agent": "copilot"}, json={"export_first": False, "hard": hard})
+        assert r.status_code == 400 and "symlink" in r.json()["detail"]
+    assert state.is_symlink() and sorted(os.listdir(other)) == ["notes.txt"]
+    assert _rows(store, "aaaa-1")["sessions"] == 1 and not (store / ".cc_mgr_trash").exists()
+
+
+def test_copilot_refuses_a_session_folder_that_became_a_symlink(store, monkeypatch):
+    # swapped for a symlink after delete_session looked, while cc_mgr waited for the lock
+    _age(store, "aaaa-1")
+    other = _other_session_folder(store)
+    state = store / "session-state" / "aaaa-1"
+    calls = []
+
+    def swapped_meanwhile(home, sid, updated=0.0):
+        calls.append(sid)
+        if len(calls) == 2:
+            state.rename(store / "aside")
+            state.symlink_to(other, target_is_directory=True)
+        return ""
+
+    monkeypatch.setattr(cp, "_busy_reason", swapped_meanwhile)
+    with pytest.raises(ValueError, match="symlink"):
+        CopilotAdapter().delete_session(_cp_project(store), "aaaa-1")
+    assert len(calls) == 2 and state.is_symlink() and sorted(os.listdir(other)) == ["notes.txt"]
+    assert _rows(store, "aaaa-1")["sessions"] == 1
+    assert not any((store / ".cc_mgr_trash").iterdir())
+
+
+@pytest.fixture(params=["atomic", "no-renameat2", "lustre-like"])
+def restore_path(request, monkeypatch):
+    """Each way restore_dir can go: one atomic no-replace rename; no renameat2
+    at all; or a renameat2 that refuses an existing target but can't do the
+    rename itself (what Lustre does: EEXIST, else EINVAL)."""
+    if request.param == "atomic":
+        if common._renameat2() is None:
+            pytest.skip("no renameat2 here")
+    elif request.param == "no-renameat2":
+        monkeypatch.setattr(common, "_renameat2", lambda: None)
+    else:
+        err = [0]
+
+        def lustre(at, src, at2, dst, flags):
+            err[0] = errno.EEXIST if os.path.lexists(dst) else errno.EINVAL
+            return -1
+
+        monkeypatch.setattr(common, "_renameat2", lambda: (lustre, lambda: err[0]))
+    return request.param
+
+
+def _trash_copy(tmp_path):
     src = tmp_path / "trash" / "s"
     (src / "sub").mkdir(parents=True)
-    (src / "a.txt").write_text("a")
+    (src / "events.jsonl").write_text("old")
     (src / "sub" / "b.txt").write_text("b")
+    (src / "link").symlink_to(tmp_path / "elsewhere")
     os.chmod(src, 0o700)
     os.utime(src, (1_000_000, 2_000_000))
+    return src
+
+
+def test_restore_dir_puts_everything_back(tmp_path, restore_path):
+    (tmp_path / "elsewhere").mkdir()
+    src = _trash_copy(tmp_path)
     dst = tmp_path / "state" / "s"
     dst.parent.mkdir()
     assert restore_dir(src, dst) is True
-    assert not src.exists()
-    assert (dst / "a.txt").read_text() == "a" and (dst / "sub" / "b.txt").read_text() == "b"
+    assert not src.exists() and not (tmp_path / "trash" / "s").exists()
+    assert (dst / "events.jsonl").read_text() == "old" and (dst / "sub" / "b.txt").read_text() == "b"
+    assert (dst / "link").is_symlink() and os.readlink(dst / "link") == str(tmp_path / "elsewhere")
     assert stat.S_IMODE(dst.stat().st_mode) == 0o700 and dst.stat().st_mtime == 2_000_000
 
 
 @pytest.mark.parametrize("existing", ["empty dir", "dir", "file"])
-def test_restore_dir_never_replaces_anything(tmp_path, existing):
-    src = tmp_path / "trash" / "s"
-    src.mkdir(parents=True)
-    (src / "a.txt").write_text("old")
+def test_restore_dir_never_replaces_anything(tmp_path, restore_path, existing):
+    src = _trash_copy(tmp_path)
     dst = tmp_path / "s"
     if existing == "file":
         dst.write_text("theirs")
     else:
         dst.mkdir()
         if existing == "dir":
-            (dst / "a.txt").write_text("theirs")
+            (dst / "events.jsonl").write_text("theirs")
     before = dst.stat().st_ino
     assert restore_dir(src, dst) is False
-    assert dst.stat().st_ino == before and (src / "a.txt").read_text() == "old"
-    assert existing != "dir" or (dst / "a.txt").read_text() == "theirs"
+    assert dst.stat().st_ino == before and (src / "events.jsonl").read_text() == "old"
+    assert existing != "dir" or sorted(os.listdir(dst)) == ["events.jsonl"]
+    assert existing != "dir" or (dst / "events.jsonl").read_text() == "theirs"
 
 
-def test_restore_dir_skips_entries_that_appear_meanwhile(tmp_path, monkeypatch):
-    src = tmp_path / "trash" / "s"
-    src.mkdir(parents=True)
-    (src / "events.jsonl").write_text("old")
-    (src / "other.txt").write_text("other")
+@pytest.mark.parametrize("restore_path", ["no-renameat2", "lustre-like"], indirect=True)
+def test_restore_dir_never_replaces_an_entry_that_appears_at_the_last_moment(
+        tmp_path, restore_path, monkeypatch):
+    # entry by entry: Copilot writes events.jsonl (and a sub/ folder) into the claimed
+    # folder right before cc_mgr puts its own back — a check-then-rename would replace them
+    src = _trash_copy(tmp_path)
     dst = tmp_path / "s"
-    real_mkdir = os.mkdir
+    real_link, real_mkdir = os.link, os.mkdir
 
-    def mkdir_then_copilot_writes(path, *args, **kwargs):
-        real_mkdir(path, *args, **kwargs)
-        if Path(path) == dst:  # right after the claim, Copilot writes into it
-            (dst / "events.jsonl").write_text("new")
+    def link_after_copilot_wrote(s, d, **kw):
+        if os.path.basename(d) == "events.jsonl":
+            Path(d).write_text("new")
+        return real_link(s, d, **kw)
 
-    monkeypatch.setattr(common.os, "mkdir", mkdir_then_copilot_writes)
+    def mkdir_after_copilot_made_it(path, *args, **kw):
+        if os.path.basename(path) == "sub":
+            real_mkdir(path, *args, **kw)
+            Path(path, "c.txt").write_text("new")
+        return real_mkdir(path, *args, **kw)
+
+    monkeypatch.setattr(common.os, "link", link_after_copilot_wrote)
+    monkeypatch.setattr(common.os, "mkdir", mkdir_after_copilot_made_it)
     assert restore_dir(src, dst) is False
-    assert (dst / "events.jsonl").read_text() == "new" and (dst / "other.txt").read_text() == "other"
-    assert (src / "events.jsonl").read_text() == "old"  # kept where it was, not lost
+    assert (dst / "events.jsonl").read_text() == "new" and sorted(os.listdir(dst / "sub")) == ["c.txt"]
+    assert (dst / "link").is_symlink()  # what didn't clash went back
+    assert (src / "events.jsonl").read_text() == "old" and (src / "sub" / "b.txt").read_text() == "b"
+
+
+@pytest.mark.parametrize("restore_path", ["no-renameat2"], indirect=True)
+def test_restore_dir_without_hard_links_leaves_everything_in_trash(tmp_path, restore_path,
+                                                                    monkeypatch):
+    src = _trash_copy(tmp_path)
+    dst = tmp_path / "s"
+
+    def no_hard_links(*args, **kw):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(common.os, "link", no_hard_links)
+    assert restore_dir(src, dst) is False
+    assert not dst.exists()  # no empty stand-in left behind
+    assert (src / "events.jsonl").read_text() == "old" and (src / "sub" / "b.txt").read_text() == "b"
+
+
+def test_restore_dir_never_follows_a_symlinked_source(tmp_path, restore_path):
+    other = tmp_path / "session-state" / "other"
+    other.mkdir(parents=True)
+    (other / "events.jsonl").write_text("another session")
+    src = tmp_path / "trash" / "s"
+    src.parent.mkdir()
+    src.symlink_to(other, target_is_directory=True)
+    dst = tmp_path / "session-state" / "s"
+    assert restore_dir(src, dst) is False
+    assert not dst.exists() and src.is_symlink()
+    assert sorted(os.listdir(other)) == ["events.jsonl"]
 
 
 def _now_iso():

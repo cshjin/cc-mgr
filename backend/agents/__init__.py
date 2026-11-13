@@ -12,19 +12,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .common import (  # SessionSummary is re-exported
-    SessionSummary, default_export_dir, is_safe_id, private_mkdir, render_markdown,
-    write_private,
+from .common import (  # SessionSummary and ProjectChanged are re-exported
+    ProjectChanged, SessionSummary, default_export_dir, is_safe_id, private_mkdir,
+    render_markdown, write_private,
 )
 
 
 class UnsupportedCapability(Exception):
     """Raised when an adapter is asked for a feature it doesn't support."""
-
-
-class ProjectChanged(Exception):
-    """The project name now stands for a different directory than the caller
-    saw (names can shift when a colliding directory appears or goes)."""
 
 
 @dataclass(frozen=True)
@@ -67,14 +62,19 @@ class AgentAdapter(ABC):
     def get_doc(self, project: str) -> dict[str, Any]:
         raise UnsupportedCapability("get_doc not implemented")
 
-    def save_doc(self, project: str, content: str) -> Path:
+    def save_doc(self, project: str, content: str, expect_cwd: str | None = None) -> Path:
+        """Write the root doc into the project's directory. expect_cwd: the one
+        the editor showed (get_doc's "cwd"); ProjectChanged if it differs now."""
         raise UnsupportedCapability("doc editing not supported")
 
     # ---- Claude-only extras (base raises) ----
     def get_memory(self, project: str) -> dict[str, Any]:
         raise UnsupportedCapability("memory not supported")
 
-    def save_memory_file(self, project: str, name: str, content: str) -> Path:
+    def save_memory_file(self, project: str, name: str, content: str,
+                         expect_dir: str | None = None) -> Path:
+        """expect_dir: the memory dir the editor showed (get_memory's "dir");
+        ProjectChanged if the project's memory lives elsewhere now."""
         raise UnsupportedCapability("memory not supported")
 
     def get_tasks(self, session_id: str) -> list[dict[str, Any]]:

@@ -41,14 +41,14 @@ class ClaudeAdapter(AgentAdapter):
     def get_doc(self, project):
         return store.get_claude_md(project)
 
-    def save_doc(self, project, content):
-        return store.save_claude_md(project, content)
+    def save_doc(self, project, content, expect_cwd=None):
+        return store.save_claude_md(project, content, expect_cwd)
 
     def get_memory(self, project):
         return store.get_memory(project)
 
-    def save_memory_file(self, project, name, content):
-        return store.save_memory_file(project, name, content)
+    def save_memory_file(self, project, name, content, expect_dir=None):
+        return store.save_memory_file(project, name, content, expect_dir)
 
     def get_tasks(self, session_id):
         return store.get_tasks(session_id)

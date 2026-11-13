@@ -44,7 +44,7 @@ def test_doc_get_and_put_gemini(gemini_home, claude_home):
     assert g.status_code == 200 and "beta" in g.json()["content"]
     # Gemini CLI is retired: its view is read-only (agy edits GEMINI.md)
     p = client.put(f"/api/projects/{pname}/doc", params={"agent": "gemini"},
-                   json={"content": "# g\nsigma\n"})
+                   json={"content": "# g\nsigma\n", "expect_cwd": g.json()["cwd"]})
     assert p.status_code == 404
     assert "sigma" not in client.get(f"/api/projects/{pname}/doc",
                                      params={"agent": "gemini"}).json()["content"]

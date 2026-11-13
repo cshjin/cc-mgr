@@ -1,6 +1,8 @@
 """Agent-neutral helpers shared by all adapters."""
 from __future__ import annotations
 
+import errno
+import functools
 import hashlib
 import json
 import logging
@@ -8,6 +10,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -177,32 +180,97 @@ def project_names(cwds: Iterable[str]) -> dict[str, str]:
 
 
 def restore_dir(src: Path, dst: Path) -> bool:
-    """Move the directory src back to dst without ever replacing anything there.
+    """Move the directory src back to dst, never replacing anything there.
 
-    os.rename alone would silently replace an *empty* directory at dst (POSIX),
-    so dst is claimed with mkdir first: if anything exists there, nothing moves
-    and False is returned. The entries then move into the claimed directory one
-    by one, each one skipped if an entry of that name appeared meanwhile; src
-    is removed only once it is empty, and dst gets src's mode and times back.
-    True when everything went back.
+    One atomic no-replace rename where the system supports it; otherwise (e.g.
+    Lustre, which lacks RENAME_NOREPLACE) dst is claimed with mkdir and src's
+    entries move in one by one, each with a step that can't replace anything
+    either: a hard link for files and symlinks (then the old name goes), the
+    same claim for directories. Whatever can't go back without replacing
+    something — dst existed, even as an empty directory (a plain os.rename
+    would silently replace that); an entry of that name appeared meanwhile;
+    the filesystem refused — stays in src. src is never followed through a
+    symlink. True when everything went back and src is gone.
     """
+    src, dst = os.fspath(src), os.fspath(dst)
+    if os.path.islink(src) or not os.path.isdir(src):
+        return False
     try:
-        os.mkdir(dst)
+        if rename_noreplace(src, dst):
+            return True
     except FileExistsError:
         return False
-    st = os.stat(src)
+    return _merge_back(src, dst)
+
+
+def _merge_back(src: str, dst: str) -> bool:
+    try:
+        os.mkdir(dst)  # the claim: fails if anything is at dst
+    except FileExistsError:
+        return False
+    st = os.lstat(src)
     complete = True
     for name in sorted(os.listdir(src)):
-        target = os.path.join(dst, name)
-        if os.path.lexists(target):
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        try:
+            if stat.S_ISDIR(os.lstat(s).st_mode):
+                complete = _merge_back(s, d) and complete
+            else:
+                os.link(s, d, follow_symlinks=False)  # fails if d exists
+                os.unlink(s)
+        except OSError:  # d appeared meanwhile, or this filesystem has no hard links
             complete = False
-            continue
-        os.rename(os.path.join(src, name), target)
     os.chmod(dst, stat.S_IMODE(st.st_mode))
     os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
     if complete:
         os.rmdir(src)
+    else:
+        try:
+            os.rmdir(dst)  # nothing got in: leave no empty stand-in behind
+        except OSError:
+            pass
     return complete
+
+
+@functools.lru_cache(maxsize=1)
+def _renameat2():
+    """(libc renameat2, ctypes.get_errno), or None: not Linux, no ctypes, or a
+    libc without renameat2."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        fn = ctypes.CDLL(None, use_errno=True).renameat2
+    except (ImportError, OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    return fn, ctypes.get_errno
+
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+def rename_noreplace(src, dst) -> bool:
+    """Rename src to dst in one atomic step that never replaces anything at dst
+    (FileExistsError if something is there, even an empty directory). False if
+    this system or filesystem can't do that; then nothing happened."""
+    if os.name == "nt":  # Windows' rename never replaces an existing file or directory
+        os.rename(src, dst)
+        return True
+    found = _renameat2()
+    if found is None:
+        return False
+    renameat2, get_errno = found
+    if renameat2(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
+        return True
+    err = get_errno()
+    if err in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(err, os.strerror(err), os.fspath(dst))
+    if err in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):  # the flag isn't supported here
+        return False
+    raise OSError(err, os.strerror(err), os.fspath(src))
 
 
 def _fenced(text: str, lang: str = "") -> str:
@@ -409,6 +477,11 @@ def read_git_info(cwd: str | None) -> dict[str, Any] | None:
     return {"repo": root.name, "branch": branch, "detached": detached}
 
 
+class ProjectChanged(Exception):
+    """A project name now stands for a different directory than the caller
+    saw (names can shift when a directory that mangles alike appears or goes)."""
+
+
 def read_doc_file(cwd: str, filename: str) -> dict[str, Any]:
     """Read a root doc (CLAUDE.md/GEMINI.md/AGENTS.md) from a project's cwd."""
     if not cwd:
@@ -421,10 +494,21 @@ def read_doc_file(cwd: str, filename: str) -> dict[str, Any]:
     return {"exists": False, "path": str(path), "content": "", "cwd": cwd}
 
 
-def save_doc_file(cwd: str, filename: str, content: str) -> Path:
-    """Write a root doc into a project's cwd, with a name guard."""
+def check_cwd(cwd: str, expect_cwd: str | None) -> None:
+    """ProjectChanged unless the project's directory is still the one the
+    caller showed the user (None: no expectation)."""
+    if expect_cwd is not None and cwd != expect_cwd:
+        raise ProjectChanged(f"this project now refers to {cwd or 'no directory'}, not "
+                             f"{expect_cwd or 'no directory'}; reload and try again")
+
+
+def save_doc_file(cwd: str, filename: str, content: str, expect_cwd: str | None = None) -> Path:
+    """Write a root doc into a project's cwd, with a name guard. expect_cwd: the
+    directory the editor showed; a project that means another one by now is
+    refused (ProjectChanged) rather than written."""
     if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
         raise ValueError("invalid doc file name")
+    check_cwd(cwd, expect_cwd)
     if not cwd:
         raise FileNotFoundError("no working directory known for this project")
     base = Path(cwd)

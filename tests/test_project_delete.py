@@ -403,6 +403,103 @@ def test_opencode_refuses_subagents_that_joined_after_the_check(fake_opencode, o
     assert {"ses_v2_parent", "ses_v2_child", "ses_late_out", "ses_late_in"} <= left
 
 
+def _move_during_export(monkeypatch, db, when, moved):
+    """While `when` is being exported, OpenCode moves the session `moved` to
+    another directory (approved by id a moment ago, not by place any more)."""
+    real_export = OpencodeAdapter.export_session_to_file
+
+    def export(self, project, sid, out_dir=None):
+        if sid == when:
+            conn = sqlite3.connect(db)
+            conn.execute("UPDATE session_v2 SET directory = '/another/project' WHERE id = ?", (moved,))
+            conn.commit()
+            conn.close()
+        return real_export(self, project, sid, out_dir)
+
+    monkeypatch.setattr(OpencodeAdapter, "export_session_to_file", export)
+
+
+def test_opencode_never_deletes_a_session_that_moved_away(fake_opencode, opencode_v2_home,
+                                                          tmp_path, monkeypatch):
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(tmp_path / "exports"))
+    db = opencode_v2_home / "opencode.db"
+    _move_during_export(monkeypatch, db, "ses_v2_parent", "ses_v2_child")
+    res = _delete(_oc_project(), agent="opencode", hard=True, export_first=True).json()
+    # the parent would take the moved child along; the child itself is elsewhere now
+    assert sorted(res["errors"]) == ["ses_v2_child", "ses_v2_parent"]
+    assert "ses_v2_child" in res["errors"]["ses_v2_parent"]
+    assert fake_opencode == [["session", "delete", "ses_old"]]
+    conn = sqlite3.connect(db)
+    left = {r[0]: r[1] for r in conn.execute("SELECT id, directory FROM session_v2")}
+    conn.close()
+    assert left["ses_v2_child"] == "/another/project" and "ses_v2_parent" in left
+
+
+def test_opencode_never_archives_a_session_that_moved_away(fake_opencode, opencode_v2_home,
+                                                           tmp_path, monkeypatch):
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(tmp_path / "exports"))
+    _move_during_export(monkeypatch, opencode_v2_home / "opencode.db", "ses_v2_parent", "ses_old")
+    res = _delete(_oc_project(), agent="opencode", export_first=True).json()
+    assert list(res["errors"]) == ["ses_old"] and "moved" in res["errors"]["ses_old"]
+    assert sorted(c[3] for c in fake_opencode) == ["sessionID=ses_v2_child", "sessionID=ses_v2_parent"]
+
+
+def test_a_doc_editor_never_writes_into_another_directory(copilot_store_home, tmp_path):
+    a, b = tmp_path / "a-b", tmp_path / "a" / "b"
+    a.mkdir()
+    b.mkdir(parents=True)
+    (b / "AGENTS.md").write_text("b's doc")
+    _cp_add(copilot_store_home, "cc-1", str(a))
+    name = mangle(str(a))
+    shown = client.get(f"/api/projects/{name}/doc", params={"agent": "copilot"}).json()
+    assert shown["cwd"] == str(a)  # the editor shows a's AGENTS.md
+    _cp_add(copilot_store_home, "dd-2", str(b))  # b appears, and another client deletes a:
+    CopilotAdapter().delete_project(next(p["name"] for p in CopilotAdapter().list_projects()
+                                         if p["cwd"] == str(a)), hard=True)
+    assert next(p["name"] for p in CopilotAdapter().list_projects() if p["cwd"] == str(b)) == name
+
+    def save(content, expect_cwd):
+        return client.put(f"/api/projects/{name}/doc", params={"agent": "copilot"},
+                          json={"content": content, "expect_cwd": expect_cwd})
+
+    r = save("a's edit", shown["cwd"])  # the editor that still shows a
+    assert r.status_code == 409 and "reload" in r.json()["detail"]
+    assert (b / "AGENTS.md").read_text() == "b's doc" and not (a / "AGENTS.md").exists()
+    assert save("b's edit", str(b)).status_code == 200  # an editor that shows b
+    assert (b / "AGENTS.md").read_text() == "b's edit"
+    r = client.put(f"/api/projects/{name}/doc", params={"agent": "copilot"}, json={"content": "x"})
+    assert r.status_code == 422  # a save must say which directory it means
+
+
+def test_claude_doc_and_memory_saves_check_what_the_editor_showed(claude_home):
+    doc = client.get(f"/api/projects/{CLAUDE_PROJ}/doc").json()
+    mem = client.get(f"/api/projects/{CLAUDE_PROJ}/memory").json()
+    claude_md = Path(doc["cwd"]) / "CLAUDE.md"
+    before = claude_md.read_text()
+    r = client.put(f"/api/projects/{CLAUDE_PROJ}/doc", json={"content": "x", "expect_cwd": "/elsewhere"})
+    assert r.status_code == 409 and claude_md.read_text() == before
+    r = client.put(f"/api/projects/{CLAUDE_PROJ}/memory",
+                   json={"name": "n.md", "content": "x", "expect_dir": "/elsewhere"})
+    assert r.status_code == 409 and not (Path(mem["dir"]) / "n.md").exists()
+    assert client.put(f"/api/projects/{CLAUDE_PROJ}/doc",
+                      json={"content": "new", "expect_cwd": doc["cwd"]}).status_code == 200
+    assert client.put(f"/api/projects/{CLAUDE_PROJ}/memory",
+                      json={"name": "n.md", "content": "x", "expect_dir": mem["dir"]}).status_code == 200
+    assert claude_md.read_text() == "new" and (Path(mem["dir"]) / "n.md").read_text() == "x"
+
+
+def test_agy_memory_save_checks_the_directory(agy_home):
+    pname = AgyAdapter().list_projects()[0]["name"]
+    mem = client.get(f"/api/projects/{pname}/memory", params={"agent": "agy"}).json()
+    rules = Path(mem["dir"]) / ".agents" / "rules"
+    r = client.put(f"/api/projects/{pname}/memory", params={"agent": "agy"},
+                   json={"name": "r.md", "content": "x", "expect_dir": "/elsewhere"})
+    assert r.status_code == 409 and not (rules / "r.md").exists()
+    r = client.put(f"/api/projects/{pname}/memory", params={"agent": "agy"},
+                   json={"name": "r.md", "content": "x", "expect_dir": mem["dir"]})
+    assert r.status_code == 200 and (rules / "r.md").read_text() == "x"
+
+
 def test_the_index_follows_a_renamed_project(copilot_store_home, tmp_path):
     a, b = str(tmp_path / "a-b"), str(tmp_path / "a" / "b")
     _cp_add(copilot_store_home, "cc-1", a)

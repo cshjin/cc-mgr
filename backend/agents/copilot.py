@@ -310,6 +310,8 @@ def _delete_store_session(home: Path, db: Path | None, state_dir: Path, session_
             (trash / "db_rows.json").write_text(
                 json.dumps({"db": str(db), "session_id": session_id, "rows": backup},
                            ensure_ascii=False, indent=1), encoding="utf-8")
+            if state_dir.is_symlink():  # became one since delete_session looked
+                raise ValueError("the session's folder is a symlink; refusing to move it")
             if state_dir.is_dir():
                 os.rename(state_dir, trash / "session-state")  # same filesystem: both under home
                 moved = True
@@ -328,8 +330,8 @@ def _delete_store_session(home: Path, db: Path | None, state_dir: Path, session_
             except OSError:
                 restored = False
             if not restored:
-                kept = (f"; the session folder reappeared meanwhile (or couldn't be put back), "
-                        f"so its previous copy is kept in {trash}")
+                kept = (f"; the session folder couldn't all go back without replacing something "
+                        f"that appeared meanwhile, so its previous copy is kept in {trash}")
         if trash is not None and not kept:
             shutil.rmtree(trash, ignore_errors=True)
         if isinstance(e, (sqlite3.Error, OSError)):
@@ -497,8 +499,8 @@ class CopilotAdapter(AgentAdapter):
     def get_doc(self, project):
         return read_doc_file(self._project_cwd(project), "AGENTS.md")
 
-    def save_doc(self, project, content):
-        return save_doc_file(self._project_cwd(project), "AGENTS.md", content)
+    def save_doc(self, project, content, expect_cwd=None):
+        return save_doc_file(self._project_cwd(project), "AGENTS.md", content, expect_cwd)
 
     def _session_title(self, project: str, session_id: str) -> str:
         info = next((s for s in self._store_sessions(project) if s["id"] == session_id), None)
@@ -517,8 +519,10 @@ class CopilotAdapter(AgentAdapter):
         db = _store_db(home)
         if db is not None and not resolves_inside(db, home):
             raise ValueError("session-store.db resolves outside the Copilot home; refusing to modify it")
-        return _delete_store_session(home, db, safe_join(home / "session-state", session_id),
-                                     session_id, hard)
+        state_dir = safe_join(home / "session-state", session_id)
+        if state_dir.is_symlink():  # it would point at another session's (or any) folder
+            raise ValueError("the session's folder is a symlink; refusing to move or delete through it")
+        return _delete_store_session(home, db, state_dir, session_id, hard)
 
     def _delete_history_session(self, project: str, session_id: str, hard: bool) -> dict[str, Any]:
         """A session in the legacy history/<project>/ layout: just its file."""

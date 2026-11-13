@@ -792,8 +792,8 @@ class OpencodeAdapter(AgentAdapter):
     def get_doc(self, project: str) -> dict[str, Any]:
         return read_doc_file(self._project_cwd(project), "AGENTS.md")
 
-    def save_doc(self, project: str, content: str) -> Path:
-        return save_doc_file(self._project_cwd(project), "AGENTS.md", content)
+    def save_doc(self, project: str, content: str, expect_cwd: str | None = None) -> Path:
+        return save_doc_file(self._project_cwd(project), "AGENTS.md", content, expect_cwd)
 
     # ---- tasks: the legacy v1 `todo` table (OpenCode v2 has no todo tool) ----
 
@@ -987,59 +987,70 @@ class OpencodeAdapter(AgentAdapter):
                        guard: Callable[[str], None] | None = None) -> dict[str, Any]:
         """Archive (soft) or delete every session of the project.
 
-        A permanent delete takes each session's descendants along, so it is
-        bounded to what was approved: the listed sessions and the archived
-        subagents in this directory (exported first). Descendants elsewhere
-        refuse the whole delete up front, and right before each session goes
-        its subtree is looked up again: if anything else joined it meanwhile
-        (e.g. a new subagent), that session is refused and kept."""
+        Only what was approved goes: the listed sessions and, for a permanent
+        delete (which takes each session's descendants along), the archived
+        subagents in this directory, exported first. Descendants elsewhere
+        refuse the whole permanent delete up front. Right before each session
+        goes, everything that call touches — the session, and for a permanent
+        delete its whole subtree — is looked up again: each must still be
+        approved and still in this directory. A session that moved away, or
+        gained a descendant (here or elsewhere), is refused and kept."""
         cwd = self._project_cwd(project)
         if expect_cwd is not None and cwd != expect_cwd:
             raise ProjectChanged(f"project {project} now refers to {cwd or 'no directory'}, "
                                  f"not {expect_cwd or 'no directory'}; reload and try again")
-        if not hard:  # archiving touches only the session itself
-            return super().delete_project(project, export_first=export_first,
-                                          expect_cwd=expect_cwd, guard=guard)
-        here, elsewhere = self._cascade(cwd)
-        if elsewhere:
-            raise ValueError(
-                f"a permanent delete would also remove {len(elsewhere)} subagent session(s) "
-                f"stored under other directories (OpenCode deletes a session's "
-                f"descendants); archive this project instead, or delete those first")
-        approved = set(here) | {s.session_id for s in self.list_sessions(project)}
+        here: list[str] = []
         exported: list[str] = []
-        if export_first:  # the archived subagents go too: export them before anything is deleted
-            exported = [str(self.export_session_to_file(project, sid)) for sid in here]
+        if hard:
+            here, elsewhere = self._cascade(cwd)
+            if elsewhere:
+                raise ValueError(
+                    f"a permanent delete would also remove {len(elsewhere)} subagent session(s) "
+                    f"stored under other directories (OpenCode deletes a session's "
+                    f"descendants); archive this project instead, or delete those first")
+            if export_first:  # the archived subagents go too: export them before anything is deleted
+                exported = [str(self.export_session_to_file(project, sid)) for sid in here]
+        approved = set(here) | {s.session_id for s in self.list_sessions(project)}
 
         def bounded(session_id: str) -> None:
             if guard is not None:
                 guard(session_id)
-            extra = sorted(set(self._subtree(session_id)) - approved)
-            if extra:
+            stray = sorted(sid for sid, directory in self._reach(session_id, hard).items()
+                           if sid not in approved or directory != cwd)
+            if stray:
                 raise RuntimeError(
-                    f"not deleting {session_id}: OpenCode would also delete "
-                    f"{len(extra)} session(s) that weren't part of this delete "
-                    f"({', '.join(extra[:3])}{', …' if len(extra) > 3 else ''}); "
-                    f"reload and try again")
+                    f"not {'deleting' if hard else 'archiving'} {session_id}: "
+                    f"{len(stray)} session(s) it would take along moved to another directory "
+                    f"or weren't part of this delete ({', '.join(stray[:3])}"
+                    f"{', …' if len(stray) > 3 else ''}); reload and try again")
 
-        result = super().delete_project(project, hard=True, export_first=export_first,
+        result = super().delete_project(project, hard=hard, export_first=export_first,
                                         expect_cwd=expect_cwd, guard=bounded)
         result["exported"] = exported + result["exported"]
         return result
 
-    def _subtree(self, session_id: str) -> list[str]:
-        """The session and every descendant: what `opencode session delete`
-        removes (v1 deletes one session only)."""
+    def _reach(self, session_id: str, descendants: bool) -> dict[str, str]:
+        """{id: directory} of what archiving the session (just it) or deleting
+        it (with descendants: `opencode session delete` takes its whole
+        subtree; v1 deletes one session) touches, as the database says now."""
         db_file = self._db_path()
         if not db_file:
-            return [session_id]
+            return {}
         conn = _connect_ro(db_file)
         try:
-            if not _is_v2(conn):
-                return [session_id]
-            return _descendants(conn, session_id)
+            v2 = _is_v2(conn)
+            if descendants and v2:
+                rows = conn.execute(
+                    "WITH RECURSIVE tree(id) AS (SELECT ? UNION "
+                    "SELECT s.id FROM session_v2 s JOIN tree t ON s.parent_id = t.id) "
+                    "SELECT s.id, s.directory FROM session_v2 s JOIN tree t ON s.id = t.id",
+                    (session_id,)).fetchall()
+            else:
+                rows = conn.execute(f"SELECT id, directory FROM {'session_v2' if v2 else 'session'} "
+                                    f"WHERE id = ?", (session_id,)).fetchall()
         finally:
             conn.close()
+        return {r[0]: r[1] or "" for r in rows}
 
     def _delete_v2(self, db_file: Path, session_id: str, hard: bool) -> dict[str, Any]:
         if not _opencode_cli() or not _is_cli_managed(db_file):

@@ -164,13 +164,18 @@ def api_get_doc(project: str, agent: str | None = None):
 
 class DocRequest(BaseModel):
     content: str
+    # The directory the editor showed (the doc GET's "cwd"). A project name can
+    # come to mean another directory; then the save is refused (409).
+    expect_cwd: str
 
 
 @app.put("/api/projects/{project}/doc")
 def api_save_doc(project: str, req: DocRequest, agent: str | None = None):
     _project(project)
     try:
-        path = _adapter(agent).save_doc(project, req.content)
+        path = _adapter(agent).save_doc(project, req.content, expect_cwd=req.expect_cwd)
+    except ProjectChanged as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except UnsupportedCapability as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
@@ -203,13 +208,17 @@ def api_memory(project: str, agent: str | None = None):
 class MemoryFileRequest(BaseModel):
     name: str
     content: str
+    expect_dir: str  # the memory dir the editor showed (the memory GET's "dir"); else 409
 
 
 @app.put("/api/projects/{project}/memory")
 def api_save_memory_file(project: str, req: MemoryFileRequest, agent: str | None = None):
     _project(project)
     try:
-        path = _adapter(agent).save_memory_file(project, req.name, req.content)
+        path = _adapter(agent).save_memory_file(project, req.name, req.content,
+                                                expect_dir=req.expect_dir)
+    except ProjectChanged as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except UnsupportedCapability as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:

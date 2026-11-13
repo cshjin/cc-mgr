@@ -40,7 +40,7 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, connect_sqlite_ro, context_window, default_export_dir,
+    SessionSummary, check_cwd, connect_sqlite_ro, context_window, default_export_dir,
     is_safe_id, iter_jsonl, private_mkdir, project_names, read_doc_file, read_git_info,
     resolves_inside, safe_join, save_doc_file, write_private,
 )
@@ -546,14 +546,15 @@ class AgyAdapter(AgentAdapter):
                 return read_doc_file(cwd, fname)
         return read_doc_file(cwd, "GEMINI.md")
 
-    def save_doc(self, project: str, content: str) -> Path:
+    def save_doc(self, project: str, content: str, expect_cwd: str | None = None) -> Path:
         cwd = self._project_cwd(project)
+        check_cwd(cwd, expect_cwd)
         if not cwd:
             raise FileNotFoundError("no working directory known for this project")
         # If AGENTS.md exists and GEMINI.md doesn't, write to AGENTS.md
         if (Path(cwd) / "AGENTS.md").is_file() and not (Path(cwd) / "GEMINI.md").is_file():
-            return save_doc_file(cwd, "AGENTS.md", content)
-        return save_doc_file(cwd, "GEMINI.md", content)
+            return save_doc_file(cwd, "AGENTS.md", content, expect_cwd)
+        return save_doc_file(cwd, "GEMINI.md", content, expect_cwd)
 
     def get_memory(self, project: str) -> dict[str, Any]:
         cwd = self._project_cwd(project)
@@ -615,12 +616,14 @@ class AgyAdapter(AgentAdapter):
             "files": files,
         }
 
-    def save_memory_file(self, project: str, name: str, content: str) -> Path:
+    def save_memory_file(self, project: str, name: str, content: str,
+                         expect_dir: str | None = None) -> Path:
         if "/" in name or "\\" in name or name in ("", ".", ".."):
             raise ValueError("invalid memory file name")
         if not name.endswith(".md"):
             raise ValueError("memory files must end in .md")
         cwd = self._project_cwd(project)
+        check_cwd(cwd, expect_dir)  # get_memory reports the cwd as its "dir"
         if not cwd:
             raise FileNotFoundError("no working directory known for this project")
         # Anchored at the project cwd: a symlinked .agents/ or rules file can't

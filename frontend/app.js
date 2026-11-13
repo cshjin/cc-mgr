@@ -177,13 +177,15 @@ async function loadProjects() {
   renderProjects();
 }
 
-// The row that is still the open project after the list reloads: the same name
-// and directory; else the same directory under its new name (names change when
-// a directory that mangles alike appears or goes); else the same name.
+// The row that is still the open project after the list reloads. Directories
+// decide, since names can change (a directory that mangles alike appeared or
+// went): the same name and directory, else the same directory under its new
+// name; a project without a known directory goes by its name. null when the
+// directory is gone, even if its old name now means another directory.
 function followProject(projects, name, cwd) {
-  const byName = projects.find((p) => p.name === name);
-  if (byName && (byName.cwd || "") === (cwd || "")) return byName;
-  return (cwd && projects.find((p) => p.cwd === cwd)) || byName || null;
+  if (!cwd) return projects.find((p) => p.name === name) || null;
+  return projects.find((p) => p.name === name && p.cwd === cwd)
+    || projects.find((p) => p.cwd === cwd) || null;
 }
 
 // Projects to show, filtered (only those whose directory is gone) and sorted.
@@ -322,22 +324,32 @@ function renderProjNav() {
 async function loadProjView() {
   const el = $("#sessionPane");
   el.innerHTML = '<div class="loading">loading…</div>';
+  // What this view is for; a response for anything else (the user moved on
+  // meanwhile) is dropped, so an editor never shows one project's file bound
+  // to another.
+  const view = { agent: state.agent, project: state.activeProject, kind: state.projView };
+  const current = () => state.agent === view.agent && state.activeProject === view.project
+    && state.projView === view.kind;
+  const path = (what) => `/api/projects/${encodeURIComponent(view.project)}/${what}` +
+    `?agent=${encodeURIComponent(view.agent)}`;
   try {
-    if (state.projView === "sessions") {
-      state.sessions = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions`);
+    if (view.kind === "sessions") {
+      const sessions = await api(path("sessions"));
+      if (!current()) return;
+      state.sessions = sessions;
       renderSessions();
-    } else if (state.projView === "tasks") {
-      const tasks = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/tasks`);
-      renderProjectTasks(el, tasks);
-    } else if (state.projView === "memory") {
-      const mem = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`);
-      renderMemory(el, mem, true);
-    } else if (state.projView === "claude") {
-      const cm = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/doc`);
-      renderClaudeMd(el, cm);
+    } else if (view.kind === "tasks") {
+      const tasks = await api(path("tasks"));
+      if (current()) renderProjectTasks(el, tasks);
+    } else if (view.kind === "memory") {
+      const mem = await api(path("memory"));
+      if (current()) renderMemory(el, mem, view);
+    } else if (view.kind === "claude") {
+      const cm = await api(path("doc"));
+      if (current()) renderClaudeMd(el, cm, view);
     }
   } catch (e) {
-    el.innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`;
+    if (current()) el.innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`;
   }
 }
 
@@ -465,7 +477,10 @@ function renderProjectTasks(el, tasks) {
   wireKanban(el, { perCard: true });
 }
 
-function renderClaudeMd(el, cm) {
+// view: the {agent, project} the document was loaded for; saving goes there,
+// with the directory shown here, so the server refuses (409) if the project
+// means another directory by now.
+function renderClaudeMd(el, cm, view) {
   const docName = (state.caps && state.caps.doc_filename) || "CLAUDE.md";
   if (!cm.cwd) {
     el.innerHTML = '<div class="empty">No working directory known for this project (no session has a cwd yet).</div>';
@@ -499,22 +514,25 @@ function renderClaudeMd(el, cm) {
         <span class="editor-status" id="cmStatus">${esc(status)}</span>
       </div>
     </div>`;
-  $("#cmSave").addEventListener("click", async () => {
-    $("#cmStatus").textContent = "saving…";
+  // The elements this editor was rendered with: the pane may show something else by the
+  // time a save finishes.
+  const editor = el.querySelector("#cmEditor");
+  const statusEl = el.querySelector("#cmStatus");
+  el.querySelector("#cmSave").addEventListener("click", async () => {
+    statusEl.textContent = "saving…";
     try {
-      const u = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/doc`,
-                        location.origin);
-      u.searchParams.set("agent", state.agent);
+      const u = new URL(`/api/projects/${encodeURIComponent(view.project)}/doc`, location.origin);
+      u.searchParams.set("agent", view.agent);
       const r = await fetch(u, {
         method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: $("#cmEditor").value }),
+        body: JSON.stringify({ content: editor.value, expect_cwd: cm.cwd }),
       });
       if (!r.ok) throw await httpError(r);
       const res = await r.json();
-      $("#cmStatus").textContent = "saved ✓";
+      statusEl.textContent = "saved ✓";
       flash(docName + " saved to " + res.saved);
     } catch (e) {
-      $("#cmStatus").textContent = "failed: " + e.message;
+      statusEl.textContent = "failed: " + e.message;
     }
   });
 }
@@ -607,13 +625,17 @@ function openDeleteModal() {
   const session = state.activeSession;
   const close = () => overlay.remove();
   overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
-  $("#mCancel").addEventListener("click", close);
-  $("#mConfirm").addEventListener("click", async () => {
-    const exportFirst = $("#mExport").checked;
-    const saveMemory = Boolean($("#mMemory") && $("#mMemory").checked);
-    const hard = $("#mHard").checked;
-    $("#mConfirm").disabled = true;  // one request at a time
-    $("#mStatus").textContent = "deleting…";
+  // this dialog's own elements: switching agents may remove it mid-request
+  const q = (sel) => overlay.querySelector(sel);
+  const confirmBtn = q("#mConfirm");
+  const statusEl = q("#mStatus");
+  q("#mCancel").addEventListener("click", close);
+  confirmBtn.addEventListener("click", async () => {
+    const exportFirst = q("#mExport").checked;
+    const saveMemory = Boolean(q("#mMemory") && q("#mMemory").checked);
+    const hard = q("#mHard").checked;
+    confirmBtn.disabled = true;  // one request at a time
+    statusEl.textContent = "deleting…";
     try {
       const du = new URL(`/api/projects/${encodeURIComponent(project)}/sessions/${encodeURIComponent(session)}/delete`,
                          location.origin);
@@ -637,8 +659,8 @@ function openDeleteModal() {
       const warn = res.warnings && res.warnings.length ? ` Warning: ${res.warnings.join("; ")}` : "";
       flash(`Session deleted.${note}${mem}${where}${warn}`);
     } catch (e) {
-      $("#mStatus").textContent = "Failed: " + e.message;
-      $("#mConfirm").disabled = false;
+      statusEl.textContent = "Failed: " + e.message;
+      confirmBtn.disabled = false;
     }
   });
 }
@@ -1032,7 +1054,10 @@ async function reloadTasksView() {
   }
 }
 
-function renderMemory(scope, mem, editable) {
+// editFor: null for a read-only view, else the {agent, project} the memory was
+// loaded for; saves go there, with the directory shown here (409 if it moved).
+function renderMemory(scope, mem, editFor) {
+  const editable = Boolean(editFor);
   if (!mem.index && !mem.files.length) {
     scope.innerHTML = `<div class="md"><div class="empty">No memory for this project.</div>
       <div class="mem-path">dir: ${esc(mem.dir || "")}</div></div>`;
@@ -1048,7 +1073,7 @@ function renderMemory(scope, mem, editable) {
   }
   html += "</div>";
   scope.innerHTML = html;
-  if (editable) wireMemoryEditors(scope);
+  if (editable) wireMemoryEditors(scope, editFor, mem.dir || "");
 }
 
 function memBlock(name, path, content, editable) {
@@ -1072,7 +1097,7 @@ function memBlock(name, path, content, editable) {
     </div>`;
 }
 
-function wireMemoryEditors(scope) {
+function wireMemoryEditors(scope, view, dir) {
   scope.querySelectorAll(".mem-file").forEach((blk) => {
     const btn = blk.querySelector(".mem-save");
     if (!btn) return;
@@ -1082,12 +1107,11 @@ function wireMemoryEditors(scope) {
       const status = blk.querySelector(".editor-status");
       status.textContent = "saving…";
       try {
-        const mu = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`,
-                           location.origin);
-        mu.searchParams.set("agent", state.agent);
+        const mu = new URL(`/api/projects/${encodeURIComponent(view.project)}/memory`, location.origin);
+        mu.searchParams.set("agent", view.agent);
         const r = await fetch(mu, {
           method: "PUT", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, content }),
+          body: JSON.stringify({ name, content, expect_dir: dir }),
         });
         if (!r.ok) throw await httpError(r);
         status.textContent = "saved ✓";

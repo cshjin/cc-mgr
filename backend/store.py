@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .agents.common import (  # re-exported: store's public names stay importable
-    CTX_TIERS, STD_WINDOW, SessionSummary, context_limit_for as _context_limit_for,
+    CTX_TIERS, STD_WINDOW, SessionSummary, check_cwd, context_limit_for as _context_limit_for,
     context_window, default_export_dir, is_safe_id, is_safe_name, new_trash_dir,
     private_mkdir, read_git_info, safe_join, write_private,
 )
@@ -443,15 +443,17 @@ def get_memory(project: str) -> dict[str, Any]:
     }
 
 
-def save_memory_file(project: str, name: str, content: str) -> Path:
+def save_memory_file(project: str, name: str, content: str, expect_dir: str | None = None) -> Path:
     """Write a memory file (MEMORY.md or *.md) under the project's memory dir.
 
     `name` is a bare filename — path components are rejected to prevent escapes.
+    expect_dir: the memory dir the editor showed (get_memory's "dir").
     """
     if "/" in name or "\\" in name or name in ("", ".", ".."):
         raise ValueError("invalid memory file name")
     if not name.endswith(".md"):
         raise ValueError("memory files must end in .md")
+    check_cwd(str(_project_dir(project) / "memory"), expect_dir)
     # Anchored at projects/, so neither a symlinked memory/ dir nor a symlinked
     # file can point the write outside the Claude data root.
     out = safe_join(projects_dir(), _project_dir(project).name, "memory", name)
@@ -485,9 +487,12 @@ def get_claude_md(project: str) -> dict[str, Any]:
     return {"exists": False, "path": str(path), "content": "", "cwd": cwd}
 
 
-def save_claude_md(project: str, content: str) -> Path:
-    """Write CLAUDE.md into the project's working directory."""
+def save_claude_md(project: str, content: str, expect_cwd: str | None = None) -> Path:
+    """Write CLAUDE.md into the project's working directory. expect_cwd: the
+    directory the editor showed; ProjectChanged if the project's newest session
+    now says another one."""
     cwd = _project_cwd(project)
+    check_cwd(cwd, expect_cwd)
     if not cwd:
         raise FileNotFoundError("no working directory known for this project")
     base = Path(cwd)

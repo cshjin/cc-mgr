@@ -26,6 +26,8 @@ const SESSION = { session_id: "s1", title: "kept session", mtime: 1700000100, co
                   user_turns: 1, assistant_turns: 1 };
 let releaseDelete;
 let deleteStatus = 200;
+let holdDoc = null;  // a promise the doc GET waits for, to deliver it late
+const docPuts = [];
 w.fetch = async (u, opts = {}) => {
   const url = new w.URL(String(u), "http://localhost:8765");
   const agent = url.searchParams.get("agent");
@@ -37,6 +39,20 @@ w.fetch = async (u, opts = {}) => {
     { agent_id: "codex", label: "Codex", doc_filename: "AGENTS.md", has_memory: false, has_tasks: false,
       can_edit_doc: true, can_delete: true, can_export: true, delete_note: "codex note", has_data: true }]);
   if (url.pathname === "/api/projects") return json(projects[agent] || []);
+  if (url.pathname.endsWith("/doc")) {
+    const name = decodeURIComponent(url.pathname.split("/")[3]);
+    const p = (projects[agent] || []).find((x) => x.name === name);
+    if (opts.method === "PUT") {
+      const body = JSON.parse(opts.body);
+      docPuts.push({ name, body });
+      if (!p || p.cwd !== body.expect_cwd)  // like the server: the name must still mean that directory
+        return json({ detail: `this project now refers to ${p ? p.cwd : "no directory"}, ` +
+                              `not ${body.expect_cwd}; reload and try again` }, 409);
+      return json({ saved: `${p.cwd}/CLAUDE.md` });
+    }
+    if (holdDoc) await holdDoc;
+    return json({ exists: true, path: `${p.cwd}/CLAUDE.md`, content: `doc of ${p.cwd}`, cwd: p.cwd });
+  }
   if (url.pathname.endsWith("/sessions")) {  // like the server: only names that exist right now
     const name = decodeURIComponent(url.pathname.split("/")[3]);
     return (projects[agent] || []).some((p) => p.name === name) ? json([SESSION])
@@ -57,7 +73,8 @@ w.fetch = async (u, opts = {}) => {
   return json({});
 };
 w.localStorage.setItem("cc_agent", "claude");
-w.eval(fs.readFileSync(root + "/app.js", "utf8") + "\n;window.__state = () => state;");
+w.eval(fs.readFileSync(root + "/app.js", "utf8") +
+       "\n;window.__state = () => state; window.__loadProjects = () => loadProjects();");
 
 const $ = (s) => w.document.querySelector(s);
 const tick = () => new Promise((r) => setTimeout(r, 20));
@@ -142,6 +159,59 @@ const listLoads = () => calls.filter((c) => c === "GET /api/projects?agent=claud
   check(calls.filter((c) => c.startsWith("POST")).length === 2, "...and doesn't");
   $("#pdCancel").click();
   check(!$(".modal-overlay"), "cancel closes it");
+
+  // the doc editor saves to the project it was opened for, naming the directory it showed
+  $(".pnav-btn[data-view='claude']").click();
+  await until(() => $("#cmEditor"), "the doc editor");
+  check($("#cmEditor").value === "doc of /new/here", "the editor shows the project's doc");
+  $("#cmEditor").value = "edited";
+  $("#cmSave").click();
+  await until(() => docPuts.length === 1, "the save");
+  check(docPuts[0].name === "-here" && docPuts[0].body.expect_cwd === "/new/here"
+        && docPuts[0].body.content === "edited", "the save names the directory the editor showed");
+  const savedStatus = $("#cmStatus");
+  $(".pnav-btn[data-view='sessions']").click();  // move on before the save's answer is handled
+  await until(() => savedStatus.textContent === "saved ✓", "the save's answer");
+  check(true, "a save that finishes after the view changed doesn't break");
+
+  // a doc that arrives after the user moved on is dropped, not shown under another view
+  let releaseDoc;
+  holdDoc = new Promise((r) => { releaseDoc = r; });
+  $(".pnav-btn[data-view='claude']").click();
+  await until(() => calls.filter((c) => c === "GET /api/projects/-here/doc?agent=claude").length === 2,
+              "the held doc request");
+  $(".pnav-btn[data-view='sessions']").click();
+  await until(() => $("#sessionPane").textContent.includes("kept session"), "the sessions view");
+  holdDoc = null;
+  releaseDoc();
+  await tick();
+  await tick();
+  check(!$("#cmEditor") && $("#sessionPane").textContent.includes("kept session"),
+        "the late doc didn't replace the sessions view");
+
+  // the open project's name comes to mean another directory, and its own is gone:
+  // let go of it (an editor open on it must never write into the other directory)
+  $(".pnav-btn[data-view='claude']").click();
+  await until(() => $("#cmEditor"), "the doc editor again");
+  // first a plain rename (same directory): the view follows, the editor stays open and
+  // still saves to the name it was opened under; the server refuses, the text stays
+  projects.claude = [{ ...projects.claude[0], name: "-here~aaaaaaaaaaaa" }];
+  await w.__loadProjects();
+  check(w.__state().activeProject === "-here~aaaaaaaaaaaa" && $("#cmEditor"), "renamed: followed, editor kept");
+  $("#cmEditor").value = "late edit";
+  $("#cmSave").click();
+  await until(() => $("#cmStatus").textContent.startsWith("failed: 409"), "the refused save");
+  check(docPuts[1].name === "-here" && docPuts[1].body.expect_cwd === "/new/here",
+        "the save went to the name and directory the editor was opened for");
+  check($("#cmEditor").value === "late edit", "the unsaved text is still there");
+  projects.claude = [{ ...projects.claude[0], name: "-here" }];
+  await w.__loadProjects();
+  $(".pnav-btn[data-view='claude']").click();
+  await until(() => $("#cmEditor") && $("#cmEditor").value === "doc of /new/here", "the reopened editor");
+  projects.claude = [{ ...projects.claude[0], cwd: "/other/dir", display_path: "/other/dir" }];
+  await w.__loadProjects();
+  check(w.__state().activeProject === null && !$("#cmEditor"), "the view is closed, not moved along");
+  check(row("-here") && !row("-here").classList.contains("active"), "the other directory isn't opened");
 
   // switching agents closes an open dialog: it can never act on another agent's project
   releaseDelete = null;

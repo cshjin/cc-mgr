@@ -142,9 +142,11 @@ def test_follow_project_after_the_list_reloads():
           renamed: name(followProject(ps, "-w-repo-x~0123456789ab", "/w/repo/x")),
           gone: name(followProject(ps, "-w-old", "/w/old")),
           noCwd: name(followProject(ps, "-mem-only", "")),
+          nameNowElsewhere: name(followProject(ps, "-w-repo-x", "/w/repo-x")),
           cwdChanged: name(followProject(ps, "-w-a", "/w/a-before")) }}));""")
     assert r == {"same": "-w-a",
-                 "renamed": "-w-repo-x",    # the name changed: follow the directory
-                 "gone": None,              # deselect
-                 "noCwd": "-mem-only",
-                 "cwdChanged": "-w-a"}      # e.g. a Claude folder whose newest session moved
+                 "renamed": "-w-repo-x",      # the name changed: follow the directory
+                 "gone": None,                # deselect
+                 "noCwd": "-mem-only",        # nothing else to go by
+                 "nameNowElsewhere": None,    # its old name means another directory now
+                 "cwdChanged": None}          # (an editor open on it must not move along)
