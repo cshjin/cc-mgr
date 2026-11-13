@@ -328,6 +328,8 @@ class GeminiAdapter(AgentAdapter):
         if not tmp_dir.is_dir():
             raise FileNotFoundError(f"project {project} not found")
         dirs = [d for d in (tmp_dir, safe_join(home / "history", project)) if d.is_dir()]
+        if any(d.is_symlink() for d in dirs):
+            raise ValueError("the project folder is a symlink; refusing to delete through it")
         files = sorted((tmp_dir / "chats").glob("session-*.jsonl"))
         exported = self._export_all(project) if export_first else []
         trash = None

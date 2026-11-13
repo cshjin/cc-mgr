@@ -136,6 +136,8 @@ async function loadAgents() {
     .join("");
   sel.value = state.agent;
   sel.addEventListener("change", async () => {
+    // A dialog belongs to the agent it was opened for: never let it act on another one.
+    document.querySelectorAll(".modal-overlay").forEach((o) => o.remove());
     state.agent = sel.value;
     localStorage.setItem("cc_agent", state.agent);
     state.caps = currentCaps();
@@ -579,6 +581,10 @@ function openDeleteModal() {
       <div class="modal-status" id="mStatus"></div>
     </div>`;
   document.body.appendChild(overlay);
+  // Bound now: the dialog acts on exactly the session it was opened for.
+  const agent = state.agent;
+  const project = state.activeProject;
+  const session = state.activeSession;
   const close = () => overlay.remove();
   overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
   $("#mCancel").addEventListener("click", close);
@@ -586,11 +592,12 @@ function openDeleteModal() {
     const exportFirst = $("#mExport").checked;
     const saveMemory = Boolean($("#mMemory") && $("#mMemory").checked);
     const hard = $("#mHard").checked;
+    $("#mConfirm").disabled = true;  // one request at a time
     $("#mStatus").textContent = "deleting…";
     try {
-      const du = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}/delete`,
+      const du = new URL(`/api/projects/${encodeURIComponent(project)}/sessions/${encodeURIComponent(session)}/delete`,
                          location.origin);
-      du.searchParams.set("agent", state.agent);
+      du.searchParams.set("agent", agent);
       const r = await fetch(du, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ export_first: exportFirst, save_memory: saveMemory, hard }),
@@ -598,9 +605,11 @@ function openDeleteModal() {
       if (!r.ok) throw await httpError(r);
       const res = await r.json();
       close();
-      closeDetail();
-      state.sessions = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions`);
-      renderSessions();
+      if (state.agent === agent && state.activeProject === project) {
+        if (state.activeSession === session) closeDetail();
+        state.sessions = await api(`/api/projects/${encodeURIComponent(project)}/sessions`);
+        renderSessions();
+      }
       const note = res.export ? ` Exported.` : "";
       const mem = res.memory ? ` Saved to memory.` : "";
       const where = res.note ? ` ${res.note}`
@@ -609,6 +618,7 @@ function openDeleteModal() {
       flash(`Session deleted.${note}${mem}${where}${warn}`);
     } catch (e) {
       $("#mStatus").textContent = "Failed: " + e.message;
+      $("#mConfirm").disabled = false;
     }
   });
 }
@@ -629,12 +639,12 @@ function plural(n, word) {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
-// "3 sessions (+2 subagent sessions) · 1 empty transcript · 4 memory files"
+// "3 sessions (+2 subagent sessions) · 1 not listed (empty or archived) · 4 memory files"
 function projectDeleteSummary(pv) {
   let head = plural(pv.sessions || 0, "session");
   if (pv.subagents) head += ` (+${plural(pv.subagents, "subagent session")})`;
   const parts = [head];
-  if (pv.hidden) parts.push(plural(pv.hidden, "empty transcript"));
+  if (pv.hidden) parts.push(`${pv.hidden} not listed (empty or archived)`);
   if (pv.memory_files) parts.push(plural(pv.memory_files, "memory file"));
   return parts.join(" · ");
 }
@@ -665,6 +675,9 @@ function projectDeleteResultText(res, hard) {
 async function openProjectDeleteModal(name) {
   const p = state.projects.find((x) => x.name === name);
   if (!p) return;
+  // Bound now: the preview and the delete are for this agent's project, whatever
+  // the agent dropdown says later (switching agents also closes the dialog).
+  const agent = state.agent;
   const caps = state.caps || {};
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -680,7 +693,7 @@ async function openProjectDeleteModal(name) {
   const body = overlay.querySelector("#pdBody");
   let pv;
   try {
-    pv = await api(`/api/projects/${encodeURIComponent(name)}/delete-preview`);
+    pv = await api(`/api/projects/${encodeURIComponent(name)}/delete-preview?agent=${encodeURIComponent(agent)}`);
   } catch (e) {
     body.innerHTML = `<p class="mwarn">${esc(e.message)}</p>
       <div class="modal-actions"><button class="dbtn" id="pdClose">Close</button></div>`;
@@ -698,7 +711,9 @@ async function openProjectDeleteModal(name) {
     ${caps.can_export ? '<label class="mrow"><input type="checkbox" id="pdExport" checked /> Export every session to Markdown first</label>' : ""}
     ${pv.memory_files ? `<label class="mrow"><input type="checkbox" id="pdMemory" /> Also delete the project memory (${plural(pv.memory_files, "file")})</label>
        <p class="mhint">Unticked, the memory stays and the project remains listed with its memory only.</p>` : ""}
-    <label class="mrow"><input type="checkbox" id="pdHard" /> Permanent delete (skip trash / archive)</label>
+    <label class="mrow"><input type="checkbox" id="pdHard" ${pv.outside ? "disabled" : ""} /> Permanent delete (skip trash / archive)</label>
+    ${pv.outside ? `<p class="mhint">Not available: it would also delete ${plural(pv.outside, "subagent session")}
+       stored under other directories.</p>` : ""}
     <div class="mrow" id="pdTypeRow" hidden>Type <b>${esc(word)}</b> to confirm:
       <input type="text" id="pdType" class="mtext" autocomplete="off" /></div>
     <div class="modal-actions">
@@ -712,15 +727,17 @@ async function openProjectDeleteModal(name) {
   const confirmBtn = body.querySelector("#pdConfirm");
   const total = (pv.sessions || 0) + (pv.subagents || 0);
   const what = total ? plural(total, "session")
-    : (pv.hidden ? plural(pv.hidden, "empty transcript") : "the project");
+    : (pv.hidden ? `${pv.hidden} unlisted` : "the project");
+  let busy = false;  // a request is running: nothing may re-enable the button
   const sync = () => {
     const hard = hardBox.checked;
     body.querySelector("#pdTypeRow").hidden = !hard;
+    body.querySelectorAll("input").forEach((i) => { i.disabled = busy || (i === hardBox && Boolean(pv.outside)); });
     // A project whose only content is memory that is being kept: nothing would change.
     const nothing = !total && !pv.hidden && pv.memory_files && !(memBox && memBox.checked);
     confirmBtn.textContent = nothing ? "Nothing to remove unless the memory goes too"
       : (hard ? `Delete ${what} permanently` : `Remove ${what}`);
-    confirmBtn.disabled = Boolean(nothing) || (hard && typed.value.trim() !== word);
+    confirmBtn.disabled = busy || Boolean(nothing) || (hard && typed.value.trim() !== word);
   };
   hardBox.addEventListener("change", sync);
   if (memBox) memBox.addEventListener("change", sync);
@@ -728,26 +745,32 @@ async function openProjectDeleteModal(name) {
   sync();
   body.querySelector("#pdCancel").addEventListener("click", close);
   confirmBtn.addEventListener("click", async () => {
+    if (busy) return;
     const hard = hardBox.checked;
     const exportFirst = Boolean(body.querySelector("#pdExport") && body.querySelector("#pdExport").checked);
-    confirmBtn.disabled = true;
+    const includeMemory = Boolean(memBox && memBox.checked);
+    busy = true;
+    sync();
     body.querySelector("#pdStatus").textContent =
       "deleting… (agents that go through their own CLI take about a second per session)";
     try {
       const u = new URL(`/api/projects/${encodeURIComponent(name)}/delete`, location.origin);
-      u.searchParams.set("agent", state.agent);
+      u.searchParams.set("agent", agent);
       const r = await fetch(u, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ export_first: exportFirst, include_memory: Boolean(memBox && memBox.checked), hard }),
+        body: JSON.stringify({ export_first: exportFirst, include_memory: includeMemory, hard }),
       });
       if (!r.ok) throw await httpError(r);
       const res = await r.json();
       close();
-      if (state.activeProject === name) deselectProject();
-      await loadProjects();
+      if (state.agent === agent) {
+        if (state.activeProject === name) deselectProject();
+        await loadProjects();
+      }
       flash(projectDeleteResultText(res, hard));
     } catch (e) {
       body.querySelector("#pdStatus").textContent = "Failed: " + e.message;
+      busy = false;
       sync();
     }
   });

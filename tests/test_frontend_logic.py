@@ -121,7 +121,8 @@ def test_project_delete_dialog_texts():
           archived: projectDeleteResultText({sessions: ["a"], trash: []}, false),
           hard: projectDeleteResultText({sessions: ["a"], trash: [], exported: ["/e/a.md"]}, true),
         }));""")
-    assert r["summary"] == "3 sessions (+1 subagent session) · 2 empty transcripts · 1 memory file"
+    assert r["summary"] == ("3 sessions (+1 subagent session) · 2 not listed (empty or archived) "
+                            "· 1 memory file")
     assert r["one"] == "1 session"
     assert r["words"] == ["SwarmZoo_paper", "repo", "-tmp"]
     assert r["soft"] == ("Removed 2 sessions (reversible: /t/x). The project memory was kept. "

@@ -127,11 +127,12 @@ class AgentAdapter(ABC):
     def delete_project(self, project: str, hard: bool = False, include_memory: bool = False,
                        export_first: bool = False) -> dict[str, Any]:
         """Delete every session of a project through delete_session (soft by
-        default), optionally exporting each one first.
+        default), optionally exporting them all first.
 
-        Parents go first, so a permanent delete that cascades (OpenCode) takes
-        its subagent sessions along; sessions already gone are skipped. A
-        session that fails is reported in `errors` and the rest continue. If
+        Exports all happen before any delete, and parents go first, so a
+        permanent delete that cascades (OpenCode) takes its subagent sessions
+        along only after they were exported; sessions already gone are skipped.
+        A session that fails is reported in `errors` and the rest continue. If
         the first session is refused for a reason that refuses them all
         (UnsupportedCapability), that is raised instead.
         """
@@ -142,17 +143,18 @@ class AgentAdapter(ABC):
             raise FileNotFoundError(f"no sessions to delete in {project}")
         result: dict[str, Any] = {"sessions": [], "deleted": [], "trash": [], "exported": [],
                                   "errors": {}, "warnings": []}
+        if export_first:  # all of them before any delete: a cascade must not outrun its export
+            for s in sessions:
+                try:
+                    result["exported"].append(str(self.export_session_to_file(project, s.session_id)))
+                except FileNotFoundError:
+                    pass  # nothing to export: the session has no turns
         gone: set[str] = set()
         for s in sessions:
             sid = s.session_id
             if sid in gone:
                 continue
             try:
-                if export_first:
-                    try:
-                        result["exported"].append(str(self.export_session_to_file(project, sid)))
-                    except FileNotFoundError:
-                        pass  # nothing to export: the session has no turns
                 res = self.delete_session(project, sid, hard=hard)
             except FileNotFoundError:  # already removed, e.g. along with its parent
                 gone.add(sid)
@@ -175,6 +177,7 @@ class AgentAdapter(ABC):
             if res.get("note"):
                 result["note"] = res["note"]
         result["sessions"] = list(dict.fromkeys(result["sessions"]))
+        result["project_removed"] = not any(p["name"] == project for p in self.list_projects())
         return result
 
     def _export_all(self, project: str) -> list[str]:

@@ -204,9 +204,84 @@ def test_a_project_delete_that_would_fail_for_every_session_is_refused(opencode_
     assert r.status_code == 404 and "read-only" in r.json()["detail"]
 
 
+def _oc_project():
+    return next(p["name"] for p in OpencodeAdapter().list_projects() if p["cwd"].endswith("repo_oc2"))
+
+
+def test_opencode_subagents_are_exported_before_their_parent_takes_them(fake_opencode, tmp_path,
+                                                                         monkeypatch):
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(tmp_path / "exports"))
+    res = _delete(_oc_project(), agent="opencode", hard=True, export_first=True).json()
+    assert sorted(Path(p).name.split(".")[0] for p in res["exported"]) == [
+        "ses_old", "ses_v2_child", "ses_v2_parent"]
+
+
+def test_opencode_cascade_into_another_directory_is_refused(fake_opencode, opencode_v2_home):
+    conn = sqlite3.connect(opencode_v2_home / "opencode.db")
+    conn.execute("UPDATE session_v2 SET directory = '/elsewhere' WHERE id = 'ses_v2_child'")
+    conn.commit()
+    conn.close()
+    pname = _oc_project()
+    pv = client.get(f"/api/projects/{pname}/delete-preview", params={"agent": "opencode"}).json()
+    assert (pv["subagents"], pv["outside"]) == (0, 1)
+    r = _delete(pname, agent="opencode", hard=True)
+    assert r.status_code == 400 and "other directories" in r.json()["detail"]
+    assert fake_opencode == []  # nothing was sent to OpenCode
+    assert _delete(pname, agent="opencode").status_code == 200  # archiving doesn't cascade
+
+
+def test_opencode_archived_subagents_are_counted_and_exported(fake_opencode, opencode_v2_home,
+                                                              tmp_path, monkeypatch):
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(tmp_path / "exports"))
+    conn = sqlite3.connect(opencode_v2_home / "opencode.db")
+    conn.execute("UPDATE session_v2 SET time_archived = 5 WHERE id = 'ses_v2_child'")
+    conn.commit()
+    conn.close()
+    pname = _oc_project()
+    pv = client.get(f"/api/projects/{pname}/delete-preview", params={"agent": "opencode"}).json()
+    assert (pv["sessions"], pv["subagents"], pv["hidden"]) == (2, 0, 1)
+    res = _delete(pname, agent="opencode", hard=True, export_first=True).json()
+    assert "ses_v2_child" in res["sessions"]
+    assert "ses_v2_child" in {Path(p).name.split(".")[0] for p in res["exported"]}
+
+
+def test_directories_that_mangle_alike_get_distinct_projects(copilot_store_home, tmp_path):
+    from backend.agents.common import project_names
+    names = project_names(["/w/repo-x", "/w/repo/x", "/w/other"])
+    assert names["/w/other"] == "-w-other"  # a unique path keeps its plain name
+    assert names["/w/repo-x"] != names["/w/repo/x"]
+    assert project_names(["/w/repo/x", "/w/repo-x"]) == {k: names[k] for k in ("/w/repo/x", "/w/repo-x")}
+
+    a_b, a_slash_b = str(tmp_path / "a-b"), str(tmp_path / "a" / "b")
+    conn = sqlite3.connect(copilot_store_home / "session-store.db")
+    for sid, cwd in (("cc-1", a_b), ("dd-2", a_slash_b)):
+        conn.execute("INSERT INTO sessions VALUES (?, ?, NULL, NULL, NULL, ?, "
+                     "'2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')", (sid, cwd, sid))
+        conn.execute("INSERT INTO turns (session_id, turn_index, user_message, timestamp) "
+                     "VALUES (?, 0, 'hi', '2026-01-01T00:00:00.000Z')", (sid,))
+    conn.commit()
+    conn.close()
+    by_cwd = {p["cwd"]: p["name"] for p in CopilotAdapter().list_projects()}
+    assert by_cwd[a_b] != by_cwd[a_slash_b]
+    res = _delete(by_cwd[a_b], agent="copilot").json()
+    assert res["sessions"] == ["cc-1"] and res["project_removed"]  # the other one is untouched
+    # without the collision, the survivor's name is plain again (the UI reloads the list)
+    after = {p["cwd"]: p["name"] for p in CopilotAdapter().list_projects()}
+    assert after[a_slash_b] == project_names([a_slash_b])[a_slash_b] and a_b not in after
+    assert [s.session_id for s in CopilotAdapter().list_sessions(after[a_slash_b])] == ["dd-2"]
+
+
+def test_a_removed_projects_docs_leave_the_index(agy_home):
+    index_db.reindex()
+    assert index_db.search("findings", agent="agy")  # brain/<id>/report.md
+    res = _delete(AgyAdapter().list_projects()[0]["name"], agent="agy").json()
+    assert res["project_removed"] is True
+    assert index_db.search("findings", agent="agy") == []
+
+
 def test_one_failing_session_does_not_stop_the_rest(copilot_store_home, monkeypatch):
-    monkeypatch.setattr(cp, "_busy_reason",
-                        lambda home, sid: "it is open in a running Copilot CLI" if sid == "aaaa-1" else "")
+    monkeypatch.setattr(cp, "_busy_reason", lambda home, sid, updated=0.0:
+                        "it is open in a running Copilot CLI" if sid == "aaaa-1" else "")
     pname = str(copilot_store_home.parent / "repo_cp").replace("/", "-")
     res = _delete(pname, agent="copilot").json()
     assert list(res["errors"]) == ["aaaa-1"] and "running Copilot" in res["errors"]["aaaa-1"]

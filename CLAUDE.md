@@ -53,6 +53,8 @@ every agent root (and `HOME`, `XDG_DATA_HOME`, the search index, exports) at an
 empty sandbox and refuses to run real agent CLIs — keep it that way: a test must
 never read or write real user data. Pure frontend helpers are tested under node
 (`tests/test_frontend_logic.py`); `node --check frontend/app.js` is also a test.
+`tests/test_frontend_dom.py` drives the real page in jsdom (the project-delete
+dialog); it runs only when jsdom is reachable via `NODE_PATH`, else it is skipped.
 
 ## Architecture
 
@@ -78,14 +80,19 @@ Three layers, all under `backend/` + `frontend/`:
   `has_data` probe per adapter).
   **Only the transcript parser truly differs per agent** — paths, doc filename, and
   capability flags are data on each adapter (`Capabilities.delete_note` explains
-  what a delete does, for the dialogs). The base class provides a generic Markdown
-  export (`get_conversation` → `render_markdown`) and a generic project delete
-  (`delete_project`: every listed session through `delete_session`, parents first
-  so cascades are skipped, per-session failures in `errors`), plus
-  `project_delete_preview`; Claude and Gemini override both to remove the whole
-  project folder. Adapters without a feature leave the base method, which raises
-  `UnsupportedCapability` (mapped to HTTP 404 in `app.py`). Each adapter's module
-  docstring documents the real on-disk format it was verified against.
+  what a delete does, for the dialogs). Agents that group sessions by working
+  directory name projects with `common.project_names`: the mangled path, plus a
+  short hash of the path when two directories mangle alike (`repo-x` vs `repo/x`),
+  so a project name never stands for two directories and a project delete can't
+  reach into another one. The base class provides a generic Markdown export
+  (`get_conversation` → `render_markdown`) and a generic project delete
+  (`delete_project`: exports everything first, then every listed session through
+  `delete_session`, parents first so cascades are skipped, per-session failures in
+  `errors`), plus `project_delete_preview`; Claude and Gemini override both to
+  remove the whole project folder. Adapters without a feature leave the base method,
+  which raises `UnsupportedCapability` (mapped to HTTP 404 in `app.py`). Each
+  adapter's module docstring documents the real on-disk format it was verified
+  against.
 - **`backend/index_db.py`** — SQLite + FTS5 full-text index over every conversation
   turn (`turns`/`turns_fts`) **and** every project's memory files + root doc
   (`docs`/`docs_fts`), across **all agents**. A **rebuildable cache** at
@@ -180,7 +187,11 @@ Three layers, all under `backend/` + `frontend/`:
   running OpenCode service on this host is writing exactly this DB — the unique
   `.db` it has open read-write with its `-wal` open too (`opencode api
   server.info` → pid → `/proc/<pid>/fd` + `fdinfo`). `opencode debug paths` can't
-  prove that (it inherits `OPENCODE_DB`). Doc: `AGENTS.md`.
+  prove that (it inherits `OPENCODE_DB`). `opencode session delete` also removes a
+  session's descendants, so a permanent *project* delete first walks that tree:
+  archived subagents in the directory are previewed and exported, and descendants
+  under other directories make it refuse (archiving is still possible). Doc:
+  `AGENTS.md`.
 - **Codex** (`$CODEX_HOME` or `~/.codex`): sessions under
   `sessions/YYYY/MM/DD/rollout-*.jsonl`, grouped into projects by mangled cwd. **Each
   line is a `{timestamp,type,payload}` envelope.** cwd from `session_meta.payload`,
@@ -190,8 +201,10 @@ Three layers, all under `backend/` + `frontend/`:
   `last_token_usage.total_tokens` (NOT the cumulative `total_token_usage`).
   Delete goes through the codex CLI with cc_mgr's `CODEX_HOME`: `codex archive <uuid>`
   (moves the rollout to `archived_sessions/`, flags `threads` in `state_*.sqlite`;
-  undo with `codex unarchive`) / `codex delete --force <uuid>`; the uuid comes from
-  `session_meta.payload.id`. Doc: `AGENTS.md`.
+  undo with `codex unarchive`) / `codex delete --force <uuid>`. The uuid must be the
+  same in the file name and `session_meta.payload.id`, and no other rollout (active
+  or archived) may carry it; afterwards exactly that rollout must have left
+  `sessions/`. Doc: `AGENTS.md`.
 - **Copilot CLI** (`$COPILOT_HOME` or `~/.copilot`): `session-store.db` (`sessions`
   with cwd/summary/branch, `turns`, `assistant_usage_events`) plus
   `session-state/<id>/events.jsonl` (the full transcript: `user.message`,
@@ -200,12 +213,16 @@ Three layers, all under `backend/` + `frontend/`:
   title/branch. The old `history/<mangled-cwd>/*.jsonl` guess is a fallback. The CLI
   can't delete sessions (`copilot sessions` only imports), so cc_mgr does: every
   table with a `session_id` column (FTS5 `search_index` included, its shadow tables
-  not) plus the `sessions` row, in one `BEGIN IMMEDIATE` transaction, and
-  `session-state/<id>/`. Soft delete first saves the rows (`db_rows.json`) and the
-  folder in `.cc_mgr_trash/`, and puts the folder back if the transaction fails.
-  Refused while `session-state/<id>/inuse.<pid>.lock` names a live copilot process,
-  or the session was active in the last two minutes (the home is often on a shared
-  filesystem, so Copilot may run it on another node). Doc: `AGENTS.md`.
+  not) plus the `sessions` row, and `session-state/<id>/`. The `BEGIN IMMEDIATE`
+  transaction is taken *before* the backup is read, so a soft delete saves exactly
+  the rows it deletes (`db_rows.json`, with the folder, in `.cc_mgr_trash/`); on a
+  failure it rolls back and moves the folder back — never over one that reappeared
+  (then the trash copy is kept and reported). A `session-store.db` that resolves
+  outside the Copilot home is refused. Refused too while
+  `session-state/<id>/inuse.<pid>.lock` names a live copilot process, or the session
+  (folder, events.jsonl or the store's `updated_at`) was active in the last two
+  minutes — the home is often on a shared filesystem, so Copilot may run it on
+  another node. Doc: `AGENTS.md`.
 - **Gemini CLI — legacy** (`$GEMINI_HOME` or `~/.gemini`): the CLI is
   retired (agy replaces it). Projects under `tmp/<project>/`, true cwd from
   `tmp/<project>/.project_root` (fallback `history/<project>/.project_root`,

@@ -373,6 +373,8 @@ def api_project_delete(project: str, req: ProjectDeleteRequest, agent: str | Non
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:  # the agent's own CLI refused or failed
         raise HTTPException(status_code=502, detail=str(e))
+    except OSError as e:  # e.g. an export that couldn't be written: nothing was deleted
+        raise HTTPException(status_code=500, detail=str(e))
     try:  # the search index is a cache: keep it from offering deleted sessions
         index_db.remove_sessions(ad.capabilities.agent_id, result.get("sessions") or [],
                                  project if result.get("project_removed") else None)

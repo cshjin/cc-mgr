@@ -35,7 +35,7 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
-    SessionSummary, context_window, is_safe_id, iter_jsonl, read_doc_file,
+    SessionSummary, context_window, is_safe_id, iter_jsonl, project_names, read_doc_file,
     read_git_info, save_doc_file,
 )
 
@@ -47,17 +47,24 @@ def codex_home() -> Path:
     return Path(env).expanduser() if env else Path.home() / ".codex"
 
 
-def _thread_id(path: Path) -> str:
-    """A session's Codex id: session_meta.payload.id, else the UUID that ends
-    the rollout file name ("" if neither is a UUID)."""
+def _meta_id(path: Path) -> str:
+    """The UUID in the rollout's session_meta (lower-case), or ""."""
     for rec in iter_jsonl(path):
         if rec.get("type") == "session_meta":
             sid = (rec.get("payload") or {}).get("id")
-            if isinstance(sid, str) and _UUID_AT_END.fullmatch(sid):
-                return sid
-            break
+            return sid.lower() if isinstance(sid, str) and _UUID_AT_END.fullmatch(sid) else ""
+    return ""
+
+
+def _name_id(path: Path) -> str:
     m = _UUID_AT_END.search(path.stem)
-    return m.group(0) if m else ""
+    return m.group(0).lower() if m else ""
+
+
+def _all_rollouts(home: Path) -> list[Path]:
+    """Every rollout Codex could resolve an id to: active and archived."""
+    return [p for d in ("sessions", "archived_sessions") if (home / d).is_dir()
+            for p in (home / d).rglob("rollout-*.jsonl")]
 
 
 def _codex_cli() -> str | None:
@@ -80,10 +87,6 @@ def _run_codex(args: list[str], home: Path) -> None:
                  if ln.strip() and not ln.startswith("WARNING:")]
         raise RuntimeError(f"`codex {args[0]}` failed: "
                            f"{lines[-1] if lines else f'exit {proc.returncode}'}")
-
-
-def _mangle(cwd: str) -> str:
-    return cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
 
 
 def _session_cwd(path: Path) -> str:
@@ -195,13 +198,12 @@ class CodexAdapter(AgentAdapter):
         return root.is_dir() and any(root.rglob("rollout-*.jsonl"))
 
     def _project_map(self) -> dict[str, list[Path]]:
-        """mangled-cwd -> [session paths]."""
-        out: dict[str, list[Path]] = {}
+        """project name -> [session paths]; one name per cwd (see project_names)."""
+        by_cwd: dict[str, list[Path]] = {}
         for s in _all_sessions(self._home()):
-            cwd = _session_cwd(s)
-            key = _mangle(cwd) if cwd else "unknown"
-            out.setdefault(key, []).append(s)
-        return out
+            by_cwd.setdefault(_session_cwd(s), []).append(s)
+        names = project_names(cwd for cwd in by_cwd if cwd)
+        return {(names[cwd] if cwd else "unknown"): paths for cwd, paths in by_cwd.items()}
 
     def list_projects(self) -> list[dict[str, Any]]:
         out = []
@@ -317,18 +319,39 @@ class CodexAdapter(AgentAdapter):
     def save_doc(self, project, content):
         return save_doc_file(self._project_cwd(project), "AGENTS.md", content)
 
+    def _codex_target(self, path: Path) -> str:
+        """The id to hand the codex CLI, only if it unambiguously means this
+        rollout: the ids in the file name and in session_meta agree, and no
+        other rollout (active or archived) carries the same id."""
+        meta, name = _meta_id(path), _name_id(path)
+        if meta and name and meta != name:
+            raise RuntimeError(f"{path.name}: the id in its file name and in its session_meta "
+                               f"disagree ({name} vs {meta}); not handing it to codex")
+        thread = meta or name
+        if not thread:
+            raise RuntimeError(f"can't tell the Codex id of {path.name}")
+        for other in _all_rollouts(self._home()):
+            if other != path and (thread in other.name.lower() or _meta_id(other) == thread):
+                raise RuntimeError(f"another rollout ({other.name}) carries the same Codex id "
+                                   f"{thread}; not handing it to codex")
+        return thread
+
     def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
         if not is_safe_id(session_id):
             raise ValueError("invalid session id")
         path = self._session_path(project, session_id)
         if path is None or not path.is_file():
             raise FileNotFoundError(f"session {session_id} not found in {project}")
-        thread = _thread_id(path)
-        if not thread:
-            raise RuntimeError(f"can't tell the Codex id of {path.name}")
-        _run_codex(["delete", "--force", thread] if hard else ["archive", thread], self._home())
-        if path.exists():  # the CLI reported success: make sure it really acted
+        home = self._home()
+        thread = self._codex_target(path)
+        before = set(_all_sessions(home))
+        _run_codex(["delete", "--force", thread] if hard else ["archive", thread], home)
+        after = set(_all_sessions(home))
+        if path in after:  # the CLI reported success: make sure it really acted
             raise RuntimeError(f"Codex did not {'delete' if hard else 'archive'} session {thread}")
+        collateral = sorted(p.name for p in before - after - {path})
+        if collateral:
+            raise RuntimeError(f"Codex also removed other sessions: {', '.join(collateral)}")
         if hard:
             return {"deleted": [str(path)], "trash": None, "note": "Deleted with `codex delete`."}
         return {"deleted": [str(path)], "trash": "codex-archive",

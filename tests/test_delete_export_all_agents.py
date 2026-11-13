@@ -1,6 +1,7 @@
 """#24: Markdown export for every agent; delete for Codex, Copilot CLI and Gemini CLI."""
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -176,6 +177,46 @@ def test_codex_session_without_a_uuid_is_not_sent_to_the_cli(codex_home, monkeyp
     assert r.status_code == 502 and "Codex id" in r.json()["detail"]
 
 
+OTHER = "019e6c93-0000-7c33-ae62-48ccb9c2eb1e"
+
+
+def _rekey(path, meta_id):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    meta = json.loads(lines[0])
+    meta["payload"]["id"] = meta_id
+    path.write_text("\n".join([json.dumps(meta), *lines[1:]]), encoding="utf-8")
+
+
+def test_codex_refuses_ids_that_disagree_or_repeat(codex_uuid, codex_home, monkeypatch):
+    monkeypatch.setattr(cx, "_run_codex", lambda args, home: pytest.fail("must not call codex"))
+    a = CodexAdapter()
+    pname = _first_project(a)
+    _rekey(codex_uuid, OTHER)  # the file name says UUID, session_meta says OTHER
+    with pytest.raises(RuntimeError, match="disagree"):
+        a.delete_session(pname, codex_uuid.stem)
+    _rekey(codex_uuid, UUID)
+    archived = codex_home / "archived_sessions" / f"rollout-2026-01-01T00-00-00-{UUID}.jsonl"
+    archived.parent.mkdir()
+    shutil.copy(codex_uuid, archived)  # another rollout with the same id: ambiguous for the CLI
+    with pytest.raises(RuntimeError, match="same Codex id"):
+        a.delete_session(pname, codex_uuid.stem)
+    assert codex_uuid.exists() and archived.exists()
+
+
+def test_codex_collateral_removal_is_reported(codex_uuid, monkeypatch):
+    other = codex_uuid.with_name(f"rollout-2026-06-03T11-00-00-{OTHER}.jsonl")
+    shutil.copy(codex_uuid, other)
+    _rekey(other, OTHER)
+
+    def greedy(args, home):  # a CLI that removes more than it was asked to
+        for p in home.glob("sessions/**/rollout-*.jsonl"):
+            p.unlink()
+
+    monkeypatch.setattr(cx, "_run_codex", greedy)
+    with pytest.raises(RuntimeError, match="also removed other sessions"):
+        CodexAdapter().delete_session(_first_project(CodexAdapter()), codex_uuid.stem, hard=True)
+
+
 def test_run_codex_targets_cc_mgrs_codex_home_and_reports_failures(monkeypatch, tmp_path):
     seen = {}
 
@@ -299,34 +340,117 @@ def test_copilot_refuses_a_session_active_moments_ago(store):
     assert (store / "session-state" / "aaaa-1").is_dir()
 
 
-def test_copilot_puts_everything_back_if_the_store_refuses(store, monkeypatch):
+def test_copilot_db_only_session_active_moments_ago_is_refused(store):
+    # no session-state folder: only the store's own updated_at says it is in use
+    conn = sqlite3.connect(store / "session-store.db")
+    conn.execute("UPDATE sessions SET updated_at = ? WHERE id = 'bbbb-2'",
+                 (time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),))
+    conn.commit()
+    conn.close()
+    with pytest.raises(RuntimeError, match="active in the last two minutes"):
+        CopilotAdapter().delete_session(_cp_project(store), "bbbb-2", hard=True)
+    assert _rows(store, "bbbb-2")["sessions"] == 1
+
+
+def _refuse_deletes_from(store, table):
+    """Make the store refuse a DELETE on one table, after others already went."""
+    conn = sqlite3.connect(store / "session-store.db")
+    conn.execute(f"CREATE TRIGGER keep BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT, 'refused'); END")
+    conn.commit()
+    conn.close()
+
+
+def test_copilot_puts_everything_back_if_the_store_refuses(store):
     _age(store, "aaaa-1")
-
-    def locked(db, sid):
-        raise sqlite3.OperationalError("database is locked")
-
-    monkeypatch.setattr(cp, "_delete_rows", locked)
+    _refuse_deletes_from(store, "sessions")  # the last table: every other delete already ran
     with pytest.raises(RuntimeError, match="nothing was deleted"):
         CopilotAdapter().delete_session(_cp_project(store), "aaaa-1")
     assert (store / "session-state" / "aaaa-1" / "events.jsonl").is_file()
     assert not any((store / ".cc_mgr_trash").iterdir())
+    assert _rows(store, "aaaa-1") == {"sessions": 1, "turns": 1, "assistant_usage_events": 0,
+                                      "search_index": ["aaaa-1", "bbbb-2"]}  # all rolled back
+
+
+def test_copilot_rollback_never_overwrites_a_folder_that_reappeared(store, monkeypatch):
+    _age(store, "aaaa-1")
+    _refuse_deletes_from(store, "sessions")
+    state = store / "session-state" / "aaaa-1"
+    real_rename = os.rename
+
+    def rename_then_copilot_recreates_it(src, dst):
+        real_rename(src, dst)
+        if Path(src) == state:  # the forward move: Copilot writes the folder again meanwhile
+            state.mkdir()
+            (state / "new.txt").write_text("new")
+
+    monkeypatch.setattr(cp.os, "rename", rename_then_copilot_recreates_it)
+    with pytest.raises(RuntimeError, match="previous copy is kept in"):
+        CopilotAdapter().delete_session(_cp_project(store), "aaaa-1")
+    assert sorted(p.name for p in state.iterdir()) == ["new.txt"]  # not nested, not overwritten
+    kept = next((store / ".cc_mgr_trash").iterdir())
+    assert (kept / "session-state" / "events.jsonl").is_file() and (kept / "db_rows.json").is_file()
     assert _rows(store, "aaaa-1")["sessions"] == 1
 
 
-def test_delete_rows_is_all_or_nothing(store, monkeypatch):
-    real = cp._session_tables
+def test_copilot_backup_and_delete_see_the_same_rows(store, monkeypatch):
+    # The write lock is held from before the backup until the commit: Copilot
+    # can't add a row in between that would be deleted without being backed up.
+    _age(store, "aaaa-1")
+    blocked = []
+    real = cp.new_trash_dir
 
-    def with_a_broken_table(conn):
-        return real(conn) + [("no_such_table", "session_id")]
+    def try_to_write_meanwhile(home, name):
+        other = sqlite3.connect(store / "session-store.db", timeout=0)
+        try:
+            other.execute("INSERT INTO turns VALUES (99, 'aaaa-1', 9, 'late', NULL, 'x')")
+            other.commit()
+        except sqlite3.OperationalError as e:
+            blocked.append(str(e))
+        finally:
+            other.close()
+        return real(home, name)
 
-    monkeypatch.setattr(cp, "_session_tables", with_a_broken_table)
-    with pytest.raises(sqlite3.OperationalError):
-        cp._delete_rows(store / "session-store.db", "aaaa-1")
-    assert _rows(store, "aaaa-1")["turns"] == 1  # rolled back
+    monkeypatch.setattr(cp, "new_trash_dir", try_to_write_meanwhile)
+    res = CopilotAdapter().delete_session(_cp_project(store), "aaaa-1")
+    assert blocked and "locked" in blocked[0]
+    backup = json.loads((Path(res["trash"]) / "db_rows.json").read_text(encoding="utf-8"))
+    assert [r["user_message"] for r in backup["rows"]["turns"]] == ["please fix the build"]
 
 
-def test_an_unreadable_store_is_never_written(tmp_path):
-    db = tmp_path / "session-store.db"
-    db.write_bytes(b"definitely not a database " * 100)
-    with pytest.raises(RuntimeError, match="nothing was deleted"):
-        cp._session_rows(db, "aaaa-1")
+def test_copilot_store_busy_means_nothing_happens(store, monkeypatch):
+    _age(store, "aaaa-1")
+    monkeypatch.setattr(cp, "_LOCK_TIMEOUT", 0.1)
+    holder = sqlite3.connect(store / "session-store.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")  # Copilot is writing
+    try:
+        with pytest.raises(RuntimeError, match="busy.*nothing was deleted"):
+            CopilotAdapter().delete_session(_cp_project(store), "aaaa-1")
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert (store / "session-state" / "aaaa-1").is_dir() and not (store / ".cc_mgr_trash").exists()
+
+
+def test_copilot_refuses_a_store_that_resolves_outside_its_home(store, tmp_path):
+    outside = tmp_path / "elsewhere.db"
+    os.rename(store / "session-store.db", outside)
+    (store / "session-store.db").symlink_to(outside)
+    _age(store, "aaaa-1")
+    r = client.post(f"/api/projects/{_cp_project(store)}/sessions/aaaa-1/delete",
+                    params={"agent": "copilot"}, json={"export_first": False, "hard": True})
+    assert r.status_code == 400 and "outside" in r.json()["detail"]
+    conn = sqlite3.connect(outside)
+    assert conn.execute("SELECT COUNT(*) FROM turns WHERE session_id = 'aaaa-1'").fetchone()[0] == 1
+    conn.close()
+
+
+def test_pid_alive_fails_closed_on_windows(monkeypatch):
+    from backend.agents import common
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(common.os, "name", "nt")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Failed())
+    assert common.pid_alive(4242) is True  # tasklist failed: unknown counts as alive

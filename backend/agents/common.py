@@ -1,6 +1,7 @@
 """Agent-neutral helpers shared by all adapters."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -10,7 +11,7 @@ import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 CTX_TIERS = (200_000, 1_000_000)
 STD_WINDOW = 200_000
@@ -114,11 +115,13 @@ def pid_alive(pid: int) -> bool:
     if os.name == "nt":
         import subprocess
         try:
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                                 capture_output=True, text=True, timeout=10).stdout
+            proc = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                                  capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return True
-        return str(pid) in out.split()
+        if proc.returncode != 0:  # the query failed: unknown, so alive
+            return True
+        return str(pid) in proc.stdout.split()
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -126,6 +129,32 @@ def pid_alive(pid: int) -> bool:
     except OSError:  # PermissionError: it exists but belongs to someone else
         return True
     return True
+
+
+def resolves_inside(path: Path, root: Path) -> bool:
+    """Whether path, with symlinks resolved, is root or lies under it."""
+    real, base = os.path.realpath(path), os.path.realpath(root)
+    return real == base or real.startswith(base + os.sep)
+
+
+def mangle(cwd: str) -> str:
+    """A working directory as a single folder-like name (lossy: / \\ : → -)."""
+    return cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
+
+
+def project_names(cwds: Iterable[str]) -> dict[str, str]:
+    """A unique project name for each working directory: its mangled path,
+    plus a short hash of the path when two directories mangle to the same
+    name (e.g. repo-x and repo/x), so a name never stands for two directories."""
+    groups: dict[str, set[str]] = {}
+    for cwd in cwds:
+        groups.setdefault(mangle(cwd), set()).add(cwd)
+    out: dict[str, str] = {}
+    for name, members in groups.items():
+        for cwd in members:
+            out[cwd] = name if len(members) == 1 else \
+                f"{name}~{hashlib.sha1(cwd.encode('utf-8')).hexdigest()[:8]}"
+    return out
 
 
 def _fenced(text: str, lang: str = "") -> str:

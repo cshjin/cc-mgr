@@ -50,7 +50,7 @@ from typing import Any, Iterable, Iterator
 from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
     STD_WINDOW, SessionSummary, connect_sqlite_ro, default_export_dir,
-    is_claude_model, is_safe_id, private_mkdir, read_doc_file,
+    is_claude_model, is_safe_id, private_mkdir, project_names, read_doc_file,
     read_git_info, save_doc_file, write_private,
 )
 
@@ -209,8 +209,11 @@ def _session_table(conn: sqlite3.Connection) -> str:
 # Small parsing helpers
 # ---------------------------------------------------------------------------
 
-def _mangle(cwd: str) -> str:
-    return cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
+def _dir_names(conn: sqlite3.Connection, table: str) -> dict[str, str]:
+    """Project name for every directory with a session (archived ones too, so
+    the names don't change when a session is archived)."""
+    return project_names(r[0] for r in conn.execute(
+        f"SELECT DISTINCT directory FROM {table} WHERE directory IS NOT NULL AND directory != ''"))
 
 
 def _json(raw: Any) -> dict[str, Any]:
@@ -621,21 +624,16 @@ class OpencodeAdapter(AgentAdapter):
         return self._db_path() is not None
 
     def _project_cwd(self, project: str) -> str:
-        """Resolve a project name (mangled cwd) back to its real directory."""
+        """Resolve a project name back to its real directory."""
         db_file = self._db_path()
         if not db_file:
             return ""
         conn = _connect_ro(db_file)
         try:
-            table = _session_table(conn)
-            for r in conn.execute(f"SELECT DISTINCT directory FROM {table} "
-                                  f"WHERE directory IS NOT NULL AND directory != ''"):
-                d = r["directory"]
-                if _mangle(d) == project or d == project:
-                    return d
+            names = _dir_names(conn, _session_table(conn))
         finally:
             conn.close()
-        return ""
+        return next((d for d, name in names.items() if name == project), "")
 
     def list_projects(self) -> list[dict[str, Any]]:
         db_file = self._db_path()
@@ -644,6 +642,7 @@ class OpencodeAdapter(AgentAdapter):
         conn = _connect_ro(db_file)
         try:
             table = _session_table(conn)
+            names = _dir_names(conn, table)
             rows = conn.execute(f"""
                 SELECT directory,
                        SUM(CASE WHEN parent_id IS NULL OR parent_id = '' THEN 1 ELSE 0 END)
@@ -673,7 +672,7 @@ class OpencodeAdapter(AgentAdapter):
             cwd = r["directory"]
             total, opn = todos.get(cwd, (0, 0))
             out.append({
-                "name": _mangle(cwd),
+                "name": names[cwd],
                 "display_path": cwd,
                 "cwd": cwd,
                 "session_count": r["session_count"] or 0,
@@ -943,6 +942,54 @@ class OpencodeAdapter(AgentAdapter):
         if v2:
             return self._delete_v2(db_file, session_id, hard)
         return self._delete_v1(db_file, session_id, hard)
+
+    def _cascade(self, project: str) -> tuple[list[str], list[str]]:
+        """What a permanent delete of the project's listed sessions takes along
+        (`opencode session delete` removes a session's descendants): (archived
+        sessions in this directory, sessions under other directories)."""
+        db_file = self._db_path()
+        cwd = self._project_cwd(project)
+        if not db_file or not cwd:
+            return [], []
+        conn = _connect_ro(db_file)
+        try:
+            if not _is_v2(conn):
+                return [], []  # v1 deletes are per session: nothing cascades
+            rows = conn.execute(
+                "WITH RECURSIVE tree(id) AS ("
+                " SELECT id FROM session_v2 WHERE directory = ?"
+                "  AND (time_archived IS NULL OR time_archived = 0)"
+                " UNION SELECT s.id FROM session_v2 s JOIN tree t ON s.parent_id = t.id) "
+                "SELECT s.id, s.directory, s.time_archived FROM session_v2 s JOIN tree t ON s.id = t.id",
+                (cwd,)).fetchall()
+        finally:
+            conn.close()
+        here = [r["id"] for r in rows if r["directory"] == cwd and r["time_archived"]]
+        elsewhere = [r["id"] for r in rows if r["directory"] != cwd]
+        return here, elsewhere
+
+    def project_delete_preview(self, project: str) -> dict[str, Any]:
+        preview = super().project_delete_preview(project)
+        here, elsewhere = self._cascade(project)
+        preview["hidden"] = len(here)          # archived subagents, removed by a permanent delete
+        preview["outside"] = len(elsewhere)    # ...and ones under other directories
+        return preview
+
+    def delete_project(self, project: str, hard: bool = False, include_memory: bool = False,
+                       export_first: bool = False) -> dict[str, Any]:
+        exported: list[str] = []
+        if hard:
+            here, elsewhere = self._cascade(project)
+            if elsewhere:
+                raise ValueError(
+                    f"a permanent delete would also remove {len(elsewhere)} subagent session(s) "
+                    f"stored under other directories (OpenCode deletes a session's "
+                    f"descendants); archive this project instead, or delete those first")
+            if export_first:  # the archived subagents go too: export them before anything is deleted
+                exported = [str(self.export_session_to_file(project, sid)) for sid in here]
+        result = super().delete_project(project, hard=hard, export_first=export_first)
+        result["exported"] = exported + result["exported"]
+        return result
 
     def _delete_v2(self, db_file: Path, session_id: str, hard: bool) -> dict[str, Any]:
         if not _opencode_cli() or not _is_cli_managed(db_file):
