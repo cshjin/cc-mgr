@@ -7,7 +7,8 @@ Reads, on demand, from:
       <session-uuid>/...            per-session sidecar dirs
   ~/.claude/tasks/<session-uuid>/N.json   per-session tasks
 
-Nothing is mutated here; this module is read-only.
+Mutating operations (all path-guarded): task status, memory files,
+CLAUDE.md, session export, save-as-memory, and delete.
 """
 from __future__ import annotations
 
@@ -19,9 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .agents.common import (
-    SessionSummary, context_limit_for as _context_limit_for, context_window,
-    default_export_dir, is_safe_id, is_safe_name, safe_join,
+from .agents.common import (  # re-exported: store's public names stay importable
+    CTX_TIERS, STD_WINDOW, SessionSummary, context_limit_for as _context_limit_for,
+    context_window, default_export_dir, is_safe_id, is_safe_name, read_git_info,
+    safe_join,
 )
 
 
@@ -68,17 +70,13 @@ def _task_dir(session_id: str) -> Path:
 
 
 def unmangle_path(folder_name: str) -> str:
-    """Best-effort recovery of the original cwd from a mangled folder name.
+    """Display name for a project folder whose real cwd isn't known.
 
-    Claude mangles a path by replacing path separators (and ':') with '-'.
-    The transform is lossy (a literal '-' in the path is indistinguishable
-    from a separator), so this is display-only.
+    Claude mangles a path by replacing separators (and ':') with '-'. That is
+    lossy — a literal '-' is indistinguishable from a separator — so the
+    folder name is shown as-is rather than as a guessed path.
     """
-    name = folder_name
-    # Windows drive prefix like "G--My-Drive" -> "G:/My/Drive" is ambiguous;
-    # show a readable approximation.
-    name = name.replace("--", ":/", 1) if "--" in name else name
-    return name.replace("-", "/") if False else folder_name
+    return folder_name
 
 
 # Context-window tiers (tokens). Transcripts record only the resolved API model
@@ -87,8 +85,7 @@ def unmangle_path(folder_name: str) -> str:
 # The only thing we can assert from a transcript is a *lower bound*: if observed
 # usage crossed 200k, the window must be the 1M tier. Below 200k it's ambiguous
 # (could be a 200k model, or a 1M model that simply didn't fill up).
-CTX_TIERS = (200_000, 1_000_000)
-STD_WINDOW = 200_000
+# The constants and helpers live in agents.common, shared by every adapter.
 
 
 def context_limit_for(observed_tokens: int) -> dict[str, Any]:
@@ -97,51 +94,8 @@ def context_limit_for(observed_tokens: int) -> dict[str, Any]:
     Returns {limit, known}. `known` is True only when usage proves the tier
     (i.e. it exceeded the standard 200k window, so it must be the 1M variant).
     When False, `limit` is an assumed default (200k) for display, NOT a fact.
-    Shared with the other adapters (agents.common).
     """
     return _context_limit_for(observed_tokens)
-
-
-def read_git_info(cwd: str | None) -> dict[str, Any] | None:
-    """Read repo name + current branch from <cwd>/.git without invoking git.
-
-    Returns None if cwd is missing or not a git working tree.
-    """
-    if not cwd:
-        return None
-    try:
-        root = Path(cwd)
-    except (TypeError, ValueError):
-        return None
-    git = root / ".git"
-    if not git.exists():
-        return None
-    branch = None
-    detached = False
-    head_file = git / "HEAD" if git.is_dir() else None
-    # Worktrees use a .git *file* pointing elsewhere; handle the common dir case.
-    if git.is_file():
-        try:
-            content = git.read_text(encoding="utf-8", errors="replace").strip()
-            if content.startswith("gitdir:"):
-                gitdir = Path(content.split(":", 1)[1].strip())
-                # The gitdir may be relative to the .git file's own directory.
-                if not gitdir.is_absolute():
-                    gitdir = (git.parent / gitdir).resolve()
-                head_file = gitdir / "HEAD"
-        except OSError:
-            head_file = None
-    if head_file and head_file.is_file():
-        try:
-            head = head_file.read_text(encoding="utf-8", errors="replace").strip()
-            if head.startswith("ref:"):
-                branch = head.split("/")[-1]
-            elif head:
-                branch = head[:8]
-                detached = True
-        except OSError:
-            pass
-    return {"repo": root.name, "branch": branch, "detached": detached}
 
 
 def _peek_session_meta(path: Path, max_lines: int = 40) -> dict[str, Any]:

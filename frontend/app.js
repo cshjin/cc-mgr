@@ -525,7 +525,7 @@ function renderDetailShell() {
 }
 
 function exportSession() {
-  const url = `/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/export?agent=${encodeURIComponent(state.agent)}`;
+  const url = `/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}/export?agent=${encodeURIComponent(state.agent)}`;
   const a = document.createElement("a");
   a.href = url;
   a.download = `${state.activeSession.slice(0, 8)}.md`;
@@ -546,7 +546,7 @@ function openDeleteModal() {
       ${state.agent === "opencode" ? `<p>OpenCode: the soft delete archives the session inside
          OpenCode; a permanent delete also removes its subagent sessions.</p>` : ""}
       <label class="mrow"><input type="checkbox" id="mExport" checked /> Export to Markdown first</label>
-      <label class="mrow"><input type="checkbox" id="mMemory" /> Save a summary to project memory</label>
+      ${(state.caps || {}).has_memory ? '<label class="mrow"><input type="checkbox" id="mMemory" /> Save a summary to project memory</label>' : ""}
       <label class="mrow"><input type="checkbox" id="mHard" /> Permanent delete (skip trash)</label>
       <div class="modal-actions">
         <button class="dbtn" id="mCancel">Cancel</button>
@@ -560,11 +560,11 @@ function openDeleteModal() {
   $("#mCancel").addEventListener("click", close);
   $("#mConfirm").addEventListener("click", async () => {
     const exportFirst = $("#mExport").checked;
-    const saveMemory = $("#mMemory").checked;
+    const saveMemory = Boolean($("#mMemory") && $("#mMemory").checked);
     const hard = $("#mHard").checked;
     $("#mStatus").textContent = "deleting…";
     try {
-      const du = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/delete`,
+      const du = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}/delete`,
                          location.origin);
       du.searchParams.set("agent", state.agent);
       const r = await fetch(du, {
@@ -618,7 +618,7 @@ async function loadTab() {
       // If navigating to a specific turn, load enough to include it in one go.
       const need = (typeof state.targetSeq === "number")
         ? Math.max(CONV_PAGE, state.targetSeq + 5) : CONV_PAGE;
-      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}?offset=0&limit=${need}`);
+      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}?offset=0&limit=${need}`);
       state.convTotal = data.total;
       state.convOffset = data.turns.length;
       renderConversation(body, data.turns, true);
@@ -627,7 +627,7 @@ async function loadTab() {
         state.targetSeq = null;
       }
     } else if (state.detailTab === "tasks") {
-      const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
+      const tasks = await api(`/api/sessions/${encodeURIComponent(state.activeSession)}/tasks`);
       renderTasks(body, tasks);
     } else if (state.detailTab === "memory") {
       const mem = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`);
@@ -707,10 +707,14 @@ function renderConversation(body, turns, fresh) {
 async function loadMoreTurns() {
   const btn = $("#loadMore");
   if (btn) btn.textContent = "loading…";
-  const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}?offset=${state.convOffset}&limit=${CONV_PAGE}`);
-  state.convTotal = data.total;
-  state.convOffset += data.turns.length;
-  renderConversation($("#tabBody"), data.turns, false);
+  try {
+    const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}?offset=${state.convOffset}&limit=${CONV_PAGE}`);
+    state.convTotal = data.total;
+    state.convOffset += data.turns.length;
+    renderConversation($("#tabBody"), data.turns, false);
+  } catch (e) {
+    if (btn) btn.textContent = `Load more failed (${e.message}) — click to retry`;
+  }
 }
 
 function renderBlock(b) {
@@ -808,7 +812,7 @@ function wireKanban(scope, opts = {}) {
 
 async function reloadTasksView() {
   if (state.activeSession && state.detailTab === "tasks") {
-    const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
+    const tasks = await api(`/api/sessions/${encodeURIComponent(state.activeSession)}/tasks`);
     renderTasks($("#tabBody"), tasks);
   } else if (state.projView === "tasks") {
     const tasks = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/tasks`);

@@ -18,7 +18,7 @@ from . import index_db, store
 from .agents import UnsupportedCapability, get_adapter, list_agents
 from .agents.common import is_safe_id, is_safe_name
 
-app = FastAPI(title="cc_mgr", version="0.3.0")
+app = FastAPI(title="cc_mgr", version="0.5.0")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 

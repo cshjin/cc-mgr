@@ -36,11 +36,22 @@ def safe_join(root: Path, *parts: str) -> Path:
     return Path(target)
 
 
+REPO_DIR = Path(__file__).resolve().parents[2]
+
+
+def data_dir() -> Path:
+    """cc_mgr's own state (search index, pidfiles, logs): $CC_MGR_DATA_DIR or
+    <repo>/data. Relocate it e.g. off a slow network filesystem."""
+    env = os.environ.get("CC_MGR_DATA_DIR")
+    return Path(env).expanduser() if env else REPO_DIR / "data"
+
+
 def default_export_dir(project: str) -> Path:
-    """exports/<project>/ for session exports (project must be a safe name)."""
+    """<exports>/<project>/ for session exports ($CC_MGR_EXPORT_DIR or <repo>/exports)."""
     if not is_safe_name(project):
         raise ValueError("invalid project name")
-    return safe_join(Path.cwd() / "exports", project)
+    env = os.environ.get("CC_MGR_EXPORT_DIR")
+    return safe_join(Path(env).expanduser() if env else REPO_DIR / "exports", project)
 
 
 def connect_sqlite_ro(db_file: Path, timeout: float = 5.0) -> sqlite3.Connection:
@@ -183,7 +194,10 @@ def read_git_info(cwd: str | None) -> dict[str, Any] | None:
         try:
             head = head_file.read_text(encoding="utf-8", errors="replace").strip()
             if head.startswith("ref:"):
-                branch = head.split("/")[-1]
+                ref = head.split(":", 1)[1].strip()
+                # keep slashes in branch names: refs/heads/feature/foo -> feature/foo
+                branch = (ref[len("refs/heads/"):] if ref.startswith("refs/heads/")
+                          else ref.rsplit("/", 1)[-1])
             elif head:
                 branch = head[:8]
                 detached = True

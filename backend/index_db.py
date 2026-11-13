@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 from . import store
 from .agents import all_adapters
+from .agents.common import data_dir
 
 # Snippet highlight markers: control characters can't collide with real text
 # (the old "[" / "]" also matched every bracket in code and Markdown).
@@ -20,7 +21,7 @@ HL_END = "\x03"
 
 
 def db_path() -> Path:
-    return Path.cwd() / "data" / "cc_mgr.db"
+    return data_dir() / "cc_mgr.db"
 
 
 def _connect() -> sqlite3.Connection:
