@@ -5,10 +5,56 @@ resolve into the tmp tree instead of the real ~/. No real user data touched.
 """
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
+
+# Every env var an adapter consults to find real user data.
+AGENT_ENV_VARS = (
+    "CLAUDE_HOME", "CLAUDE_CONFIG_DIR", "AGY_HOME", "ANTIGRAVITY_HOME",
+    "ANTIGRAVITY_CLI_HOME", "GEMINI_HOME", "CODEX_HOME", "COPILOT_HOME",
+    "OPENCODE_DB", "OPENCODE_BASE", "XDG_DATA_HOME", "CC_MGR_TOKEN",
+    "CC_MGR_READ_ONLY", "CC_MGR_ALLOWED_HOSTS",
+)
+AGENT_CLIS = {"opencode", "agy", "claude", "codex", "copilot", "gemini"}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_real_agent_data(tmp_path_factory, monkeypatch):
+    """Never let a test read real agent data or run a real agent CLI.
+
+    Autouse fixtures run before the per-agent fixtures below, which then point
+    their own env var at a synthetic home. Everything else resolves into an
+    empty sandbox (HOME and XDG_DATA_HOME included), and agent CLIs are hidden
+    from shutil.which and refused by subprocess.run.
+    """
+    sandbox = tmp_path_factory.mktemp("no_real_data")
+    for var in AGENT_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(sandbox / "home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(sandbox / "xdg_data"))
+
+    real_which = shutil.which
+
+    def which(cmd, *args, **kwargs):
+        if Path(str(cmd)).name in AGENT_CLIS:
+            return None
+        return real_which(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "which", which)
+
+    real_run = subprocess.run
+
+    def run(args, *a, **kw):
+        argv0 = args[0] if isinstance(args, (list, tuple)) else str(args).split()[0]
+        if Path(str(argv0)).name in AGENT_CLIS:
+            raise AssertionError(f"test tried to run a real agent CLI: {args!r}")
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
