@@ -19,12 +19,12 @@ class ClaudeAdapter(AgentAdapter):
     def list_projects(self) -> list[dict[str, Any]]:
         return store.list_projects()
 
+    def has_data(self) -> bool:
+        root = store.projects_dir()
+        return root.is_dir() and any(p.is_dir() for p in root.iterdir())
+
     def list_sessions(self, project: str) -> list[SessionSummary]:
-        out = []
-        for s in store.list_sessions(project):
-            s.agent = "claude"
-            out.append(s)
-        return out
+        return store.list_sessions(project)
 
     def get_conversation(self, project, session_id, offset=0, limit=None):
         return store.get_conversation(project, session_id, offset=offset, limit=limit)

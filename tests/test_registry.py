@@ -32,7 +32,7 @@ def test_capabilities_shape():
     caps = get_adapter("gemini").capabilities
     assert caps.doc_filename == "GEMINI.md"
     assert caps.has_tasks is False
-    assert caps.can_edit_doc is True
+    assert caps.can_edit_doc is False  # legacy, read-only
 
 
 def test_base_unsupported_methods_raise():

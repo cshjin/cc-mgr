@@ -42,25 +42,35 @@ const state = {
   sortBy: "time", // time | name
   convOffset: 0,
   convTotal: 0,
-  agent: localStorage.getItem("cc_agent") || "claude",
+  agent: localStorage.getItem("cc_agent") || "",
   agents: [],
   caps: null,
+  showSubagents: localStorage.getItem("cc_showSubagents") === "1",
 };
 
 const CONV_PAGE = 40;
 const $ = (sel) => document.querySelector(sel);
 
+// Error carrying the server's `detail` (e.g. the 401 hint about ?token=…).
+async function httpError(r) {
+  let detail = r.statusText;
+  try { detail = (await r.json()).detail || detail; } catch { /* not JSON */ }
+  return new Error(`${r.status} ${detail}`);
+}
+
 async function api(path) {
   const u = new URL(path, location.origin);
   if (!u.searchParams.has("agent")) u.searchParams.set("agent", state.agent);
   const r = await fetch(u);
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  if (!r.ok) throw await httpError(r);
   return r.json();
 }
 
+// Escapes for both text and quoted-attribute contexts.
 function esc(s) {
   return String(s == null ? "" : s)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function fmtTokens(n) {
@@ -96,22 +106,33 @@ function currentCaps() {
   return state.agents.find((a) => a.agent_id === state.agent) || null;
 }
 
+// Agents with data first (stable), so the dropdown leads with what's in use.
+function orderAgents(agents) {
+  const noData = (a) => (a.has_data === false ? 1 : 0);
+  return [...agents].sort((a, b) => noData(a) - noData(b));
+}
+
 async function loadAgents() {
   try {
-    state.agents = await fetch("/api/agents").then((r) => r.json());
-  } catch {
+    const r = await fetch("/api/agents");
+    if (!r.ok) throw await httpError(r);
+    state.agents = orderAgents(await r.json());
+  } catch (e) {
+    if (e.message.startsWith("401")) throw e;  // not logged in: show the hint
     state.agents = [{ agent_id: "claude", label: "Claude", doc_filename: "CLAUDE.md",
       has_memory: true, has_tasks: true, can_edit_doc: true,
       can_delete: true, can_export: true }];
   }
   state.caps = currentCaps();
   if (!state.caps && state.agents.length) {
-    state.agent = state.agents[0].agent_id;
-    state.caps = state.agents[0];
+    const first = state.agents.find((a) => a.has_data !== false) || state.agents[0];
+    state.agent = first.agent_id;
+    state.caps = first;
   }
   const sel = $("#agentSel");
   sel.innerHTML = state.agents
-    .map((a) => `<option value="${esc(a.agent_id)}">${esc(a.label)}</option>`).join("");
+    .map((a) => `<option value="${esc(a.agent_id)}">${esc(a.label)}${a.has_data === false ? " — no data" : ""}</option>`)
+    .join("");
   sel.value = state.agent;
   sel.addEventListener("change", async () => {
     state.agent = sel.value;
@@ -302,13 +323,35 @@ function ctxLabel(s) {
   };
 }
 
+// Top-level sessions, plus (when shown) their subagent children depth-first.
+function sessionTree(sessions, showSubagents) {
+  const ids = new Set(sessions.map((s) => s.session_id));
+  const isChild = (s) => Boolean(s.parent_id) && ids.has(s.parent_id);
+  const kids = {};
+  for (const s of sessions) if (isChild(s)) (kids[s.parent_id] = kids[s.parent_id] || []).push(s);
+  const tops = sessions.filter((s) => !isChild(s));
+  const visible = [];
+  const seen = new Set();
+  const pushTree = (s, depth) => {
+    if (seen.has(s.session_id)) return;
+    seen.add(s.session_id);
+    visible.push({ s, depth });
+    if (showSubagents) for (const k of kids[s.session_id] || []) pushTree(k, depth + 1);
+  };
+  for (const s of tops) pushTree(s, 0);
+  return { visible, kids, topCount: tops.length, childTotal: sessions.length - tops.length };
+}
+
 function renderSessions() {
   const el = $("#sessionPane");
   if (!state.sessions.length) {
     el.innerHTML = '<div class="empty">No sessions in this project.</div>';
     return;
   }
-  const rows = state.sessions.map((s) => {
+  // Subagent (child) sessions hide under their parent unless toggled on.
+  const { visible, kids, topCount, childTotal } = sessionTree(state.sessions, state.showSubagents);
+
+  const rows = visible.map(({ s, depth }) => {
     const pct = ctxPct(s);
     const ctx = ctxLabel(s);
     const taskBadge = s.total_tasks
@@ -318,10 +361,12 @@ function renderSessions() {
       : "";
     const memBadge = s.has_memory ? '<span class="badge mem">◆ memory</span>' : "";
     const modelBadge = s.model ? `<span class="badge model">${esc(shortModel(s.model))}</span>` : "";
+    const nKids = (kids[s.session_id] || []).length;
+    const subBadge = nKids ? `<span class="badge sub" title="subagent sessions">⑂ ${nKids} subagent${nKids === 1 ? "" : "s"}</span>` : "";
     return `
-      <div class="session ${s.session_id === state.activeSession ? "active" : ""}" data-id="${esc(s.session_id)}">
+      <div class="session ${s.session_id === state.activeSession ? "active" : ""} ${depth ? "child" : ""}" data-id="${esc(s.session_id)}" style="margin-left:${depth * 18}px">
         <div class="session-head">
-          <span class="session-id" title="${esc(s.session_id)}">${esc(s.title || s.session_id.slice(0, 8))}</span>
+          <span class="session-id" title="${esc(s.session_id)}">${depth ? "↳ " : ""}${esc(s.title || s.session_id.slice(0, 8))}</span>
           <span class="session-time">${fmtTime(s.mtime)}</span>
         </div>
         <div class="session-prompt ${state.showPrompts ? "" : "hidden"}">${esc(s.last_prompt || s.first_prompt || "(no prompt)")}</div>
@@ -331,14 +376,25 @@ function renderSessions() {
         </div>
         <div class="badges">
           <span class="badge">${s.user_turns}↗ ${s.assistant_turns}↙</span>
-          ${modelBadge}${memBadge}${taskBadge}
+          ${modelBadge}${subBadge}${memBadge}${taskBadge}
         </div>
       </div>`;
   }).join("");
-  el.innerHTML = `<h2 class="pane-title">${state.sessions.length} sessions · newest first</h2>` + rows;
+  const toggle = childTotal
+    ? `<label class="subtoggle"><input type="checkbox" id="showSubagents" ${state.showSubagents ? "checked" : ""} /> show ${childTotal} subagent session${childTotal === 1 ? "" : "s"}</label>`
+    : "";
+  el.innerHTML = `<h2 class="pane-title">${topCount} sessions · newest first ${toggle}</h2>` + rows;
   el.querySelectorAll(".session").forEach((node) => {
     node.addEventListener("click", () => openSession(node.dataset.id));
   });
+  const tg = $("#showSubagents");
+  if (tg) {
+    tg.addEventListener("change", () => {
+      state.showSubagents = tg.checked;
+      localStorage.setItem("cc_showSubagents", tg.checked ? "1" : "0");
+      renderSessions();
+    });
+  }
 }
 
 // Aggregated task board across all sessions in the project
@@ -368,6 +424,21 @@ function renderClaudeMd(el, cm) {
     el.innerHTML = '<div class="empty">No working directory known for this project (no session has a cwd yet).</div>';
     return;
   }
+  if (state.caps && state.caps.can_edit_doc === false) {
+    el.innerHTML = `
+      <div class="editor-wrap">
+        <div class="editor-head">
+          <strong>${esc(docName)}</strong>
+          <span class="ehpath">${esc(cm.path)}</span>
+        </div>
+        ${cm.exists ? `<pre class="editor readonly">${esc(cm.content)}</pre>`
+                    : `<div class="empty">${esc(docName)} does not exist.</div>`}
+        <div class="editor-actions">
+          <span class="editor-status">Read-only for ${esc(state.caps.label)}.</span>
+        </div>
+      </div>`;
+    return;
+  }
   const status = cm.exists ? "" : `${docName} does not exist yet — saving will create it.`;
   el.innerHTML = `
     <div class="editor-wrap">
@@ -391,7 +462,7 @@ function renderClaudeMd(el, cm) {
         method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: $("#cmEditor").value }),
       });
-      if (!r.ok) throw new Error(`${r.status}`);
+      if (!r.ok) throw await httpError(r);
       const res = await r.json();
       $("#cmStatus").textContent = "saved ✓";
       flash(docName + " saved to " + res.saved);
@@ -454,7 +525,7 @@ function renderDetailShell() {
 }
 
 function exportSession() {
-  const url = `/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/export?agent=${encodeURIComponent(state.agent)}`;
+  const url = `/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}/export?agent=${encodeURIComponent(state.agent)}`;
   const a = document.createElement("a");
   a.href = url;
   a.download = `${state.activeSession.slice(0, 8)}.md`;
@@ -472,8 +543,10 @@ function openDeleteModal() {
       <h3>Delete session ${esc(sid)}?</h3>
       <p>This removes the transcript, sidecar files, and tasks. By default it
          is a <b>soft delete</b> (moved to a trash folder, reversible).</p>
+      ${state.agent === "opencode" ? `<p>OpenCode: the soft delete archives the session inside
+         OpenCode; a permanent delete also removes its subagent sessions.</p>` : ""}
       <label class="mrow"><input type="checkbox" id="mExport" checked /> Export to Markdown first</label>
-      <label class="mrow"><input type="checkbox" id="mMemory" /> Save a summary to project memory</label>
+      ${(state.caps || {}).has_memory ? '<label class="mrow"><input type="checkbox" id="mMemory" /> Save a summary to project memory</label>' : ""}
       <label class="mrow"><input type="checkbox" id="mHard" /> Permanent delete (skip trash)</label>
       <div class="modal-actions">
         <button class="dbtn" id="mCancel">Cancel</button>
@@ -487,18 +560,18 @@ function openDeleteModal() {
   $("#mCancel").addEventListener("click", close);
   $("#mConfirm").addEventListener("click", async () => {
     const exportFirst = $("#mExport").checked;
-    const saveMemory = $("#mMemory").checked;
+    const saveMemory = Boolean($("#mMemory") && $("#mMemory").checked);
     const hard = $("#mHard").checked;
     $("#mStatus").textContent = "deleting…";
     try {
-      const du = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}/delete`,
+      const du = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}/delete`,
                          location.origin);
       du.searchParams.set("agent", state.agent);
       const r = await fetch(du, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ export_first: exportFirst, save_memory: saveMemory, hard }),
       });
-      if (!r.ok) throw new Error(`${r.status}`);
+      if (!r.ok) throw await httpError(r);
       const res = await r.json();
       close();
       closeDetail();
@@ -506,8 +579,10 @@ function openDeleteModal() {
       renderSessions();
       const note = res.export ? ` Exported.` : "";
       const mem = res.memory ? ` Saved to memory.` : "";
-      const where = res.trash ? ` Moved to trash.` : " Permanently removed.";
-      flash(`Session deleted.${note}${mem}${where}`);
+      const where = res.note ? ` ${res.note}`
+        : (res.trash ? " Moved to trash." : " Permanently removed.");
+      const warn = res.warnings && res.warnings.length ? ` Warning: ${res.warnings.join("; ")}` : "";
+      flash(`Session deleted.${note}${mem}${where}${warn}`);
     } catch (e) {
       $("#mStatus").textContent = "Failed: " + e.message;
     }
@@ -543,7 +618,7 @@ async function loadTab() {
       // If navigating to a specific turn, load enough to include it in one go.
       const need = (typeof state.targetSeq === "number")
         ? Math.max(CONV_PAGE, state.targetSeq + 5) : CONV_PAGE;
-      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}?offset=0&limit=${need}`);
+      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}?offset=0&limit=${need}`);
       state.convTotal = data.total;
       state.convOffset = data.turns.length;
       renderConversation(body, data.turns, true);
@@ -552,7 +627,7 @@ async function loadTab() {
         state.targetSeq = null;
       }
     } else if (state.detailTab === "tasks") {
-      const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
+      const tasks = await api(`/api/sessions/${encodeURIComponent(state.activeSession)}/tasks`);
       renderTasks(body, tasks);
     } else if (state.detailTab === "memory") {
       const mem = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`);
@@ -632,10 +707,14 @@ function renderConversation(body, turns, fresh) {
 async function loadMoreTurns() {
   const btn = $("#loadMore");
   if (btn) btn.textContent = "loading…";
-  const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${state.activeSession}?offset=${state.convOffset}&limit=${CONV_PAGE}`);
-  state.convTotal = data.total;
-  state.convOffset += data.turns.length;
-  renderConversation($("#tabBody"), data.turns, false);
+  try {
+    const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}?offset=${state.convOffset}&limit=${CONV_PAGE}`);
+    state.convTotal = data.total;
+    state.convOffset += data.turns.length;
+    renderConversation($("#tabBody"), data.turns, false);
+  } catch (e) {
+    if (btn) btn.textContent = `Load more failed (${e.message}) — click to retry`;
+  }
 }
 
 function renderBlock(b) {
@@ -685,10 +764,14 @@ function renderTasks(body, tasks) {
 // opts.sid: fixed session for all cards (session view).
 // opts.perCard: read session id from each card's data-sid (project view).
 function wireKanban(scope, opts = {}) {
+  // Remember the dragged element itself: task ids repeat across sessions on the
+  // project board, so looking a card up by data-id can find the wrong one.
+  let dragCard = null;
   let dragId = null;
   let dragSid = null;
   scope.querySelectorAll(".kcard").forEach((card) => {
     card.addEventListener("dragstart", (e) => {
+      dragCard = card;
       dragId = card.dataset.id;
       dragSid = opts.perCard ? card.dataset.sid : opts.sid;
       card.classList.add("dragging");
@@ -703,33 +786,33 @@ function wireKanban(scope, opts = {}) {
       e.preventDefault();
       drop.classList.remove("over");
       const newStatus = drop.dataset.status;
-      if (!dragId || !dragSid) return;
-      const card = scope.querySelector(`.kcard[data-id="${CSS.escape(dragId)}"]`);
-      if (card && card.parentElement !== drop) {
+      const card = dragCard;
+      if (!card || !dragId || !dragSid) return;
+      if (card.parentElement !== drop) {
         drop.appendChild(card);
         try {
-          const tu = new URL(`/api/sessions/${dragSid}/tasks/${encodeURIComponent(dragId)}`,
+          const tu = new URL(`/api/sessions/${encodeURIComponent(dragSid)}/tasks/${encodeURIComponent(dragId)}`,
                              location.origin);
           tu.searchParams.set("agent", state.agent);
           const r = await fetch(tu, {
             method: "PATCH", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ status: newStatus }),
           });
-          if (!r.ok) throw new Error(`${r.status}`);
+          if (!r.ok) throw await httpError(r);
           reloadTasksView();
         } catch (err) {
           flash("Failed to update task: " + err.message);
           reloadTasksView();
         }
       }
-      dragId = null; dragSid = null;
+      dragCard = null; dragId = null; dragSid = null;
     });
   });
 }
 
 async function reloadTasksView() {
   if (state.activeSession && state.detailTab === "tasks") {
-    const tasks = await api(`/api/sessions/${state.activeSession}/tasks`);
+    const tasks = await api(`/api/sessions/${encodeURIComponent(state.activeSession)}/tasks`);
     renderTasks($("#tabBody"), tasks);
   } else if (state.projView === "tasks") {
     const tasks = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/tasks`);
@@ -794,7 +877,7 @@ function wireMemoryEditors(scope) {
           method: "PUT", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, content }),
         });
-        if (!r.ok) throw new Error(`${r.status}`);
+        if (!r.ok) throw await httpError(r);
         status.textContent = "saved ✓";
       } catch (e) {
         status.textContent = "failed: " + e.message;
@@ -878,8 +961,11 @@ function initSearch() {
     btn.textContent = "indexing…";
     try {
       const r = await fetch("/api/reindex", { method: "POST" });
+      if (!r.ok) throw await httpError(r);
       const res = await r.json();
-      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs across all agents.`);
+      const pruned = res.pruned ? `, ${res.pruned} stale removed` : "";
+      const errs = res.errors ? ` Failed: ${Object.entries(res.errors).map(([a, m]) => `${a} (${m})`).join("; ")}` : "";
+      flash(`Index updated: ${res.indexed} sessions, ${res.turns} turns, ${res.docs} docs${pruned} across all agents.${errs}`);
     } catch (e) {
       flash("Reindex failed: " + e.message);
     } finally {
@@ -910,7 +996,8 @@ function renderSearchResults(el, results, q, scopeProject) {
     return;
   }
   const html = results.map((r, i) => {
-    const snip = esc(r.snippet).replace(/\[/g, '<mark>').replace(/\]/g, '</mark>');
+    // \u0002 / \u0003 mark the match (the index never emits them otherwise).
+    const snip = esc(r.snippet).replace(/\u0002/g, "<mark>").replace(/\u0003/g, "</mark>");
     if (r.source === "conversation") {
       return `
         <div class="searchres" data-i="${i}">

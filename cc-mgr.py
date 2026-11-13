@@ -3,65 +3,160 @@
 
 Usage:
     python cc-mgr.py run [--host H] [--port P] [--reload] [--background]
+                         [--read-only] [--no-token]
     python cc-mgr.py stop [--port P]
     python cc-mgr.py status [--port P]
 
 `run` serves the app (foreground; Ctrl+C to stop). Add --background to detach
 the server and return to the shell. `stop` terminates a server previously
 started by this script. Cross-platform (Windows + Linux).
+
+Every start generates a random access token (or uses $CC_MGR_TOKEN) and prints
+http://localhost:PORT/?token=… — the API refuses requests without it, so other
+users on a shared machine (loopback is shared by everyone on the host) can't
+read or change your data.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import secrets
+import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PID_FILE = HERE / "data" / "cc_mgr.pid"
-LOG_FILE = HERE / "data" / "cc_mgr.log"
+# cc_mgr's own state (pidfile, log, search index); $CC_MGR_DATA_DIR relocates it,
+# e.g. off a slow network filesystem.
+DATA_DIR = Path(os.environ.get("CC_MGR_DATA_DIR") or HERE / "data").expanduser()
+LEGACY_PID_NAME = "cc_mgr.pid"  # pre-0.5 pidfile, which didn't record its host
 IS_WINDOWS = os.name == "nt"
+
+
+def _host_tag() -> str:
+    """This machine's short hostname, safe to use in a file name."""
+    name = socket.gethostname().split(".")[0] or "localhost"
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
+def _pid_file() -> Path:
+    # One pidfile per host: the repo (and data/) often lives on a filesystem
+    # every node mounts, and a PID only means something on the host that wrote it.
+    return DATA_DIR / f"cc_mgr.{_host_tag()}.pid"
+
+
+def _log_file() -> Path:
+    return DATA_DIR / f"cc_mgr.{_host_tag()}.log"
 
 # Sentinel default for --host: bind both loopback addresses (IPv4 127.0.0.1 and
 # IPv6 ::1) so both `localhost` and `127.0.0.1` work regardless of how the OS
 # resolves `localhost`, while staying loopback-only (not exposed to the network).
+# Note: loopback is still shared by every user on the same machine, hence the
+# access token.
 LOOPBACK = "loopback"
+LOOPBACK_NAMES = (LOOPBACK, "127.0.0.1", "::1", "localhost")
 
 
 def _display_host(host: str) -> str:
-    return "localhost" if host == LOOPBACK else host
+    if host == LOOPBACK:
+        return "localhost"
+    return f"[{host}]" if ":" in host else host
+
+
+def _url(host: str, port: int, token: str = "") -> str:
+    return f"http://{_display_host(host)}:{port}/" + (f"?token={token}" if token else "")
+
+
+def _security_env(host: str, token: str, read_only: bool) -> dict[str, str]:
+    """Env vars backend/app.py reads for access control."""
+    return {
+        "CC_MGR_TOKEN": token,
+        "CC_MGR_READ_ONLY": "1" if read_only else "",
+        # Host-header allowlist (DNS-rebinding guard) only makes sense when the
+        # server is reachable solely through loopback names.
+        "CC_MGR_ALLOWED_HOSTS": "localhost,127.0.0.1,::1" if host in LOOPBACK_NAMES else "",
+    }
 
 
 # ---------------------------------------------------------------------------
 # PID-file helpers
 # ---------------------------------------------------------------------------
 
-def _write_pidfile(pid: int, host: str, port: int) -> None:
-    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(
-        json.dumps({"pid": pid, "host": host, "port": port}), encoding="utf-8"
-    )
+def _secure_state() -> None:
+    """Make cc_mgr's own state private before serving: the data dir (pidfiles,
+    logs, the search index — a copy of every conversation) and the exports.
+    Fresh files are created that way; this also tightens what an older
+    version left world-readable. Shared sticky dirs (e.g. /tmp) are left alone.
+    """
+    exports = Path(os.environ.get("CC_MGR_EXPORT_DIR") or HERE / "exports").expanduser()
+    for root, pattern in ((DATA_DIR, "cc_mgr*"), (exports, "**/*")):
+        if not root.is_dir():
+            continue
+        try:
+            st = root.stat()
+            if IS_WINDOWS or st.st_uid != os.getuid() or st.st_mode & stat.S_ISVTX:
+                continue
+            os.chmod(root, 0o700)
+            for p in root.glob(pattern):
+                if p.is_symlink():
+                    continue
+                os.chmod(p, 0o700 if p.is_dir() else 0o600)
+        except OSError:
+            continue
 
 
-def _read_pidfile() -> dict | None:
-    if not PID_FILE.is_file():
+def _write_pidfile(pid: int, host: str, port: int, token: str = "") -> None:
+    path = _pid_file()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The pidfile holds the access token: create it owner-only, never via a symlink.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"pid": pid, "host": host, "port": port, "token": token,
+                   "hostname": _host_tag(), "start": _proc_start(pid)}, fh)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _read_pidfile(path: Path | None = None) -> dict | None:
+    path = path or _pid_file()
+    if not path.is_file():
         return None
     try:
-        return json.loads(PID_FILE.read_text(encoding="utf-8"))
+        info = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+    return info if isinstance(info, dict) and isinstance(info.get("pid"), int) else None
 
 
-def _clear_pidfile() -> None:
+def _clear_pidfile(path: Path | None = None) -> None:
     try:
-        PID_FILE.unlink()
+        (path or _pid_file()).unlink()
     except FileNotFoundError:
         pass
+
+
+def _other_pidfiles() -> list[tuple[str, dict]]:
+    """Pidfiles this host can't check: other hosts' and the legacy host-less one."""
+    out: list[tuple[str, dict]] = []
+    if not DATA_DIR.is_dir():
+        return out
+    mine = _pid_file().name
+    for p in sorted(DATA_DIR.glob("cc_mgr*.pid")):
+        info = _read_pidfile(p)
+        if p.name == mine or not info:
+            continue
+        host = "an unknown host (old cc_mgr)" if p.name == LEGACY_PID_NAME \
+            else p.name[len("cc_mgr."):-len(".pid")]
+        out.append((host, info))
+    return out
 
 
 def _pid_alive(pid: int) -> bool:
@@ -85,6 +180,109 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _run_quiet(cmd: list[str], timeout: float = 5) -> str:
+    """stdout of a short helper command; "" if it can't be run."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _split_windows_cmdline(cmdline: str) -> list[str]:
+    """argv from a Windows command line (quoted paths may contain spaces)."""
+    try:
+        parts = shlex.split(cmdline, posix=False)
+    except ValueError:  # unbalanced quotes: unverifiable
+        return []
+    return [p[1:-1] if len(p) > 1 and p[0] == p[-1] == '"' else p for p in parts]
+
+
+def _proc_info(pid: int) -> tuple[int | str | None, list[str]]:
+    """(start time, argv) of a process on this host; (None, []) if unreadable.
+
+    The start time is recorded in the pidfile, so a PID that was reused since
+    doesn't match. Linux: /proc (clock ticks since boot, exact argv). Windows:
+    CIM (creation time, command line). macOS/BSD: ps (lstart, command; ps
+    doesn't quote, so a path containing spaces isn't recognized and `stop`
+    refuses rather than guess).
+    """
+    if _has_proc():
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            # field 22 (starttime); fields after "(comm)" start at field 3
+            start = int(stat_line.rsplit(")", 1)[1].split()[19])
+        except (OSError, IndexError, ValueError):
+            return None, []
+        return start, [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    if IS_WINDOWS:  # tasklist can't show command lines; ask CIM
+        script = (f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; "
+                  "if ($p) { $p.CreationDate.ToUniversalTime().Ticks; $p.CommandLine }")
+        lines = _run_quiet(["powershell", "-NoProfile", "-Command", script], timeout=15).strip().splitlines()
+        if len(lines) < 2:
+            return None, []
+        return lines[0].strip() or None, _split_windows_cmdline(lines[1].strip())
+    start = _run_quiet(["ps", "-o", "lstart=", "-p", str(pid)]).strip()
+    return start or None, _run_quiet(["ps", "-o", "command=", "-p", str(pid)]).split()
+
+
+def _proc_start(pid: int) -> int | str | None:
+    return _proc_info(pid)[0]
+
+
+# Interpreter long options that take the next argument as their value.
+_PY_LONG_OPTS_WITH_VALUE = {"--check-hash-based-pycs"}
+
+
+def _looks_like_server(argv: list[str]) -> bool:
+    """argv of a Python interpreter running cc-mgr.py with the `run` command —
+    not merely a process that mentions the file (an editor, `python -c …`)."""
+    def base(arg: str) -> str:
+        return arg.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+    if not argv or not base(argv[0]).startswith("python"):
+        return False
+    i = 1
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+        opt = argv[i]
+        i += 1
+        if opt == "--":
+            break
+        if opt.startswith("--"):
+            if opt in _PY_LONG_OPTS_WITH_VALUE:
+                i += 1
+            continue
+        for j, ch in enumerate(opt[1:], 1):  # a group like -u, -uB, -Wignore, -X utf8
+            if ch in "cm":  # -c code / -m module: no script runs
+                return False
+            if ch in "WX":  # takes the rest of the group, else the next argument
+                if j == len(opt) - 1:
+                    i += 1
+                break
+    return i + 1 < len(argv) and base(argv[i]) == "cc-mgr.py" and argv[i + 1] == "run"
+
+
+def _has_proc() -> bool:
+    return Path("/proc/self/cmdline").exists()
+
+
+def _is_cc_mgr_process(pid: int, start: int | str | None = None) -> bool:
+    """True only if pid is alive here AND is a cc_mgr server we started.
+
+    A pidfile can outlive its server and the PID can be reused by anything,
+    so a bare "is the PID alive" check could make `stop` signal an unrelated
+    process. The command line must be `python [opts] …/cc-mgr.py run …` and,
+    when the pidfile recorded one, the process start time must match. If
+    identity can't be established, the answer is no.
+    """
+    if not _pid_alive(pid):
+        return False
+    actual_start, argv = _proc_info(pid)
+    if not _looks_like_server(argv):
+        return False
+    return start is None or actual_start == start
+
+
 def _terminate(pid: int) -> None:
     """Terminate a process (and its children, e.g. uvicorn --reload workers)."""
     if IS_WINDOWS:
@@ -99,7 +297,7 @@ def _terminate(pid: int) -> None:
     except (ProcessLookupError, PermissionError):
         try:
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
 
@@ -195,7 +393,8 @@ def _loopback_sockets(port: int) -> list[socket.socket]:
     return socks
 
 
-def _serve(host: str, port: int, reload: bool, auto_port: bool = False) -> None:
+def _serve(host: str, port: int, reload: bool, auto_port: bool = False,
+           no_token: bool = False, read_only: bool = False) -> None:
     """Run uvicorn in the foreground (blocking). Manages the pidfile."""
     # Ensure imports + data paths resolve regardless of the caller's cwd.
     os.chdir(HERE)
@@ -217,10 +416,20 @@ def _serve(host: str, port: int, reload: bool, auto_port: bool = False) -> None:
         else:
             _die_port_in_use(port, holder)
 
-    _write_pidfile(os.getpid(), host, port)
-    print(f"cc_mgr serving on http://{_display_host(host)}:{port}  "
-          f"(pid {os.getpid()})")
-    print("Press Ctrl+C to stop." if sys.stdout.isatty() else "")
+    token = "" if no_token else (os.environ.get("CC_MGR_TOKEN") or secrets.token_urlsafe(24))
+    os.environ.update(_security_env(host, token, read_only))
+    _secure_state()
+    if not token:
+        exposure = ("anyone who can reach it over the network" if host not in LOOPBACK_NAMES
+                    else "every user logged into this machine")
+        print(f"WARNING: --no-token: the API is open to {exposure}.", file=sys.stderr)
+    elif host not in LOOPBACK_NAMES:
+        print("WARNING: serving on a non-loopback address over plain HTTP; the token "
+              "travels unencrypted. Prefer the default bind plus `ssh -L`.", file=sys.stderr)
+
+    _write_pidfile(os.getpid(), host, port, token)
+    print(_banner(host, port, token, read_only, sys.stdout.isatty()))
+    print("Press Ctrl+C to stop." if sys.stdout.isatty() else "", flush=True)
     try:
         # The dual-loopback default needs two listening sockets, which the
         # uvicorn.run() convenience can't express — drive a Server directly.
@@ -235,6 +444,30 @@ def _serve(host: str, port: int, reload: bool, auto_port: bool = False) -> None:
             uvicorn.run("backend.app:app", host=bind, port=port, reload=reload)
     finally:
         _clear_pidfile()
+
+
+def _banner(host: str, port: int, token: str, read_only: bool, tty: bool) -> str:
+    """Startup line. The token stays out of logs: a background server's stdout
+    is a log file (`run --background` / `status` print the full URL from the
+    0600 pidfile instead)."""
+    shown = _url(host, port, token) if tty else (
+        _url(host, port) + ("?token=<see `cc-mgr.py status`>" if token else ""))
+    return (f"cc_mgr serving on {shown}  (pid {os.getpid()})"
+            + ("  [read-only]" if read_only else ""))
+
+
+def _open_log() -> int:
+    """Append-only fd for the background log, owner-only even if an older run
+    left a world-readable log behind."""
+    log_file = _log_file()
+    log_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                 0o600)
+    try:
+        os.chmod(log_file, 0o600)
+    except OSError:
+        pass
+    return fd
 
 
 def _die_port_in_use(port: int, holder: str | None, no_alt: bool = False) -> None:
@@ -252,16 +485,17 @@ def _die_port_in_use(port: int, holder: str | None, no_alt: bool = False) -> Non
 
 def cmd_run(args: argparse.Namespace) -> int:
     existing = _read_pidfile()
-    if existing and _pid_alive(existing["pid"]):
-        print(f"cc_mgr already running (pid {existing['pid']} on "
-              f"http://{_display_host(existing['host'])}:{existing['port']}). "
+    if existing and _is_cc_mgr_process(existing["pid"], existing.get("start")):
+        print(f"cc_mgr already running on {_host_tag()} (pid {existing['pid']} on "
+              f"{_url(existing['host'], existing['port'], existing.get('token', ''))}). "
               f"Use `stop` first.")
         return 1
     if existing:
         _clear_pidfile()  # stale
 
     if not args.background:
-        _serve(args.host, args.port, args.reload, auto_port=args.auto_port)
+        _serve(args.host, args.port, args.reload, auto_port=args.auto_port,
+               no_token=args.no_token, read_only=args.read_only)
         return 0
 
     # --- background: spawn a detached copy running in the foreground ---
@@ -271,67 +505,86 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd.append("--reload")
     if args.auto_port:
         cmd.append("--auto-port")
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    logf = open(LOG_FILE, "ab")
-    if IS_WINDOWS:
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf,
-                                stdin=subprocess.DEVNULL, creationflags=flags,
-                                close_fds=True, cwd=str(HERE))
-    else:
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf,
-                                stdin=subprocess.DEVNULL, start_new_session=True,
-                                close_fds=True, cwd=str(HERE))
+    if args.no_token:
+        cmd.append("--no-token")
+    if args.read_only:
+        cmd.append("--read-only")
+    log_file = _log_file()
+    with os.fdopen(_open_log(), "ab") as logf:  # the child keeps its own copy of the fd
+        if IS_WINDOWS:
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(cmd, stdout=logf, stderr=logf,
+                             stdin=subprocess.DEVNULL, creationflags=flags,
+                             close_fds=True, cwd=str(HERE))
+        else:
+            subprocess.Popen(cmd, stdout=logf, stderr=logf,
+                             stdin=subprocess.DEVNULL, start_new_session=True,
+                             close_fds=True, cwd=str(HERE))
     # The child writes its own pidfile at startup; give it a moment, then verify.
     time.sleep(1.5)
     info = _read_pidfile()
-    if info and _pid_alive(info["pid"]):
+    if info and _is_cc_mgr_process(info["pid"], info.get("start")):
         print(f"cc_mgr started in background (pid {info['pid']}) on "
-              f"http://{_display_host(args.host)}:{args.port}")
-        print(f"Logs: {LOG_FILE}")
+              f"{_url(info['host'], info['port'], info.get('token', ''))}")
+        print(f"Logs: {log_file}")
         print("Stop it with:  python cc-mgr.py stop")
         return 0
-    print(f"Failed to start in background. Check {LOG_FILE}.")
+    print(f"Failed to start in background. Check {log_file}.")
     return 1
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    info = _read_pidfile()
+    host = _host_tag()
+    path = _pid_file()
+    info = _read_pidfile(path)
     if not info:
-        print("No cc_mgr pidfile found — nothing to stop "
-              "(was it started by this script?).")
-        return 1
-    pid = info["pid"]
-    if not _pid_alive(pid):
-        print(f"cc_mgr not running (stale pidfile for pid {pid}); cleaning up.")
-        _clear_pidfile()
+        # An older cc_mgr wrote a host-less pidfile; only trust it if its PID
+        # is provably a cc_mgr process on *this* host.
+        legacy = DATA_DIR / LEGACY_PID_NAME
+        linfo = _read_pidfile(legacy)
+        if linfo and _is_cc_mgr_process(linfo["pid"], linfo.get("start")):
+            info, path = linfo, legacy
+        else:
+            print(f"No cc_mgr pidfile for this host ({host}) — nothing to stop "
+                  "(was it started by this script?).")
+            for other, oinfo in _other_pidfiles():
+                print(f"  A pidfile from {other} lists pid {oinfo['pid']}; "
+                      "run `stop` on that machine.")
+            return 1
+    pid, start = info["pid"], info.get("start")
+    if not _is_cc_mgr_process(pid, start):
+        print(f"cc_mgr not running on {host} (stale pidfile for pid {pid}); cleaning up.")
+        _clear_pidfile(path)
         return 0
     print(f"Stopping cc_mgr (pid {pid})…")
     _terminate(pid)
     # wait briefly for it to die
     for _ in range(20):
-        if not _pid_alive(pid):
+        if not _is_cc_mgr_process(pid, start):
             break
         time.sleep(0.1)
-    if _pid_alive(pid):
+    if _is_cc_mgr_process(pid, start):
         print(f"Process {pid} did not exit; you may need to kill it manually.")
         return 1
-    _clear_pidfile()
+    _clear_pidfile(path)
     print("Stopped.")
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    host = _host_tag()
     info = _read_pidfile()
-    if info and _pid_alive(info["pid"]):
-        print(f"cc_mgr running (pid {info['pid']}) on "
-              f"http://{_display_host(info['host'])}:{info['port']}")
-        return 0
-    if info:
-        print("cc_mgr not running (stale pidfile present).")
+    if info and _is_cc_mgr_process(info["pid"], info.get("start")):
+        print(f"cc_mgr running on {host} (pid {info['pid']}) on "
+              f"{_url(info['host'], info['port'], info.get('token', ''))}")
+        rc = 0
     else:
-        print("cc_mgr not running.")
-    return 1
+        print(f"cc_mgr not running on {host}" + (" (stale pidfile present)." if info else "."))
+        rc = 1
+    for other, oinfo in _other_pidfiles():
+        print(f"  pidfile from {other}: pid {oinfo['pid']}, port {oinfo.get('port')} "
+              "(not checked from this host)")
+    return rc
 
 
 def main() -> int:
@@ -351,6 +604,11 @@ def main() -> int:
                        help="detach and run in the background")
     p_run.add_argument("--auto-port", action="store_true",
                        help="if --port is taken, try the next free one")
+    p_run.add_argument("--read-only", action="store_true",
+                       help="disable every endpoint that writes or deletes data")
+    p_run.add_argument("--no-token", action="store_true",
+                       help="serve the API without an access token (unsafe on "
+                            "shared machines: loopback is shared by all users)")
     p_run.set_defaults(func=cmd_run)
 
     p_stop = sub.add_parser("stop", help="stop a server started by this script")

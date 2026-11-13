@@ -26,7 +26,7 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, context_limit_for, iter_jsonl, read_doc_file,
+    SessionSummary, context_window, iter_jsonl, read_doc_file,
     read_git_info, save_doc_file,
 )
 
@@ -142,6 +142,10 @@ class CodexAdapter(AgentAdapter):
     def _home(self) -> Path:
         return codex_home()
 
+    def has_data(self) -> bool:
+        root = self._home() / "sessions"
+        return root.is_dir() and any(root.rglob("rollout-*.jsonl"))
+
     def _project_map(self) -> dict[str, list[Path]]:
         """mangled-cwd -> [session paths]."""
         out: dict[str, list[Path]] = {}
@@ -186,9 +190,13 @@ class CodexAdapter(AgentAdapter):
             user_turns = asst_turns = msg_count = 0
             first = last = ""
             cwd = ""
+            model = ""
             for rec in iter_jsonl(s):
                 if rec.get("type") == "session_meta":
                     cwd = (rec.get("payload") or {}).get("cwd", "") or cwd
+                    continue
+                if rec.get("type") == "turn_context":
+                    model = (rec.get("payload") or {}).get("model") or model
                     continue
                 turn = _envelope_to_turn(rec)
                 if not turn:
@@ -211,8 +219,9 @@ class CodexAdapter(AgentAdapter):
                 first_prompt=first, last_prompt=last, message_count=msg_count,
                 user_turns=user_turns, assistant_turns=asst_turns,
                 cwd=cwd, git_branch="", context_tokens=ctx, agent="codex",
+                model=model,
             )
-            win = context_limit_for(ctx)
+            win = context_window(model, ctx)
             summ.context_limit = win["limit"]
             summ.context_limit_known = win["known"]
             out.append(summ)

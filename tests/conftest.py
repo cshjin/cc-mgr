@@ -5,10 +5,82 @@ resolve into the tmp tree instead of the real ~/. No real user data touched.
 """
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
+
+# Every env var an adapter consults to find real user data.
+AGENT_ENV_VARS = (
+    "CLAUDE_HOME", "CLAUDE_CONFIG_DIR", "AGY_HOME", "ANTIGRAVITY_HOME",
+    "ANTIGRAVITY_CLI_HOME", "GEMINI_HOME", "CODEX_HOME", "COPILOT_HOME",
+    "OPENCODE_DB", "OPENCODE_BASE", "XDG_DATA_HOME", "CC_MGR_TOKEN",
+    "CC_MGR_READ_ONLY", "CC_MGR_ALLOWED_HOSTS",
+)
+# Pointed at (empty) sandbox paths, so no adapter falls back to a real home.
+AGENT_ROOT_VARS = ("CLAUDE_HOME", "AGY_HOME", "GEMINI_HOME", "CODEX_HOME",
+                   "COPILOT_HOME", "OPENCODE_DB")
+AGENT_CLIS = {"opencode", "agy", "claude", "codex", "copilot", "gemini"}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_real_agent_data(tmp_path_factory, monkeypatch):
+    """Never let a test read real agent data or run a real agent CLI.
+
+    Autouse fixtures run before the per-agent fixtures below, which then point
+    their own env var at a synthetic home. Every other agent root points into
+    an empty sandbox, and so do HOME / USERPROFILE / Path.home() (Windows
+    resolves ~ from USERPROFILE) and XDG_DATA_HOME. Agent CLIs are hidden
+    from shutil.which and refused by subprocess.run.
+    """
+    sandbox = tmp_path_factory.mktemp("no_real_data")
+    for var in AGENT_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    for var in AGENT_ROOT_VARS:
+        monkeypatch.setenv(var, str(sandbox / f"unset_{var.lower()}"))
+    home = sandbox / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(sandbox / "xdg_data"))
+    # cc_mgr's own state (search index, exports) must never land in the repo.
+    monkeypatch.setenv("CC_MGR_DATA_DIR", str(sandbox / "cc_mgr_data"))
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(sandbox / "exports"))
+    from backend import index_db
+    monkeypatch.setattr(index_db, "db_path", lambda: sandbox / "cc_mgr.db")
+
+    real_which = shutil.which
+
+    def which(cmd, *args, **kwargs):
+        if Path(str(cmd)).name in AGENT_CLIS:
+            return None
+        return real_which(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "which", which)
+
+    real_run = subprocess.run
+
+    def run(args, *a, **kw):
+        argv0 = args[0] if isinstance(args, (list, tuple)) else str(args).split()[0]
+        if Path(str(argv0)).name in AGENT_CLIS:
+            raise AssertionError(f"test tried to run a real agent CLI: {args!r}")
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+@pytest.fixture
+def launcher(tmp_path, monkeypatch):
+    """cc-mgr.py loaded as a module, with its data dir (pidfiles, logs) in tmp."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "cc_mgr_launcher", Path(__file__).resolve().parent.parent / "cc-mgr.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "DATA_DIR", tmp_path / "data")
+    return mod
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -131,6 +203,72 @@ def empty_codex_home(tmp_path, monkeypatch):
 def copilot_home(tmp_path, monkeypatch):
     home = tmp_path / "copilot"
     (home / "ide").mkdir(parents=True)
+    monkeypatch.setenv("COPILOT_HOME", str(home))
+    return home
+
+
+@pytest.fixture
+def copilot_store_home(tmp_path, monkeypatch):
+    """GitHub Copilot CLI layout: session-store.db + session-state/<id>/events.jsonl."""
+    home = tmp_path / "copilot_store"
+    cwd1, cwd2 = tmp_path / "repo_cp", tmp_path / "repo_cp2"
+    cwd1.mkdir()
+    cwd2.mkdir()
+    (cwd1 / "AGENTS.md").write_text("# Copilot agents doc\nkappa\n", encoding="utf-8")
+    home.mkdir()
+    conn = sqlite3.connect(home / "session-store.db")
+    conn.executescript("""
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, repository TEXT, host_type TEXT,
+                               branch TEXT, summary TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE turns (id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER,
+                            user_message TEXT, assistant_response TEXT, timestamp TEXT);
+        CREATE TABLE assistant_usage_events (id INTEGER PRIMARY KEY, session_id TEXT,
+                            turn_index INTEGER, model TEXT, input_tokens INTEGER,
+                            output_tokens INTEGER, cache_read_tokens INTEGER, created_at TEXT);
+    """)
+    conn.execute("INSERT INTO sessions VALUES ('aaaa-1', ?, 'me/repo', 'github', 'main', "
+                 "'Fix the build', '2026-11-01T00:00:00.000Z', '2026-11-01T01:00:00.000Z')", (str(cwd1),))
+    conn.execute("INSERT INTO sessions VALUES ('bbbb-2', ?, 'me/repo', 'github', 'dev', "
+                 "'DB only', '2026-11-02T00:00:00.000Z', '2026-11-02T01:00:00.000Z')", (str(cwd1),))
+    conn.execute("INSERT INTO turns VALUES (1, 'aaaa-1', 0, 'please fix the build', NULL, "
+                 "'2026-11-01T00:00:01.000Z')")
+    conn.execute("INSERT INTO turns VALUES (2, 'bbbb-2', 0, 'db prompt', NULL, '2026-11-02T00:00:01.000Z')")
+    conn.execute("INSERT INTO turns VALUES (3, 'bbbb-2', 1, 'second', 'db reply', '2026-11-02T00:00:02.000Z')")
+    conn.execute("INSERT INTO assistant_usage_events VALUES (1, 'bbbb-2', 1, 'gemini-4-argon', "
+                 "45243, 391, 42740, '2026-11-02T00:00:03.000Z')")
+    conn.commit()
+    conn.close()
+
+    def events(sid, cwd, evs):
+        d = home / "session-state" / sid
+        d.mkdir(parents=True)
+        start = {"type": "session.start", "timestamp": "2026-11-01T00:00:00.000Z",
+                 "data": {"sessionId": sid, "context": {"cwd": str(cwd), "branch": "main"}}}
+        (d / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [start, *evs]),
+                                        encoding="utf-8")
+
+    events("aaaa-1", cwd1, [
+        {"type": "user.message", "id": "u1", "timestamp": "2026-11-01T00:00:01.000Z",
+         "data": {"content": "please fix the build", "attachments": []}},
+        {"type": "assistant.message", "id": "a1", "timestamp": "2026-11-01T00:00:02.000Z",
+         "data": {"model": "claude-sonnet-5.5", "reasoningText": "look at make", "content": "On it.",
+                  "toolRequests": [{"toolCallId": "t1", "name": "bash", "arguments": {"command": "make"}}]}},
+        {"type": "tool.execution_complete", "id": "r1",
+         "data": {"toolCallId": "t1", "success": True, "result": {"content": "build ok"}}},
+        {"type": "tool.execution_complete", "id": "r2",
+         "data": {"toolCallId": "t2", "success": False, "error": {"message": "permission denied"}}},
+        {"type": "session.usage_record",
+         "data": {"usage": {"model": "claude-sonnet-5.5", "inputTokens": 249_000, "outputTokens": 1_000}}},
+        {"type": "session.compaction_complete", "id": "c1",
+         "data": {"success": True, "summaryContent": "summary of earlier work"}},
+        {"type": "session.usage_record",
+         "data": {"usage": {"model": "claude-sonnet-5.5", "inputTokens": 50_000, "outputTokens": 100}}},
+        {"type": "system.message", "id": "s1", "data": {"content": "mode changed"}},
+        {"type": "assistant.turn_end", "data": {}},
+    ])
+    events("cccc-3", cwd2, [
+        {"type": "user.message", "id": "u9", "data": {"content": "events only"}},
+    ])
     monkeypatch.setenv("COPILOT_HOME", str(home))
     return home
 
@@ -345,6 +483,113 @@ def opencode_home(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
 
+    monkeypatch.setenv("OPENCODE_DB", str(db_file))
+    return home
+
+
+@pytest.fixture
+def opencode_v2_home(tmp_path, monkeypatch):
+    """An OpenCode v2 database shaped like the real one (2.2.7).
+
+    session_v2 + session_message (parts inlined in data.content), an empty-ish
+    session_part, and the legacy v1 tables that v2 keeps after migrating.
+    """
+    home = tmp_path / "opencode_v2"
+    home.mkdir()
+    cwd = tmp_path / "repo_oc2"
+    cwd.mkdir()
+    (cwd / "AGENTS.md").write_text("# OpenCode v2 doc\nzeta\n", encoding="utf-8")
+    db_file = home / "opencode.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript("""
+        CREATE TABLE session_v2 (
+            id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, slug TEXT,
+            directory TEXT NOT NULL, title TEXT, version TEXT, model TEXT, agent TEXT,
+            tokens_input INTEGER DEFAULT 0, tokens_output INTEGER DEFAULT 0,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER);
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+            seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE session_part (
+            message_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+            type TEXT NOT NULL, call_id TEXT, time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL, data TEXT NOT NULL,
+            PRIMARY KEY (message_id, ordinal));
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, directory TEXT, title TEXT,
+            model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                              time_updated INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                           time_created INTEGER, time_updated INTEGER, data TEXT);
+        CREATE TABLE todo (session_id TEXT, content TEXT, status TEXT, priority TEXT,
+                           position INTEGER, time_created INTEGER, time_updated INTEGER);
+    """)
+    t0 = 1_790_000_000_000
+    claude = {"id": "claude-opus-5.5", "providerID": "github-copilot", "variant": "max"}
+    gpt = {"id": "gpt-6-astra", "providerID": "github-copilot", "variant": "max"}
+    sessions = [
+        ("ses_v2_parent", None, "V2 Parent", json.dumps(claude), t0, t0 + 9000, None),
+        ("ses_v2_child", "ses_v2_parent", "Subagent run", json.dumps(gpt), t0 + 100, t0 + 500, None),
+        ("ses_old", None, "Migrated v1", json.dumps(claude), t0 - 50_000, t0 - 40_000, None),
+        ("ses_archived", None, "Archived", json.dumps(claude), t0, t0 + 1, t0 + 2),
+    ]
+    for sid, parent, title, model, created, updated, archived in sessions:
+        conn.execute(
+            "INSERT INTO session_v2 (id, parent_id, directory, title, model, tokens_input, "
+            "tokens_output, time_created, time_updated, time_archived) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (sid, parent, str(cwd), title, model, 36, 99, created, updated, archived))
+    conn.execute("INSERT INTO session (id, directory, title, time_created, time_updated) "
+                 "VALUES ('ses_old', ?, 'Migrated v1', ?, ?)", (str(cwd), t0 - 50_000, t0 - 40_000))
+    conn.execute("INSERT INTO todo VALUES ('ses_old', 'legacy task', 'pending', 'high', 0, ?, ?)",
+                 (t0, t0))
+
+    def msg(sid, seq, mtype, data, mid=None):
+        conn.execute("INSERT INTO session_message VALUES (?,?,?,?,?,?,?)",
+                     (mid or f"msg_{sid}_{seq}", sid, mtype, seq, t0 + seq, t0 + seq, json.dumps(data)))
+
+    p = "ses_v2_parent"
+    msg(p, 1, "user", {"text": "hello v2", "files": [
+        {"name": "paper.pdf", "mime": "application/pdf", "data": "JVBERi0xLjUK",
+         "source": {"type": "inline"}}]})
+    msg(p, 2, "assistant", {"model": gpt, "content": [
+        {"type": "reasoning", "text": "thinking v2"},
+        {"type": "text", "text": "answer v2"},
+        {"type": "tool", "id": "t1", "name": "shell", "state": {
+            "status": "completed", "input": {"command": "ls"},
+            "content": [{"type": "text", "text": "a.py\nb.py"},
+                        {"type": "file", "uri": "data:image/png;base64,AAAA", "mime": "image/png"}]}},
+        {"type": "tool", "id": "t2", "name": "read", "state": {
+            "status": "error", "input": {"path": "/nope"},
+            "error": {"type": "tool.execution", "message": "File not found: /nope"}}},
+    ], "tokens": {"input": 5, "output": 7, "reasoning": 0, "cache": {"read": 1000, "write": 10}}})
+    msg(p, 3, "idle", {"outcome": "succeeded"})
+    msg(p, 4, "compaction", {"summary": "## Objective\nsummary text", "reason": "auto", "model": claude,
+                             "tokens": {"input": 250000, "output": 100, "cache": {"read": 0, "write": 0}}})
+    msg(p, 5, "synthetic", {"text": "<shell id=\"sh_1\">done</shell>", "description": "bg"})
+    msg(p, 6, "model-switched", {"model": claude, "previous": gpt})
+    msg(p, 7, "user", {"text": "second prompt", "files": []})
+    msg(p, 8, "assistant", {"model": claude, "content": [{"type": "text", "text": "final answer"}],
+                            "tokens": {"input": 2, "output": 3, "cache": {"read": 150000, "write": 10}}})
+    # still running: no tokens yet, so the context comes from seq 8
+    msg(p, 9, "assistant", {"model": claude, "content": [
+        {"type": "tool", "name": "shell", "state": {"status": "running", "input": {"command": "sleep 1"}}}]})
+
+    c = "ses_v2_child"
+    msg(c, 1, "user", {"text": "sub task"})
+    msg(c, 2, "assistant", {"model": gpt, "content": [],
+                            "tokens": {"input": 1, "output": 1, "cache": {"read": 10, "write": 0}}},
+        mid="msg_child_answer")
+    conn.execute("INSERT INTO session_part VALUES ('msg_child_answer', ?, 0, 'text', NULL, ?, ?, ?)",
+                 (c, t0, t0, json.dumps({"type": "text", "text": "from session_part"})))
+
+    msg("ses_old", 1, "user", {"text": "old prompt"})
+    msg("ses_old", 2, "assistant", {"model": claude, "content": [{"type": "text", "text": "old answer"}],
+                                    "tokens": {"input": 1, "output": 1, "cache": {"read": 0, "write": 0}}})
+    conn.commit()
+    conn.close()
     monkeypatch.setenv("OPENCODE_DB", str(db_file))
     return home
 

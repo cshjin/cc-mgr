@@ -36,6 +36,11 @@ class AgentAdapter(ABC):
     @abstractmethod
     def list_projects(self) -> list[dict[str, Any]]: ...
 
+    def has_data(self) -> bool:
+        """Cheap check for "this agent has anything to show" (adapters override
+        it with a probe much lighter than listing every project)."""
+        return bool(self.list_projects())
+
     @abstractmethod
     def list_sessions(self, project: str) -> list[SessionSummary]: ...
 
@@ -103,7 +108,15 @@ def all_adapters() -> list[AgentAdapter]:
 
 
 def list_agents() -> list[dict[str, Any]]:
-    return [asdict(a.capabilities) for a in _REGISTRY.values()]
+    out = []
+    for a in _REGISTRY.values():
+        info = asdict(a.capabilities)
+        try:
+            info["has_data"] = a.has_data()
+        except Exception:  # noqa: BLE001 — a broken probe must not hide the agent list
+            info["has_data"] = False
+        out.append(info)
+    return out
 
 
 # Import + register concrete adapters (after class defs to avoid cycles).
@@ -117,6 +130,6 @@ from .copilot import CopilotAdapter    # noqa: E402
 _register(ClaudeAdapter())
 _register(AgyAdapter())
 _register(OpencodeAdapter())
-_register(GeminiAdapter())
 _register(CodexAdapter())
 _register(CopilotAdapter())
+_register(GeminiAdapter())  # legacy: Gemini CLI is retired, agy replaces it

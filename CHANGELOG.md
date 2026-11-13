@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.5.0 — 2026-11-13
+
+Review fixes (#5–#21); see #22 for the full list.
+
+Security
+- Path params are validated: crafted session ids (`..`, `*`) could wipe all Claude
+  transcripts or agy conversations through the delete endpoint (#5).
+- Access token for the API (printed by `cc-mgr.py run`), Host allowlist against DNS
+  rebinding, `--read-only` mode, CSP and hardening headers (#6).
+- `esc()` escapes quotes — no attribute injection via directory/artifact names (#7).
+
+OpenCode v2
+- Reads the v2 schema (`session_v2` + `session_message`): sessions created since
+  2026-10-06 were invisible (#9). Live DB read with `mode=ro` instead of
+  `immutable=1` (stale data, "database disk image is malformed") (#8).
+- Archive / delete go through OpenCode (`opencode api session.update`,
+  `opencode session delete`); other v2 DBs are read-only; DB discovery uses
+  `opencode debug paths` (#10).
+
+Agents
+- Antigravity (agy): CHECKPOINT / ERROR_MESSAGE / unknown steps are shown, real token
+  counts, no borrowed model name, reversible soft delete (#13).
+- Gemini CLI is retired: its adapter is legacy and read-only; agents with data lead
+  the dropdown (#14).
+- Copilot CLI: reads the real `session-store.db` + `session-state/*/events.jsonl` (#15).
+- Claude: cached session summaries (a 200 MB project opened in ~24 s), session titles,
+  document/image placeholders, empty sessions hidden (#17).
+- Context sizes from the last turn (OpenCode showed 42.7M tokens); the 200k/1M tier is
+  only claimed for Claude models (#11). Subagent sessions fold under their parent (#12).
+
+Search, UI, launcher, tests
+- Deleted sessions are pruned from the index; CJK search (trigram); highlight markers
+  no longer collide with brackets (#16). Kanban drags the right card (#18).
+- Per-host pidfile/log; `stop` never signals a process that isn't cc_mgr (#19).
+- Tests are isolated from real agent data and CLIs (#20). Docs refreshed; app version
+  0.5.0; `CC_MGR_DATA_DIR` / `CC_MGR_EXPORT_DIR` (#21).
+
+## v0.4.1 — 2026-10-02
+
+- OpenCode adapter (#4): sessions, tasks (todo table), AGENTS.md, export, archive/delete.
+
 ## v0.4.0 — 2026-09-09
 
 - Antigravity CLI (`agy`) support: full browsing of projects and sessions under `~/.gemini/antigravity-cli/`.

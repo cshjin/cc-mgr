@@ -47,3 +47,22 @@ def test_read_doc_file_absent(tmp_path):
     res = common.read_doc_file(str(base), "AGENTS.md")
     assert res["exists"] is False
     assert res["cwd"] == str(base)
+
+
+def test_read_git_info_keeps_slashes_in_branch_names(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/feature/foo\n", encoding="utf-8")
+    info = common.read_git_info(str(tmp_path))
+    assert info["branch"] == "feature/foo" and info["detached"] is False
+
+
+def test_data_and_export_dirs_follow_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("CC_MGR_DATA_DIR", str(tmp_path / "d"))
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(tmp_path / "e"))
+    assert common.data_dir() == tmp_path / "d"
+    assert common.default_export_dir("proj") == tmp_path / "e" / "proj"
+    assert (tmp_path / "e").stat().st_mode & 0o777 == 0o700  # exports hold conversations
+    monkeypatch.delenv("CC_MGR_DATA_DIR")
+    monkeypatch.delenv("CC_MGR_EXPORT_DIR")
+    assert common.data_dir() == common.REPO_DIR / "data"  # not the process's cwd
+    assert common.export_root() == common.REPO_DIR / "exports"

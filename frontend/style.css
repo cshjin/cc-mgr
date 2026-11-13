@@ -222,6 +222,9 @@ body {
 .badge.task-open { color: var(--amber); border-color: #d9a44144; }
 .badge.task-done { color: var(--green); border-color: #5fb87a44; }
 .badge.model { color: var(--accent); border-color: #d9775744; }
+.badge.sub { color: var(--fg-dim); }
+.session.child { border-left: 2px solid var(--border); }
+.subtoggle { float: right; text-transform: none; letter-spacing: 0; font-size: 12px; cursor: pointer; }
 
 /* context size bar */
 .ctxbar { margin-top: 9px; }
@@ -280,10 +283,12 @@ body {
 .turn.user .turn-head { background: var(--bg-soft); }
 .turn.assistant .turn-head { background: var(--bg-card); }
 .turn.tool .turn-head { background: var(--bg); }
+.turn.system .turn-head { background: var(--bg); }
 .turn-role { font-weight: 600; text-transform: capitalize; }
 .turn.user .turn-role { color: var(--blue); }
 .turn.assistant .turn-role { color: var(--accent); }
 .turn.tool .turn-role { color: var(--fg-faint); }
+.turn.system .turn-role { color: var(--amber); }
 .turn-preview { color: var(--fg-faint); font-size: 11.5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; flex: 1; }
 .turn-toks { font-size: 10.5px; color: var(--fg-faint); font-family: var(--mono); }
 .turn-caret { color: var(--fg-faint); transition: transform 0.15s; }
@@ -332,6 +337,7 @@ body {
 .editor.mem-editor { height: 240px; min-height: 120px; }
 .editor:focus { outline: none; border-color: var(--accent); }
 .editor[readonly] { opacity: 0.85; }
+.editor.readonly { white-space: pre-wrap; overflow: auto; margin: 0; }
 .editor-actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
 .editor-status { font-size: 11.5px; color: var(--green); margin-left: auto; }
 

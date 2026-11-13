@@ -7,17 +7,24 @@ Reads, on demand, from:
       <session-uuid>/...            per-session sidecar dirs
   ~/.claude/tasks/<session-uuid>/N.json   per-session tasks
 
-Nothing is mutated here; this module is read-only.
+Mutating operations (all path-guarded): task status, memory files,
+CLAUDE.md, session export, save-as-memory, and delete.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from .agents.common import (  # re-exported: store's public names stay importable
+    CTX_TIERS, STD_WINDOW, SessionSummary, context_limit_for as _context_limit_for,
+    context_window, default_export_dir, is_safe_id, is_safe_name, private_mkdir,
+    read_git_info, safe_join, write_private,
+)
 
 
 def claude_home() -> Path:
@@ -45,18 +52,46 @@ def tasks_dir() -> Path:
     return claude_home() / "tasks"
 
 
-def unmangle_path(folder_name: str) -> str:
-    """Best-effort recovery of the original cwd from a mangled folder name.
+def _project_dir(project: str) -> Path:
+    """projects/<project>, refusing names that could escape projects/."""
+    if not is_safe_name(project):
+        raise ValueError("invalid project name")
+    return safe_join(projects_dir(), project)
 
-    Claude mangles a path by replacing path separators (and ':') with '-'.
-    The transform is lossy (a literal '-' in the path is indistinguishable
-    from a separator), so this is display-only.
+
+def _session_id(session_id: str) -> str:
+    if not is_safe_id(session_id):
+        raise ValueError("invalid session id")
+    if session_id in _RESERVED_IDS:
+        raise ValueError(f"'{session_id}' is not a session id")
+    return session_id
+
+
+# Directory names inside a project folder that are not session sidecars: a
+# "session" called memory would make delete_session remove the shared memory.
+_RESERVED_IDS = {"memory"}
+
+
+def _transcript(project: str, session_id: str) -> Path:
+    """The session's transcript; FileNotFoundError if there is none."""
+    path = safe_join(_project_dir(project), f"{_session_id(session_id)}.jsonl")
+    if not path.is_file():
+        raise FileNotFoundError(f"session {session_id} not found in {project}")
+    return path
+
+
+def _task_dir(session_id: str) -> Path:
+    return safe_join(tasks_dir(), _session_id(session_id))
+
+
+def unmangle_path(folder_name: str) -> str:
+    """Display name for a project folder whose real cwd isn't known.
+
+    Claude mangles a path by replacing separators (and ':') with '-'. That is
+    lossy — a literal '-' is indistinguishable from a separator — so the
+    folder name is shown as-is rather than as a guessed path.
     """
-    name = folder_name
-    # Windows drive prefix like "G--My-Drive" -> "G:/My/Drive" is ambiguous;
-    # show a readable approximation.
-    name = name.replace("--", ":/", 1) if "--" in name else name
-    return name.replace("-", "/") if False else folder_name
+    return folder_name
 
 
 # Context-window tiers (tokens). Transcripts record only the resolved API model
@@ -65,8 +100,7 @@ def unmangle_path(folder_name: str) -> str:
 # The only thing we can assert from a transcript is a *lower bound*: if observed
 # usage crossed 200k, the window must be the 1M tier. Below 200k it's ambiguous
 # (could be a 200k model, or a 1M model that simply didn't fill up).
-CTX_TIERS = (200_000, 1_000_000)
-STD_WINDOW = 200_000
+# The constants and helpers live in agents.common, shared by every adapter.
 
 
 def context_limit_for(observed_tokens: int) -> dict[str, Any]:
@@ -76,51 +110,7 @@ def context_limit_for(observed_tokens: int) -> dict[str, Any]:
     (i.e. it exceeded the standard 200k window, so it must be the 1M variant).
     When False, `limit` is an assumed default (200k) for display, NOT a fact.
     """
-    if observed_tokens > STD_WINDOW * 0.98:
-        return {"limit": 1_000_000, "known": True}
-    return {"limit": STD_WINDOW, "known": False}
-
-
-def read_git_info(cwd: str | None) -> dict[str, Any] | None:
-    """Read repo name + current branch from <cwd>/.git without invoking git.
-
-    Returns None if cwd is missing or not a git working tree.
-    """
-    if not cwd:
-        return None
-    try:
-        root = Path(cwd)
-    except (TypeError, ValueError):
-        return None
-    git = root / ".git"
-    if not git.exists():
-        return None
-    branch = None
-    detached = False
-    head_file = git / "HEAD" if git.is_dir() else None
-    # Worktrees use a .git *file* pointing elsewhere; handle the common dir case.
-    if git.is_file():
-        try:
-            content = git.read_text(encoding="utf-8", errors="replace").strip()
-            if content.startswith("gitdir:"):
-                gitdir = Path(content.split(":", 1)[1].strip())
-                # The gitdir may be relative to the .git file's own directory.
-                if not gitdir.is_absolute():
-                    gitdir = (git.parent / gitdir).resolve()
-                head_file = gitdir / "HEAD"
-        except OSError:
-            head_file = None
-    if head_file and head_file.is_file():
-        try:
-            head = head_file.read_text(encoding="utf-8", errors="replace").strip()
-            if head.startswith("ref:"):
-                branch = head.split("/")[-1]
-            elif head:
-                branch = head[:8]
-                detached = True
-        except OSError:
-            pass
-    return {"repo": root.name, "branch": branch, "detached": detached}
+    return _context_limit_for(observed_tokens)
 
 
 def _peek_session_meta(path: Path, max_lines: int = 40) -> dict[str, Any]:
@@ -188,31 +178,6 @@ def _block_text(content: Any) -> str:
     return ""
 
 
-@dataclass
-class SessionSummary:
-    session_id: str
-    project: str
-    file: str
-    size_bytes: int
-    mtime: float
-    first_prompt: str = ""
-    last_prompt: str = ""
-    message_count: int = 0
-    user_turns: int = 0
-    assistant_turns: int = 0
-    context_tokens: int = 0  # peak observed context (input+cache+output) of last turn
-    context_limit: int = 200_000  # window size; assumed default unless context_limit_known
-    context_limit_known: bool = False  # True only when usage proves the tier
-    total_output_tokens: int = 0
-    model: str = ""
-    git_branch: str = ""
-    cwd: str = ""
-    has_memory: bool = False
-    open_tasks: int = 0
-    total_tasks: int = 0
-    title: str = ""
-
-
 def list_projects() -> list[dict[str, Any]]:
     """Project rows with cheap aggregates: latest activity, task progress, git.
 
@@ -270,21 +235,49 @@ def list_projects() -> list[dict[str, Any]]:
 
 
 def _scan_session(path: Path, project: str) -> SessionSummary:
-    """Single pass over a JSONL to build a lightweight summary."""
+    """Summary of one transcript, re-parsed only when the file changed.
+
+    Transcripts run to hundreds of MB and listing a project used to re-read
+    every one of them on each request (~24 s for a 100 MB project), so
+    summaries are cached by (path, mtime, size). Callers get a copy they may
+    modify (has_memory, task counts).
+    """
     stat = path.stat()
+    key = str(path)
+    hit = _SCAN_CACHE.get(key)
+    if not (hit and hit[0] == stat.st_mtime_ns and hit[1] == stat.st_size):
+        if len(_SCAN_CACHE) >= _SCAN_CACHE_MAX:
+            _SCAN_CACHE.clear()
+        hit = (stat.st_mtime_ns, stat.st_size, _scan_session_uncached(path, project, stat))
+        _SCAN_CACHE[key] = hit
+    return dataclasses.replace(hit[2], project=project)
+
+
+_SCAN_CACHE: dict[str, tuple[int, int, SessionSummary]] = {}
+_SCAN_CACHE_MAX = 4096
+
+
+def _scan_session_uncached(path: Path, project: str, stat: os.stat_result) -> SessionSummary:
+    """Single pass over a JSONL to build a lightweight summary."""
     summ = SessionSummary(
         session_id=path.stem,
         project=project,
         file=str(path),
         size_bytes=stat.st_size,
         mtime=stat.st_mtime,
+        agent="claude",
     )
     last_assistant_context = 0
     peak_assistant_context = 0
     first_user_seen = False
+    custom_title = ai_title = ""
     for rec in _iter_jsonl(path):
         rtype = rec.get("type")
-        if rtype == "user":
+        if rtype == "custom-title" and rec.get("customTitle"):
+            custom_title = rec["customTitle"]
+        elif rtype == "ai-title" and rec.get("aiTitle"):
+            ai_title = rec["aiTitle"]
+        elif rtype == "user":
             msg = rec.get("message", {})
             text = _block_text(msg.get("content"))
             # skip tool_result-only user records for prompt display
@@ -320,23 +313,27 @@ def _scan_session(path: Path, project: str) -> SessionSummary:
                 if ctx > peak_assistant_context:
                     peak_assistant_context = ctx
     summ.context_tokens = last_assistant_context
+    summ.title = custom_title or ai_title  # a name the user set beats the generated one
     # Tier is proven by the PEAK context ever reached, not the last turn: a
     # `compact` drops the live context below 200k, but if usage ever crossed
     # 200k the window must be the 1M tier — that fact must not be forgotten.
-    win = context_limit_for(peak_assistant_context)
+    # (Claude Code pointed at a non-Claude model via a proxy proves nothing.)
+    win = context_window(summ.model or "claude", peak_assistant_context)
     summ.context_limit = win["limit"]
     summ.context_limit_known = win["known"]
     return summ
 
 
 def list_sessions(project: str) -> list[SessionSummary]:
-    d = projects_dir() / project
+    d = _project_dir(project)
     if not d.is_dir():
         return []
     has_mem = (d / "memory").is_dir()
     sessions = []
     for f in d.glob("*.jsonl"):
         summ = _scan_session(f, project)
+        if summ.message_count == 0:
+            continue  # metadata-only transcript: nothing to open (it would 404)
         summ.has_memory = has_mem
         tdir = tasks_dir() / summ.session_id
         if tdir.is_dir():
@@ -363,7 +360,7 @@ def _count_tasks(tdir: Path) -> tuple[int, int]:
 
 
 def get_tasks(session_id: str) -> list[dict[str, Any]]:
-    tdir = tasks_dir() / session_id
+    tdir = _task_dir(session_id)
     if not tdir.is_dir():
         return []
     tasks = []
@@ -381,7 +378,9 @@ def update_task_status(session_id: str, task_id: str, status: str) -> dict[str, 
     valid = {"pending", "in_progress", "completed", "deleted"}
     if status not in valid:
         raise ValueError(f"invalid status: {status}")
-    jf = tasks_dir() / session_id / f"{task_id}.json"
+    if not is_safe_id(task_id):
+        raise ValueError("invalid task id")
+    jf = safe_join(_task_dir(session_id), f"{task_id}.json")
     if not jf.is_file():
         raise FileNotFoundError(f"task {task_id} not found for session {session_id}")
     data = json.loads(jf.read_text(encoding="utf-8"))
@@ -391,7 +390,7 @@ def update_task_status(session_id: str, task_id: str, status: str) -> dict[str, 
 
 
 def get_memory(project: str) -> dict[str, Any]:
-    mem_dir = projects_dir() / project / "memory"
+    mem_dir = _project_dir(project) / "memory"
     if not mem_dir.is_dir():
         return {"index": "", "index_path": "", "dir": str(mem_dir), "files": []}
     index = ""
@@ -424,16 +423,17 @@ def save_memory_file(project: str, name: str, content: str) -> Path:
         raise ValueError("invalid memory file name")
     if not name.endswith(".md"):
         raise ValueError("memory files must end in .md")
-    mem_dir = projects_dir() / project / "memory"
-    mem_dir.mkdir(parents=True, exist_ok=True)
-    out = mem_dir / name
+    # Anchored at projects/, so neither a symlinked memory/ dir nor a symlinked
+    # file can point the write outside the Claude data root.
+    out = safe_join(projects_dir(), _project_dir(project).name, "memory", name)
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content, encoding="utf-8")
     return out
 
 
 def _project_cwd(project: str) -> str:
     """Resolve the working directory for a project from its newest session."""
-    d = projects_dir() / project
+    d = _project_dir(project)
     sessions = sorted(d.glob("*.jsonl"), key=lambda s: s.stat().st_mtime, reverse=True)
     if not sessions:
         return ""
@@ -464,14 +464,14 @@ def save_claude_md(project: str, content: str) -> Path:
     base = Path(cwd)
     if not base.is_dir():
         raise FileNotFoundError(f"working directory does not exist: {cwd}")
-    path = base / "CLAUDE.md"
+    path = safe_join(base, "CLAUDE.md")  # refuses a CLAUDE.md symlinked outside the project
     path.write_text(content, encoding="utf-8")
     return path
 
 
 def project_tasks(project: str) -> list[dict[str, Any]]:
     """All tasks across all sessions in a project, tagged with their session id."""
-    d = projects_dir() / project
+    d = _project_dir(project)
     out: list[dict[str, Any]] = []
     for s in sorted(d.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
         for t in get_tasks(s.stem):
@@ -493,7 +493,7 @@ def get_conversation(
     prompts, keeping the viewer focused on prompts and responses. Returns
     {total, offset, limit, turns} so the UI can lazily page huge sessions.
     """
-    path = projects_dir() / project / f"{session_id}.jsonl"
+    path = safe_join(_project_dir(project), f"{_session_id(session_id)}.jsonl")
     if not path.is_file():
         return {"total": 0, "offset": offset, "limit": limit, "turns": []}
 
@@ -534,6 +534,7 @@ def get_conversation(
 
 def export_session_markdown(project: str, session_id: str) -> str:
     """Render a full session transcript to Markdown text."""
+    _transcript(project, session_id)  # unknown sessions are a 404, not an empty document
     data = get_conversation(project, session_id, offset=0, limit=None)
     lines = [f"# Session {session_id}", f"_Project: {project}_", ""]
     for t in data["turns"]:
@@ -563,13 +564,13 @@ def export_session_markdown(project: str, session_id: str) -> str:
 
 def export_session_to_file(project: str, session_id: str, out_dir: Path | None = None) -> Path:
     """Write the session export to exports/<project>/<session>.md and return the path."""
+    transcript = _transcript(project, session_id)
     if out_dir is None:
-        out_dir = Path.cwd() / "exports" / project
-    out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = default_export_dir(project)
+    private_mkdir(out_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_path = out_dir / f"{session_id}.{stamp}.md"
-    out_path.write_text(export_session_markdown(project, session_id), encoding="utf-8")
-    return out_path
+    out_path = out_dir / f"{transcript.stem}.{stamp}.md"
+    return write_private(out_path, export_session_markdown(project, session_id))
 
 
 def save_session_as_memory(project: str, session_id: str) -> Path:
@@ -620,13 +621,13 @@ def save_session_as_memory(project: str, session_id: str) -> Path:
             body.append(f"- [{t.get('status','?')}] {t.get('subject','(untitled)')}")
     body.append("")
 
-    mem_dir = projects_dir() / project / "memory"
-    mem_dir.mkdir(parents=True, exist_ok=True)
-    out = mem_dir / f"session_{short}.md"
+    mem_root = (projects_dir(), _project_dir(project).name, "memory")
+    out = safe_join(*mem_root, f"session_{short}.md")
+    idx = safe_join(*mem_root, "MEMORY.md")
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(body), encoding="utf-8")
 
     # register in MEMORY.md (create if absent)
-    idx = mem_dir / "MEMORY.md"
     line = f"- [Session {short}](session_{short}.md) — archived session summary saved by cc_mgr"
     if idx.is_file():
         existing = idx.read_text(encoding="utf-8")
@@ -644,10 +645,10 @@ def delete_session(project: str, session_id: str, hard: bool = False) -> dict[st
     <claude_home>/.cc_mgr_trash/<timestamp>/ so the action is reversible.
     Set hard=True to permanently remove instead.
     """
-    proj_dir = projects_dir() / project
-    jsonl = proj_dir / f"{session_id}.jsonl"
-    sidecar = proj_dir / session_id
-    tdir = tasks_dir() / session_id
+    proj_dir = _project_dir(project)
+    jsonl = _transcript(project, session_id)  # only sessions that exist can be deleted
+    sidecar = safe_join(proj_dir, session_id)
+    tdir = _task_dir(session_id)
 
     moved: list[str] = []
     if hard:
@@ -699,4 +700,9 @@ def _structured_blocks(content: Any) -> list[dict[str, Any]]:
         elif t == "tool_result":
             res = blk.get("content")
             out.append({"type": "tool_result", "text": _block_text(res)})
+        elif t in ("document", "image"):
+            # Never echo the inline base64; just say what was attached.
+            src = blk.get("source") if isinstance(blk.get("source"), dict) else {}
+            what = blk.get("title") or src.get("media_type") or t
+            out.append({"type": "text", "text": f"[{t}: {what}]"})
     return out
