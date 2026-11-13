@@ -16,24 +16,70 @@ Every line is an envelope {timestamp, type, payload}. `type` is one of:
 
 Sessions are grouped into projects by their cwd (mangled to a folder-like name).
 When the sessions dir is absent (machines that never ran codex), readers return [].
+
+Deletes go through the Codex CLI itself (verified with codex-cli 0.167.0):
+`codex archive <id>` moves the rollout to archived_sessions/ and flags the
+thread in state_*.sqlite (`codex unarchive <id>` restores it); `codex delete
+--force <id>` removes both. cc_mgr passes its own CODEX_HOME, so the CLI acts
+on exactly the data shown here.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import AgentAdapter, Capabilities
+from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
-    SessionSummary, context_window, iter_jsonl, read_doc_file,
+    SessionSummary, context_window, is_safe_id, iter_jsonl, read_doc_file,
     read_git_info, save_doc_file,
 )
+
+_UUID_AT_END = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
 def codex_home() -> Path:
     env = os.environ.get("CODEX_HOME")
     return Path(env).expanduser() if env else Path.home() / ".codex"
+
+
+def _thread_id(path: Path) -> str:
+    """A session's Codex id: session_meta.payload.id, else the UUID that ends
+    the rollout file name ("" if neither is a UUID)."""
+    for rec in iter_jsonl(path):
+        if rec.get("type") == "session_meta":
+            sid = (rec.get("payload") or {}).get("id")
+            if isinstance(sid, str) and _UUID_AT_END.fullmatch(sid):
+                return sid
+            break
+    m = _UUID_AT_END.search(path.stem)
+    return m.group(0) if m else ""
+
+
+def _codex_cli() -> str | None:
+    return shutil.which("codex")
+
+
+def _run_codex(args: list[str], home: Path) -> None:
+    """Run `codex <args>` against cc_mgr's CODEX_HOME; RuntimeError on failure."""
+    cli = _codex_cli()
+    if not cli:
+        raise UnsupportedCapability("the `codex` CLI isn't available here, so Codex sessions "
+                                    "can't be archived or deleted")
+    try:
+        proc = subprocess.run([cli, *args], capture_output=True, text=True, timeout=120,
+                              stdin=subprocess.DEVNULL, env={**os.environ, "CODEX_HOME": str(home)})
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"`codex {args[0]}` failed: {e}") from e
+    if proc.returncode != 0:
+        lines = [ln for ln in (proc.stderr or proc.stdout or "").strip().splitlines()
+                 if ln.strip() and not ln.startswith("WARNING:")]
+        raise RuntimeError(f"`codex {args[0]}` failed: "
+                           f"{lines[-1] if lines else f'exit {proc.returncode}'}")
 
 
 def _mangle(cwd: str) -> str:
@@ -136,7 +182,9 @@ class CodexAdapter(AgentAdapter):
     capabilities = Capabilities(
         agent_id="codex", label="Codex", doc_filename="AGENTS.md",
         has_memory=False, has_tasks=False, can_edit_doc=True,
-        can_delete=False, can_export=False,
+        can_delete=True, can_export=True,
+        delete_note=("Goes through the Codex CLI: a soft delete runs `codex archive` (undo with "
+                     "`codex unarchive <id>`), a permanent delete `codex delete`."),
     )
 
     def _home(self) -> Path:
@@ -268,3 +316,20 @@ class CodexAdapter(AgentAdapter):
 
     def save_doc(self, project, content):
         return save_doc_file(self._project_cwd(project), "AGENTS.md", content)
+
+    def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
+        if not is_safe_id(session_id):
+            raise ValueError("invalid session id")
+        path = self._session_path(project, session_id)
+        if path is None or not path.is_file():
+            raise FileNotFoundError(f"session {session_id} not found in {project}")
+        thread = _thread_id(path)
+        if not thread:
+            raise RuntimeError(f"can't tell the Codex id of {path.name}")
+        _run_codex(["delete", "--force", thread] if hard else ["archive", thread], self._home())
+        if path.exists():  # the CLI reported success: make sure it really acted
+            raise RuntimeError(f"Codex did not {'delete' if hard else 'archive'} session {thread}")
+        if hard:
+            return {"deleted": [str(path)], "trash": None, "note": "Deleted with `codex delete`."}
+        return {"deleted": [str(path)], "trash": "codex-archive",
+                "note": f"Archived in Codex; restore it with `codex unarchive {thread}`."}

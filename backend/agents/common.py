@@ -8,6 +8,7 @@ import re
 import sqlite3
 import stat
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -91,6 +92,74 @@ def default_export_dir(project: str) -> Path:
     if not is_safe_name(project):
         raise ValueError("invalid project name")
     return safe_join(private_mkdir(export_root()), project)
+
+
+def new_trash_dir(home: Path, name: str) -> Path:
+    """A fresh owner-only <home>/.cc_mgr_trash/<name>.<UTC stamp>/ for a soft
+    delete (name: a session id or project name, one path component)."""
+    root = private_mkdir(Path(home) / ".cc_mgr_trash")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path, n = safe_join(root, f"{name}.{stamp}"), 1
+    while path.exists():  # two deletes within the same second
+        path, n = safe_join(root, f"{name}.{stamp}.{n}"), n + 1
+    return private_mkdir(path)
+
+
+def pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists on this host. Never signals it
+    (on Windows os.kill(pid, 0) would terminate the process). When it can't
+    tell, it says alive: callers use it to refuse destructive actions."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import subprocess
+        try:
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                                 capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            return True
+        return str(pid) in out.split()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # PermissionError: it exists but belongs to someone else
+        return True
+    return True
+
+
+def _fenced(text: str, lang: str = "") -> str:
+    """A Markdown code fence that the text itself can't close early."""
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return f"{fence}{lang}\n{text}\n{fence}"
+
+
+def render_markdown(agent_label: str, project: str, session_id: str,
+                    turns: list[dict[str, Any]], title: str = "") -> str:
+    """A conversation (normalized turns, as get_conversation returns them) as
+    Markdown — the export format for adapters without a richer one."""
+    lines = [f"# Session: {title or session_id}", "",
+             f"- **Agent:** {agent_label}", f"- **Session ID:** `{session_id}`",
+             f"- **Project:** `{project}`", f"- **Turns:** {len(turns)}", "", "---", ""]
+    for t in turns:
+        ts = f" ({t['timestamp']})" if t.get("timestamp") else ""
+        lines += [f"### {str(t.get('role') or '?').capitalize()}{ts}", ""]
+        for b in t.get("blocks") or []:
+            bt = b.get("type")
+            if bt == "text":
+                lines.append(str(b.get("text", "")))
+            elif bt == "thinking":
+                lines.append("> **Thinking:**\n> " + str(b.get("text", "")).replace("\n", "\n> "))
+            elif bt == "tool_use":
+                args = json.dumps(b.get("input", {}), indent=2, ensure_ascii=False, default=str)
+                lines.append(f"**→ tool: {b.get('name', '')}**\n\n{_fenced(args, 'json')}")
+            elif bt == "tool_result":
+                lines.append(f"**tool result**\n\n{_fenced(str(b.get('text', '')))}")
+            lines.append("")
+        lines += ["---", ""]
+    return "\n".join(lines)
 
 
 def connect_sqlite_ro(db_file: Path, timeout: float = 5.0) -> sqlite3.Connection:

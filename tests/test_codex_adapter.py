@@ -6,7 +6,8 @@ def test_caps(codex_home):
     assert c.agent_id == "codex"
     assert c.doc_filename == "AGENTS.md"
     assert c.can_edit_doc is True
-    assert c.has_tasks is False and c.can_delete is False
+    assert c.has_tasks is False
+    assert c.can_delete is True and c.can_export is True  # #24: through the codex CLI
 
 
 def test_list_projects_groups_by_cwd(codex_home):

@@ -267,10 +267,22 @@ def _prune(conn, fts, agent: str, seen_sessions: set[str], seen_projects: set[st
 
 def remove_session(agent: str, session_id: str) -> None:
     """Drop one session from the index right away (after it was deleted)."""
+    remove_sessions(agent, [session_id])
+
+
+def remove_sessions(agent: str, session_ids: list[str], project_docs: str | None = None) -> None:
+    """Drop sessions (and, with project_docs, that project's indexed memory and
+    doc) from the index right away, after they were deleted."""
     conn = _connect()
     try:
         fts = init_db(conn)
-        _delete_session_rows(conn, fts, agent, session_id)
+        for sid in session_ids:
+            _delete_session_rows(conn, fts, agent, sid)
+        if project_docs is not None:
+            conn.execute("DELETE FROM docs WHERE agent=? AND project=?", (agent, project_docs))
+            if fts:
+                conn.execute("DELETE FROM docs_fts WHERE agent=? AND project=?",
+                             (agent, project_docs))
         conn.commit()
     finally:
         conn.close()

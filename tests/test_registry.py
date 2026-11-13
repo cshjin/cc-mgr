@@ -52,3 +52,7 @@ def test_base_unsupported_methods_raise():
         b.get_tasks("s")
     with pytest.raises(UnsupportedCapability):
         b.delete_session("p", "s")
+    with pytest.raises(UnsupportedCapability):
+        b.delete_project("p")  # can_delete is False
+    with pytest.raises(FileNotFoundError):
+        b.export_session_markdown("p", "s")  # the generic export: nothing to render

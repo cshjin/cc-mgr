@@ -6,7 +6,8 @@ def test_caps(copilot_home):
     assert c.agent_id == "copilot"
     assert c.doc_filename == "AGENTS.md"
     assert c.can_edit_doc is True
-    assert c.has_tasks is False and c.can_delete is False
+    assert c.has_tasks is False
+    assert c.can_delete is True and c.can_export is True  # #24
 
 
 def test_empty_home_is_graceful(copilot_home):

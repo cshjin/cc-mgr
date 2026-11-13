@@ -609,6 +609,9 @@ class OpencodeAdapter(AgentAdapter):
         can_edit_doc=True,
         can_delete=True,
         can_export=True,
+        delete_note=("Goes through OpenCode itself: a soft delete archives the session (restore "
+                     "it in OpenCode), a permanent delete also removes its subagent sessions. "
+                     "Only possible while the OpenCode service on this host owns this database."),
     )
 
     def _db_path(self) -> Path | None:

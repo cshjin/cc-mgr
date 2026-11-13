@@ -334,6 +334,9 @@ class AgyAdapter(AgentAdapter):
         can_edit_doc=True,
         can_delete=True,
         can_export=True,
+        delete_note=("A soft delete moves brain/<id>/ and the session's conversations/ and "
+                     "annotations/ files to .cc_mgr_trash/, with its conversation_summaries "
+                     "row saved there (reversible)."),
     )
 
     def _home(self) -> Path:

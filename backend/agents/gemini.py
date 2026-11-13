@@ -21,12 +21,14 @@ parsed but excluded from display (it's the synthetic context block). type
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, context_window, iter_jsonl, read_doc_file, read_git_info,
+    SessionSummary, context_window, is_safe_id, is_safe_name, iter_jsonl,
+    new_trash_dir, read_doc_file, read_git_info, safe_join,
 )
 
 
@@ -128,13 +130,22 @@ def _turn_text_preview(turn: dict) -> str:
     return ""
 
 
+def _has_turns(path: Path) -> bool:
+    """False for a session that only holds the startup <session_context> prelude."""
+    return any(not t.get("_prelude") for t in _read_turns(path))
+
+
 class GeminiAdapter(AgentAdapter):
-    # Gemini CLI is retired; Antigravity CLI (agy) replaces it. Its history
-    # stays browsable, read-only. GEMINI.md is shared with agy, which edits it.
+    # Gemini CLI is retired; Antigravity CLI (agy) replaces it. Its history stays
+    # browsable, exportable and deletable; GEMINI.md is shared with agy, which
+    # edits it. There is no CLI left to go through, so deletes move the files.
     capabilities = Capabilities(
         agent_id="gemini", label="Gemini CLI (legacy)", doc_filename="GEMINI.md",
         has_memory=False, has_tasks=False, can_edit_doc=False,
-        can_delete=False, can_export=False,
+        can_delete=True, can_export=True,
+        delete_note=("Gemini CLI is retired, so cc_mgr moves the files itself: a soft delete "
+                     "moves the chat file to ~/.gemini/.cc_mgr_trash/ (deleting a project "
+                     "moves its whole tmp/<project>/ folder there)."),
     )
 
     def _home(self) -> Path:
@@ -154,16 +165,17 @@ class GeminiAdapter(AgentAdapter):
             if not d.is_dir():
                 continue
             chats = d / "chats"
-            sessions = list(chats.glob("session-*.jsonl")) if chats.is_dir() else []
-            if not sessions:
+            files = list(chats.glob("session-*.jsonl")) if chats.is_dir() else []
+            if not files:
                 continue
-            mtimes = [s.stat().st_mtime for s in sessions]
+            mtimes = [s.stat().st_mtime for s in files]
             cwd = _project_cwd(home, d.name)
             out.append({
                 "name": d.name,
                 "display_path": cwd or d.name,
                 "cwd": cwd,
-                "session_count": len(sessions),
+                # what the session list shows (prelude-only files are hidden there)
+                "session_count": sum(1 for s in files if _has_turns(s)),
                 "has_memory": False,
                 "has_claude_md": bool(cwd and (Path(cwd) / "GEMINI.md").is_file()),
                 "open_tasks": 0, "total_tasks": 0,
@@ -275,3 +287,58 @@ class GeminiAdapter(AgentAdapter):
 
     def get_doc(self, project):
         return read_doc_file(_project_cwd(self._home(), project), "GEMINI.md")
+
+    # ---- delete: no CLI to go through, so move the files ----
+
+    def _session_file(self, project: str, session_id: str) -> Path:
+        """A session's chat file; refuses names that could escape tmp/."""
+        if not is_safe_name(project) or not is_safe_id(session_id):
+            raise ValueError("invalid project or session id")
+        path = safe_join(self._home() / "tmp", project, "chats", f"{session_id}.jsonl")
+        if not path.is_file():
+            raise FileNotFoundError(f"session {session_id} not found in {project}")
+        return path
+
+    def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
+        path = self._session_file(project, session_id)
+        if hard:
+            path.unlink()
+            return {"deleted": [str(path)], "trash": None}
+        trash = new_trash_dir(self._home(), session_id)
+        dest = trash / "tmp" / project / "chats"
+        dest.mkdir(parents=True)
+        shutil.move(str(path), str(dest / path.name))
+        return {"deleted": [str(path)], "trash": str(trash)}
+
+    def project_delete_preview(self, project: str) -> dict[str, Any]:
+        preview = super().project_delete_preview(project)
+        chats = self._chats_dir(project)
+        files = list(chats.glob("session-*.jsonl")) if chats.is_dir() else []
+        preview["hidden"] = sum(1 for f in files if not _has_turns(f))
+        return preview
+
+    def delete_project(self, project: str, hard: bool = False, include_memory: bool = False,
+                       export_first: bool = False) -> dict[str, Any]:
+        """Remove the project's whole tmp/<project>/ folder (chats, logs, the
+        prompt history in logs.json) and history/<project>/."""
+        if not is_safe_name(project):
+            raise ValueError("invalid project name")
+        home = self._home()
+        tmp_dir = safe_join(home / "tmp", project)
+        if not tmp_dir.is_dir():
+            raise FileNotFoundError(f"project {project} not found")
+        dirs = [d for d in (tmp_dir, safe_join(home / "history", project)) if d.is_dir()]
+        files = sorted((tmp_dir / "chats").glob("session-*.jsonl"))
+        exported = self._export_all(project) if export_first else []
+        trash = None
+        if hard:
+            for d in dirs:
+                shutil.rmtree(d)
+        else:
+            trash = new_trash_dir(home, project)
+            for d in dirs:
+                (trash / d.parent.name).mkdir()
+                shutil.move(str(d), str(trash / d.parent.name / d.name))
+        return {"sessions": [f.stem for f in files], "deleted": [str(d) for d in dirs],
+                "trash": [str(trash)] if trash else [], "exported": exported, "errors": {},
+                "warnings": [], "project_removed": True}

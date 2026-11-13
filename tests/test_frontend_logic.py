@@ -92,3 +92,39 @@ def test_project_board_moves_the_dragged_card_even_when_task_ids_repeat():
     assert r["moved"] and r["untouched"]
     assert r["calls"] == [["http://localhost/api/sessions/B/tasks/1?agent=claude", "PATCH",
                            '{"status":"completed"}']]
+
+
+def test_visible_projects_filters_missing_directories_and_sorts():
+    projects = [{"name": "b", "mtime": 1, "cwd_missing": True}, {"name": "a", "mtime": 3},
+                {"name": "c", "mtime": 2, "cwd_missing": True}]
+    r = run_js(["visibleProjects"], f"""
+        const ps = {json.dumps(projects)};
+        process.stdout.write(JSON.stringify({{
+          time: visibleProjects(ps, "time", false).map(p => p.name),
+          name: visibleProjects(ps, "name", false).map(p => p.name),
+          missing: visibleProjects(ps, "time", true).map(p => p.name),
+          untouched: ps.map(p => p.name) }}));""")
+    assert r == {"time": ["a", "c", "b"], "name": ["a", "b", "c"], "missing": ["c", "b"],
+                 "untouched": ["b", "a", "c"]}
+
+
+def test_project_delete_dialog_texts():
+    r = run_js(["plural", "projectDeleteSummary", "confirmWord", "projectDeleteResultText"], r"""
+        process.stdout.write(JSON.stringify({
+          summary: projectDeleteSummary({sessions: 3, subagents: 1, hidden: 2, memory_files: 1}),
+          one: projectDeleteSummary({sessions: 1, subagents: 0, hidden: 0, memory_files: 0}),
+          words: [confirmWord({display_path: "/global/x/SwarmZoo_paper/", name: "n"}),
+                  confirmWord({display_path: "C:\\work\\repo", name: "n"}),
+                  confirmWord({display_path: "", name: "-tmp"})],
+          soft: projectDeleteResultText({sessions: ["a", "b"], trash: ["/t/x"], kept: ["memory"],
+                                         errors: {"cccccccc-1111": "busy"}}, false),
+          archived: projectDeleteResultText({sessions: ["a"], trash: []}, false),
+          hard: projectDeleteResultText({sessions: ["a"], trash: [], exported: ["/e/a.md"]}, true),
+        }));""")
+    assert r["summary"] == "3 sessions (+1 subagent session) · 2 empty transcripts · 1 memory file"
+    assert r["one"] == "1 session"
+    assert r["words"] == ["SwarmZoo_paper", "repo", "-tmp"]
+    assert r["soft"] == ("Removed 2 sessions (reversible: /t/x). The project memory was kept. "
+                         "Not deleted (1): cccccccc: busy")
+    assert r["archived"] == "Removed 1 session (reversible)."
+    assert r["hard"] == "Permanently deleted 1 session. Exported 1 to Markdown first."

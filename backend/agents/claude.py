@@ -14,6 +14,9 @@ class ClaudeAdapter(AgentAdapter):
         agent_id="claude", label="Claude", doc_filename="CLAUDE.md",
         has_memory=True, has_tasks=True, can_edit_doc=True,
         can_delete=True, can_export=True,
+        delete_note=("A soft delete moves the transcript, its sidecar files and tasks to "
+                     "~/.claude/.cc_mgr_trash/ (reversible). Project memory is only removed "
+                     "when you ask for it."),
     )
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -67,3 +70,10 @@ class ClaudeAdapter(AgentAdapter):
 
     def delete_session(self, project, session_id, hard=False):
         return store.delete_session(project, session_id, hard=hard)
+
+    def project_delete_preview(self, project):
+        return store.project_delete_preview(project)
+
+    def delete_project(self, project, hard=False, include_memory=False, export_first=False):
+        return store.delete_project(project, hard=hard, include_memory=include_memory,
+                                    export_first=export_first)

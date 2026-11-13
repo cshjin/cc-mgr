@@ -23,11 +23,23 @@ Real on-disk format (verified with Copilot CLI 1.0.x):
 
 The older guess — history/<mangled-cwd>/*.jsonl with Claude-like records — is
 still read when present (no Copilot version has been seen writing it).
+
+The CLI has no command to delete a session (`copilot sessions` only has
+`import`), so cc_mgr edits the store itself: every table with a session_id
+column plus the sessions row, in one transaction, and session-state/<id>/.
+A soft delete first saves those rows (db_rows.json) and the folder under
+.cc_mgr_trash/. A session a running Copilot holds open
+(session-state/<id>/inuse.<pid>.lock) or that was active moments ago is
+refused.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
+import shutil
+import sqlite3
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -35,8 +47,9 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, block_text, connect_sqlite_ro, context_window, iter_jsonl,
-    read_doc_file, read_git_info, save_doc_file, structured_blocks,
+    SessionSummary, block_text, connect_sqlite_ro, context_window, is_safe_id,
+    is_safe_name, iter_jsonl, new_trash_dir, pid_alive, read_doc_file, read_git_info,
+    safe_join, save_doc_file, structured_blocks,
 )
 
 
@@ -231,11 +244,111 @@ def _session_turns(home: Path, info: dict[str, Any]) -> tuple[list[dict[str, Any
     return _db_turns(home, info["id"])
 
 
+# ---------------------------------------------------------------------------
+# delete: the CLI can't, so edit session-store.db + session-state/ directly
+# ---------------------------------------------------------------------------
+
+def _quote(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _session_tables(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(table, column) for every table holding a session's rows; the sessions
+    row itself comes last, since the others reference it. FTS5 shadow tables
+    (search_index_*) are maintained by search_index itself."""
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")]
+    out = [(t, "session_id") for t in tables
+           if t != "sessions" and not t.startswith("search_index_")
+           and "session_id" in {c[1] for c in conn.execute(f"PRAGMA table_info({_quote(t)})")}]
+    return out + ([("sessions", "id")] if "sessions" in tables else [])
+
+
+def _jsonable(value: Any) -> Any:
+    return {"base64": base64.b64encode(value).decode("ascii")} if isinstance(value, bytes) else value
+
+
+def _session_rows(db: Path, session_id: str) -> dict[str, list[dict[str, Any]]]:
+    """Every row of the session, per table, as JSON-safe data (the backup a
+    soft delete keeps). RuntimeError if the store can't be read, so nothing is
+    deleted without a backup."""
+    try:
+        conn = connect_sqlite_ro(db)
+        try:
+            backup = {}
+            for table, col in _session_tables(conn):
+                rows = conn.execute(f"SELECT * FROM {_quote(table)} WHERE {col} = ?",
+                                    (session_id,)).fetchall()
+                if rows:
+                    backup[table] = [{k: _jsonable(r[k]) for k in r.keys()} for r in rows]
+            return backup
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        raise RuntimeError(f"could not back up the session's rows in session-store.db ({e}); "
+                           f"nothing was deleted") from e
+
+
+def _delete_rows(db: Path, session_id: str) -> int:
+    """Delete the session's rows from every table in one transaction."""
+    conn = sqlite3.connect(db, timeout=10, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            n = sum(conn.execute(f"DELETE FROM {_quote(table)} WHERE {col} = ?",
+                                 (session_id,)).rowcount
+                    for table, col in _session_tables(conn))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        return n
+    finally:
+        conn.close()
+
+
+_ACTIVE_SECONDS = 120
+
+
+def _is_copilot_process(pid: int) -> bool:
+    if not pid_alive(pid):
+        return False
+    try:  # Linux: rule out an unrelated process that reused a stale lock's pid
+        return b"copilot" in Path(f"/proc/{pid}/cmdline").read_bytes().lower()
+    except FileNotFoundError:
+        return not Path("/proc/self").exists()  # no /proc: can't tell, assume it is
+    except OSError:
+        return True
+
+
+def _busy_reason(home: Path, session_id: str) -> str:
+    """Why the session must not be deleted right now ("" if it may be)."""
+    d = home / "session-state" / session_id
+    if not d.is_dir():
+        return ""
+    for lock in d.glob("inuse.*.lock"):
+        try:
+            pid = int(lock.name.split(".")[1])
+        except (IndexError, ValueError):
+            continue
+        if _is_copilot_process(pid):
+            return f"it is open in a running Copilot CLI (pid {pid}); close it first"
+    newest = max((p.stat().st_mtime for p in (d, d / "events.jsonl") if p.exists()), default=0.0)
+    if time.time() - newest < _ACTIVE_SECONDS:
+        return ("it was active in the last two minutes; Copilot may still be running it "
+                "(perhaps on another node), so try again once it is closed")
+    return ""
+
+
 class CopilotAdapter(AgentAdapter):
     capabilities = Capabilities(
         agent_id="copilot", label="Copilot", doc_filename="AGENTS.md",
         has_memory=False, has_tasks=False, can_edit_doc=True,
-        can_delete=False, can_export=False,
+        can_delete=True, can_export=True,
+        delete_note=("The Copilot CLI has no delete command, so cc_mgr edits its store: a soft "
+                     "delete first saves the session's database rows (db_rows.json) and its "
+                     "session-state folder to ~/.copilot/.cc_mgr_trash/. Sessions open in a "
+                     "running Copilot, or active in the last two minutes, are refused."),
     )
 
     def _home(self) -> Path:
@@ -336,6 +449,71 @@ class CopilotAdapter(AgentAdapter):
 
     def save_doc(self, project, content):
         return save_doc_file(self._project_cwd(project), "AGENTS.md", content)
+
+    def _session_title(self, project: str, session_id: str) -> str:
+        info = next((s for s in self._store_sessions(project) if s["id"] == session_id), None)
+        return (info or {}).get("title", "")
+
+    def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
+        if not is_safe_id(session_id):
+            raise ValueError("invalid session id")
+        home = self._home()
+        if not any(s["id"] == session_id for s in self._store_sessions(project)):
+            return self._delete_history_session(project, session_id, hard)
+        busy = _busy_reason(home, session_id)
+        if busy:
+            raise RuntimeError(f"not deleting Copilot session {session_id}: {busy}")
+        db = _store_db(home)
+        state_dir = safe_join(home / "session-state", session_id)
+        deleted: list[str] = []
+        warnings: list[str] = []
+        trash = None
+        if not hard:
+            backup = _session_rows(db, session_id) if db else {}  # raises before anything moves
+            trash = new_trash_dir(home, session_id)
+            (trash / "db_rows.json").write_text(
+                json.dumps({"db": str(db), "session_id": session_id, "rows": backup},
+                           ensure_ascii=False, indent=1), encoding="utf-8")
+            if state_dir.is_dir():
+                shutil.move(str(state_dir), str(trash / "session-state"))
+                deleted.append(str(state_dir))
+        try:
+            rows = _delete_rows(db, session_id) if db else 0
+        except sqlite3.Error as e:
+            if trash is not None:  # put everything back: nothing is deleted
+                if deleted:
+                    shutil.move(str(trash / "session-state"), str(state_dir))
+                shutil.rmtree(trash, ignore_errors=True)
+            raise RuntimeError(f"could not remove the session from session-store.db ({e}); "
+                               f"nothing was deleted") from e
+        if rows:
+            deleted.append(f"{db} ({rows} rows)")
+        if hard and state_dir.is_dir():
+            try:
+                shutil.rmtree(state_dir)
+                deleted.append(str(state_dir))
+            except OSError as e:
+                warnings.append(f"could not remove {state_dir}: {e}")
+        result: dict[str, Any] = {"deleted": deleted, "trash": str(trash) if trash else None}
+        if trash:
+            result["note"] = f"Moved to {trash} (its database rows are in db_rows.json)."
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def _delete_history_session(self, project: str, session_id: str, hard: bool) -> dict[str, Any]:
+        """A session in the legacy history/<project>/ layout: just its file."""
+        if not is_safe_name(project):
+            raise ValueError("invalid project name")
+        path = safe_join(self._history_root(), project, f"{session_id}.jsonl")
+        if not path.is_file():
+            raise FileNotFoundError(f"session {session_id} not found in {project}")
+        if hard:
+            path.unlink()
+            return {"deleted": [str(path)], "trash": None}
+        trash = new_trash_dir(self._home(), session_id)
+        shutil.move(str(path), str(trash / path.name))
+        return {"deleted": [str(path)], "trash": str(trash)}
 
     # ---- legacy history/<mangled-cwd>/*.jsonl (Claude-like records) ----
 

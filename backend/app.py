@@ -20,7 +20,7 @@ from . import index_db, store
 from .agents import UnsupportedCapability, get_adapter, list_agents
 from .agents.common import is_safe_id, is_safe_name
 
-app = FastAPI(title="cc_mgr", version="0.5.0")
+app = FastAPI(title="cc_mgr", version="0.6.0")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
@@ -138,7 +138,13 @@ def api_agents():
 
 @app.get("/api/projects")
 def api_projects(agent: str | None = None):
-    return _adapter(agent).list_projects()
+    projects = _adapter(agent).list_projects()
+    for p in projects:
+        # The recorded working directory is gone: renamed, moved, deleted, or
+        # on another machine. The sessions are still here, under the old path.
+        cwd = p.get("cwd") or ""
+        p["cwd_missing"] = bool(cwd) and not os.path.isdir(cwd)
+    return projects
 
 
 @app.get("/api/projects/{project}/sessions")
@@ -328,6 +334,51 @@ def api_save_memory(project: str, session_id: str, agent: str | None = None):
         raise HTTPException(status_code=404, detail="session not found")
     except ValueError as e:  # e.g. a memory path that would escape the project
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/projects/{project}/delete-preview")
+def api_project_delete_preview(project: str, agent: str | None = None):
+    _project(project)
+    ad = _adapter(agent)
+    if not ad.capabilities.can_delete:
+        raise HTTPException(status_code=404, detail="delete not supported")
+    try:
+        return ad.project_delete_preview(project)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class ProjectDeleteRequest(BaseModel):
+    export_first: bool = True
+    include_memory: bool = False
+    hard: bool = False
+
+
+@app.post("/api/projects/{project}/delete")
+def api_project_delete(project: str, req: ProjectDeleteRequest, agent: str | None = None):
+    """Delete every session of a project (soft by default); per-session
+    failures come back in `errors`, the rest still go."""
+    _project(project)
+    ad = _adapter(agent)
+    try:
+        result = ad.delete_project(project, hard=req.hard, include_memory=req.include_memory,
+                                   export_first=req.export_first)
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:  # the agent's own CLI refused or failed
+        raise HTTPException(status_code=502, detail=str(e))
+    try:  # the search index is a cache: keep it from offering deleted sessions
+        index_db.remove_sessions(ad.capabilities.agent_id, result.get("sessions") or [],
+                                 project if result.get("project_removed") else None)
+    except sqlite3.Error as e:
+        result.setdefault("warnings", []).append(f"search index not updated: {e}")
+    return result
 
 
 @app.get("/api/search")
