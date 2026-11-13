@@ -31,8 +31,9 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, context_limit_for, default_export_dir, is_safe_id,
-    iter_jsonl, read_doc_file, read_git_info, safe_join, save_doc_file,
+    SessionSummary, connect_sqlite_ro, context_limit_for, default_export_dir,
+    is_safe_id, iter_jsonl, read_doc_file, read_git_info, safe_join,
+    save_doc_file,
 )
 
 
@@ -158,7 +159,7 @@ def _scan_sessions(home: Path) -> tuple[dict[str, list[dict[str, Any]]], dict[st
     db_file = home / "conversation_summaries.db"
     if db_file.is_file():
         try:
-            conn = sqlite3.connect(db_file)
+            conn = connect_sqlite_ro(db_file)
             cursor = conn.execute(
                 "SELECT conversation_id, title, preview, workspace_uris, parent_conversation_id "
                 "FROM conversation_summaries"

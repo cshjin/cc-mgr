@@ -30,8 +30,8 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
-    SessionSummary, context_limit_for, default_export_dir, is_safe_id,
-    read_doc_file, read_git_info, save_doc_file, block_text,
+    SessionSummary, connect_sqlite_ro, context_limit_for, default_export_dir,
+    is_safe_id, read_doc_file, read_git_info, save_doc_file, block_text,
 )
 
 
@@ -79,11 +79,8 @@ def opencode_db_path() -> Path | None:
 
 
 def _connect_ro(db_file: Path) -> sqlite3.Connection:
-    """Connect to SQLite database in immutable read-only mode safe for Lustre/NFS."""
-    uri = f"file:{db_file.resolve()}?immutable=1"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Read-only connection to the live DB (mode=ro; see connect_sqlite_ro)."""
+    return connect_sqlite_ro(db_file)
 
 
 def _connect_rw(db_file: Path) -> sqlite3.Connection:

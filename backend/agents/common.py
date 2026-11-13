@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -40,6 +41,29 @@ def default_export_dir(project: str) -> Path:
     if not is_safe_name(project):
         raise ValueError("invalid project name")
     return safe_join(Path.cwd() / "exports", project)
+
+
+def connect_sqlite_ro(db_file: Path, timeout: float = 5.0) -> sqlite3.Connection:
+    """Open another tool's live SQLite DB read-only, WAL included.
+
+    mode=ro takes the normal shared locks and reads the -wal file, so it sees
+    every committed transaction and never returns torn pages. immutable=1 skips
+    both: while the owner writes, it misses un-checkpointed data and can report
+    "database disk image is malformed". It is only a fallback for files mode=ro
+    can't open (e.g. no access to the -shm file).
+    """
+    uri = Path(db_file).resolve().as_uri()
+    try:
+        conn = sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=timeout)
+        try:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        except sqlite3.Error:
+            conn.close()
+            raise
+    except sqlite3.Error:
+        conn = sqlite3.connect(f"{uri}?immutable=1", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def context_limit_for(observed_tokens: int) -> dict[str, Any]:
