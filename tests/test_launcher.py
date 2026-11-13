@@ -58,12 +58,20 @@ def test_terminate_survives_permission_errors(launcher, monkeypatch):
     launcher._terminate(12345)  # used to raise from the os.kill fallback
 
 
+def _stand_in_server(tmp_path: Path) -> Path:
+    """A script really named cc-mgr.py that just sleeps (run it with `run`)."""
+    script = tmp_path / "bin" / "cc-mgr.py"
+    script.parent.mkdir(exist_ok=True)
+    script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    return script
+
+
 @pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
-def test_stop_terminates_a_real_cc_mgr_process(launcher):
-    # Stand-in with a server's command line (`… cc-mgr.py run …`), in its own
+def test_stop_terminates_a_real_cc_mgr_process(launcher, tmp_path):
+    # Same command line as a server (`python …/cc-mgr.py run …`), in its own
     # session like --background.
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
-                             "cc-mgr.py", "run"], start_new_session=True)
+    proc = subprocess.Popen([sys.executable, str(_stand_in_server(tmp_path)), "run"],
+                            start_new_session=True)
     try:
         launcher._write_pidfile(proc.pid, "loopback", 8765)
         assert launcher.cmd_status(ARGS) == 0
@@ -76,21 +84,89 @@ def test_stop_terminates_a_real_cc_mgr_process(launcher):
 
 
 @pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
-def test_identity_needs_the_server_argv_and_the_recorded_start(launcher):
-    mention = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
-                                "/somewhere/cc-mgr.py"])  # e.g. an editor on the file
-    server = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
-                               "cc-mgr.py", "run"])
+def test_identity_needs_the_server_argv_and_the_recorded_start(launcher, tmp_path):
+    script, sleep = str(_stand_in_server(tmp_path)), "import time; time.sleep(60)"
+    argvs = {
+        "mentions the file": [sys.executable, "-c", sleep, script],
+        "python -c … cc-mgr.py run": [sys.executable, "-c", sleep, "cc-mgr.py", "run"],
+        "not the run command": [sys.executable, script],
+        "server": [sys.executable, "-u", script, "run", "--port", "1"],
+    }
+    procs = {name: subprocess.Popen(argv) for name, argv in argvs.items()}
     try:
-        assert not launcher._is_cc_mgr_process(mention.pid)
-        assert launcher._is_cc_mgr_process(server.pid)
-        start = launcher._proc_start(server.pid)
-        assert launcher._is_cc_mgr_process(server.pid, start)
-        assert not launcher._is_cc_mgr_process(server.pid, start + 1)  # PID reused since
+        assert {name: launcher._is_cc_mgr_process(p.pid) for name, p in procs.items()} == {
+            "mentions the file": False, "python -c … cc-mgr.py run": False,
+            "not the run command": False, "server": True}
+        pid = procs["server"].pid
+        start = launcher._proc_start(pid)
+        assert launcher._is_cc_mgr_process(pid, start)
+        assert not launcher._is_cc_mgr_process(pid, start + 1)  # PID reused since
     finally:
-        for p in (mention, server):
+        for p in procs.values():
             p.kill()
             p.wait()
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["/usr/bin/python3", "/repo/cc-mgr.py", "run"], True),
+    (["python3.12", "-u", "-X", "utf8", "-Wignore", "-OO", "cc-mgr.py", "run", "--port", "1"], True),
+    (["C:\\Program Files\\Python312\\python.exe", "G:\\My Drive\\cc_mgr\\cc-mgr.py", "run"], True),
+    (["pythonw.exe", "C:\\cc\\cc-mgr.py", "run"], True),
+    (["python", "cc-mgr.py", "stop"], False),
+    (["python", "cc-mgr.py"], False),
+    (["python", "-c", "pass", "cc-mgr.py", "run"], False),
+    (["python", "-uc", "pass", "cc-mgr.py", "run"], False),   # -c inside a flag group
+    (["python", "-m", "cc-mgr.py", "run"], False),
+    (["python", "-X", "cc-mgr.py", "run"], False),            # cc-mgr.py is -X's value
+    (["python", "-", "cc-mgr.py", "run"], False),             # script read from stdin
+    (["vim", "cc-mgr.py", "run"], False),
+    (["notepad.exe", "C:\\cc\\cc-mgr.py", "run"], False),
+    ([], False),
+])
+def test_server_argv_is_parsed_like_the_interpreter_does(launcher, argv, expected):
+    assert launcher._looks_like_server(argv) is expected
+
+
+TICKS = "638670000000000000"
+
+
+@pytest.mark.parametrize("cmdline, start, expected", [
+    ('"C:\\Program Files\\Python312\\python.exe" "G:\\My Drive\\cc_mgr\\cc-mgr.py" run --port 8765',
+     TICKS, True),
+    ("C:\\Python\\python.exe C:\\cc\\cc-mgr.py run", "638670000000000001", False),  # PID reused
+    ("notepad.exe C:\\cc\\cc-mgr.py run", TICKS, False),          # merely mentions the file
+    ('"C:\\Python\\python.exe" -c "import time" C:\\cc\\cc-mgr.py run', TICKS, False),
+    ('"C:\\Python\\python.exe C:\\cc\\cc-mgr.py run', TICKS, False),  # unbalanced quotes
+    ("", TICKS, False),                                           # couldn't be read
+])
+def test_windows_identity_is_verified_not_assumed(launcher, monkeypatch, cmdline, start, expected):
+    monkeypatch.setattr(launcher, "IS_WINDOWS", True)
+    monkeypatch.setattr(launcher, "_has_proc", lambda: False)
+    monkeypatch.setattr(launcher, "_pid_alive", lambda pid: True)
+
+    class Out:  # what the CIM query prints: creation ticks, then the command line
+        stdout = f"{TICKS}\r\n{cmdline}\r\n" if cmdline else ""
+
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: Out())
+    assert launcher._is_cc_mgr_process(4242, start=start) is expected
+    assert launcher._proc_start(4242) == (TICKS if cmdline else None)
+
+
+def test_ps_identity_without_proc(launcher, monkeypatch):
+    # macOS / BSD: start time from `ps -o lstart=`, command line from `ps -o command=`
+    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
+    monkeypatch.setattr(launcher, "_has_proc", lambda: False)
+    monkeypatch.setattr(launcher, "_pid_alive", lambda pid: True)
+    out = {"lstart=": "Fri Nov 13 10:00:00 2026\n",
+           "command=": "/usr/local/bin/python3 /Users/me/cc_mgr/cc-mgr.py run --port 8765\n"}
+    monkeypatch.setattr(launcher.subprocess, "run",
+                        lambda cmd, **k: type("Out", (), {"stdout": out[cmd[2]]})())
+    start = launcher._proc_start(4242)
+    assert start == "Fri Nov 13 10:00:00 2026"
+    assert launcher._is_cc_mgr_process(4242, start)
+    assert not launcher._is_cc_mgr_process(4242, "Thu Nov 12 09:00:00 2026")  # PID reused
+    out["command="] = "/usr/bin/vim /Users/me/cc_mgr/cc-mgr.py run\n"
+    assert not launcher._is_cc_mgr_process(4242, start)
 
 
 def test_background_log_never_contains_the_token(launcher):
@@ -126,20 +202,3 @@ def test_secure_state_tightens_what_an_older_version_left_open(launcher, tmp_pat
     assert all(stat.S_IMODE(f.stat().st_mode) == 0o600 for f in files)
     assert all(stat.S_IMODE(d.stat().st_mode) == 0o700
                for d in (launcher.DATA_DIR, exports, exports / "proj"))
-
-
-@pytest.mark.parametrize("cmdline, expected", [
-    ('"C:\\Python\\python.exe" C:\\cc\\cc-mgr.py run --port 8765', True),
-    ("notepad.exe C:\\cc\\cc-mgr.py", False),  # merely mentions the file
-    ("", False),                               # couldn't be read
-])
-def test_windows_identity_is_verified_not_assumed(launcher, monkeypatch, cmdline, expected):
-    monkeypatch.setattr(launcher, "IS_WINDOWS", True)
-    monkeypatch.setattr(launcher, "_has_proc", lambda: False)
-    monkeypatch.setattr(launcher, "_pid_alive", lambda pid: True)
-
-    class Out:
-        stdout = cmdline
-
-    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: Out())
-    assert launcher._is_cc_mgr_process(4242, start=123) is expected

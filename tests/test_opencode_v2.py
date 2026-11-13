@@ -287,6 +287,38 @@ def test_v2_context_follows_turns_completed_in_place(tmp_path, monkeypatch):
     assert (s.context_tokens, s.context_limit_known) == (250_000, True)
 
 
+@pytest.mark.parametrize("before, primed, mutate, expected", [
+    # a revert drops the newest (GPT) turn: the Claude turn is current again
+    ([_turn("claude-opus-5.5", 250_000), _turn("gpt-6-astra", 100_000)],
+     (100_000, False, "gpt-6-astra"),
+     ["DELETE FROM session_message WHERE id = 'm2'"],
+     (250_000, True, "claude-opus-5.5")),
+    # a revert replaces the turn that proved 1M with a smaller one, reusing its
+    # seq: the row count and the highest seq are unchanged
+    ([_turn("claude-opus-5.5", 150_000), _turn("claude-opus-5.5", 260_000)],
+     (260_000, True, "claude-opus-5.5"),
+     ["DELETE FROM session_message WHERE id = 'm2'",
+      "INSERT INTO session_message VALUES ('m3', 's', 'assistant', 2, 30, 30, json_object("
+      "'model', json_object('id', 'claude-opus-5.5'), 'tokens', json_object('input', 120000)))"],
+     (120_000, False, "claude-opus-5.5")),
+])
+def test_v2_context_rebuilds_after_a_revert(tmp_path, monkeypatch, before, primed, mutate, expected):
+    db = tmp_path / "revert.db"
+    _v2_db(db, before)
+    monkeypatch.setenv("OPENCODE_DB", str(db))
+    a = OpencodeAdapter()
+    s = a.list_sessions("-w")[0]  # fills the context cache
+    assert (s.context_tokens, s.context_limit_known, s.model) == primed
+    conn = sqlite3.connect(db)
+    for sql in mutate:
+        conn.execute(sql)
+    conn.execute("UPDATE session_v2 SET time_updated = time_updated + 100")
+    conn.commit()
+    conn.close()
+    s = a.list_sessions("-w")[0]  # same process: stale cached stats must not survive
+    assert (s.context_tokens, s.context_limit_known, s.model) == expected
+
+
 def test_v2_mixed_part_storage_keeps_both(tmp_path, monkeypatch):
     db = tmp_path / "mixed.db"
     _v2_db(db, [("assistant", {"model": {"id": "m"}, "content": [{"type": "text", "text": "tail"}]})])

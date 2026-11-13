@@ -444,11 +444,15 @@ def _v2_session_stats(conn: sqlite3.Connection, ids: list[str],
     return stats
 
 
-# (db, session) -> (highest seq, newest time_updated, context stats). Reading
-# every turn's tokens means parsing every message's JSON (seconds on big
-# sessions), so it is done once; afterwards only rows appended or updated in
-# place since (OpenCode fills in a turn's tokens when it finishes) are re-read.
-_CTX_CACHE: dict[tuple[str, str], tuple[int, int, dict[str, Any]]] = {}
+# (db, session) -> ((row count, newest time_created, newest time_updated),
+# context stats). Reading every turn's tokens means parsing every message's
+# JSON (seconds on big sessions), so it is done once. Afterwards, if rows were
+# only appended or updated in place (OpenCode fills in a turn's tokens when it
+# finishes), just those are re-read; anything else — e.g. a revert deleting
+# turns, possibly replacing them — rebuilds the stats from scratch.
+_CTX_CACHE: dict[tuple[str, str], tuple[tuple[int, int, int], dict[str, Any]]] = {}
+
+_CTX_ROWS = "FROM session_message WHERE session_id = ? AND type IN ('assistant', 'compaction')"
 
 
 def _v2_context(conn: sqlite3.Connection, db_key: str, sid: str) -> dict[str, Any]:
@@ -456,23 +460,27 @@ def _v2_context(conn: sqlite3.Connection, db_key: str, sid: str) -> dict[str, An
     assistant turn's model; peak_claude = the largest context any Claude turn
     (or Claude compaction) reached — only that can prove the 1M tier; peak =
     the largest context overall."""
-    top, updated = conn.execute(
-        "SELECT MAX(seq), MAX(time_updated) FROM session_message "
-        "WHERE session_id = ? AND type IN ('assistant', 'compaction')", (sid,)).fetchone()
-    top, updated = top or 0, updated or 0
     cached = _CTX_CACHE.get((db_key, sid))
-    if cached and cached[:2] == (top, updated):
-        return dict(cached[2])
+    old_n, old_created, old_updated = cached[0] if cached else (0, 0, 0)
+    n, created, updated, n_new = conn.execute(
+        f"SELECT COUNT(*), MAX(time_created), MAX(time_updated), SUM(time_created > ?) "
+        f"{_CTX_ROWS}", (old_created, sid)).fetchone()
+    key = (n or 0, created or 0, updated or 0)
+    if cached and cached[0] == key:
+        return dict(cached[1])
+    # Every row seen before is still there iff the count grew by exactly the
+    # rows created since; a deleted row (even one replaced by a new row) breaks that.
+    only_appended = (cached is not None and key[0] == old_n + (n_new or 0)
+                     and key[1] >= old_created and key[2] >= old_updated)
     st = {"context": 0, "context_seq": -1, "model": "", "model_seq": -1,
           "peak": 0, "peak_claude": 0}
-    query = ("SELECT type, seq, json_extract(data, '$.tokens') AS tokens, "
-             "json_extract(data, '$.model') AS model FROM session_message "
-             "WHERE session_id = ? AND type IN ('assistant', 'compaction')")
+    query = (f"SELECT type, seq, json_extract(data, '$.tokens') AS tokens, "
+             f"json_extract(data, '$.model') AS model {_CTX_ROWS}")
     args: tuple = (sid,)
-    if cached:  # only rows appended or updated since the last read
-        st = dict(cached[2])
-        query += " AND (seq > ? OR time_updated >= ?)"
-        args = (sid, cached[0], cached[1])
+    if only_appended:  # re-read just the rows created or updated since
+        st = dict(cached[1])
+        query += " AND (time_created > ? OR time_updated >= ?)"
+        args = (sid, old_created, old_updated)
     for r in conn.execute(query + " ORDER BY seq", args):
         ctx = _context_from_tokens(r["tokens"])
         model = _format_model_name(r["model"])
@@ -485,7 +493,7 @@ def _v2_context(conn: sqlite3.Connection, db_key: str, sid: str) -> dict[str, An
             st["peak"] = max(st["peak"], ctx)
             if is_claude_model(model):
                 st["peak_claude"] = max(st["peak_claude"], ctx)
-    _CTX_CACHE[(db_key, sid)] = (top, updated, dict(st))
+    _CTX_CACHE[(db_key, sid)] = (key, dict(st))
     return st
 
 

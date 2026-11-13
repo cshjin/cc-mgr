@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import secrets
+import shlex
 import signal
 import socket
 import stat
@@ -179,65 +180,107 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
-def _proc_start(pid: int) -> int | None:
-    """Process start time in clock ticks since boot (Linux), else None.
-
-    Recorded in the pidfile: a PID that was reused since has a different start.
-    """
+def _run_quiet(cmd: list[str], timeout: float = 5) -> str:
+    """stdout of a short helper command; "" if it can't be run."""
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
-        # field 22 (starttime); fields after "(comm)" start at field 3
-        return int(stat.rsplit(")", 1)[1].split()[19])
-    except (OSError, IndexError, ValueError):
-        return None
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _split_windows_cmdline(cmdline: str) -> list[str]:
+    """argv from a Windows command line (quoted paths may contain spaces)."""
+    try:
+        parts = shlex.split(cmdline, posix=False)
+    except ValueError:  # unbalanced quotes: unverifiable
+        return []
+    return [p[1:-1] if len(p) > 1 and p[0] == p[-1] == '"' else p for p in parts]
+
+
+def _proc_info(pid: int) -> tuple[int | str | None, list[str]]:
+    """(start time, argv) of a process on this host; (None, []) if unreadable.
+
+    The start time is recorded in the pidfile, so a PID that was reused since
+    doesn't match. Linux: /proc (clock ticks since boot, exact argv). Windows:
+    CIM (creation time, command line). macOS/BSD: ps (lstart, command; ps
+    doesn't quote, so a path containing spaces isn't recognized and `stop`
+    refuses rather than guess).
+    """
+    if _has_proc():
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            # field 22 (starttime); fields after "(comm)" start at field 3
+            start = int(stat_line.rsplit(")", 1)[1].split()[19])
+        except (OSError, IndexError, ValueError):
+            return None, []
+        return start, [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    if IS_WINDOWS:  # tasklist can't show command lines; ask CIM
+        script = (f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; "
+                  "if ($p) { $p.CreationDate.ToUniversalTime().Ticks; $p.CommandLine }")
+        lines = _run_quiet(["powershell", "-NoProfile", "-Command", script], timeout=15).strip().splitlines()
+        if len(lines) < 2:
+            return None, []
+        return lines[0].strip() or None, _split_windows_cmdline(lines[1].strip())
+    start = _run_quiet(["ps", "-o", "lstart=", "-p", str(pid)]).strip()
+    return start or None, _run_quiet(["ps", "-o", "command=", "-p", str(pid)]).split()
+
+
+def _proc_start(pid: int) -> int | str | None:
+    return _proc_info(pid)[0]
+
+
+# Interpreter long options that take the next argument as their value.
+_PY_LONG_OPTS_WITH_VALUE = {"--check-hash-based-pycs"}
 
 
 def _looks_like_server(argv: list[str]) -> bool:
-    """argv of `python …/cc-mgr.py run …` (not merely any mention of the file)."""
-    return any(a.replace("\\", "/").rsplit("/", 1)[-1] == "cc-mgr.py" and argv[i + 1] == "run"
-               for i, a in enumerate(argv[:-1]))
+    """argv of a Python interpreter running cc-mgr.py with the `run` command —
+    not merely a process that mentions the file (an editor, `python -c …`)."""
+    def base(arg: str) -> str:
+        return arg.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+    if not argv or not base(argv[0]).startswith("python"):
+        return False
+    i = 1
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+        opt = argv[i]
+        i += 1
+        if opt == "--":
+            break
+        if opt.startswith("--"):
+            if opt in _PY_LONG_OPTS_WITH_VALUE:
+                i += 1
+            continue
+        for j, ch in enumerate(opt[1:], 1):  # a group like -u, -uB, -Wignore, -X utf8
+            if ch in "cm":  # -c code / -m module: no script runs
+                return False
+            if ch in "WX":  # takes the rest of the group, else the next argument
+                if j == len(opt) - 1:
+                    i += 1
+                break
+    return i + 1 < len(argv) and base(argv[i]) == "cc-mgr.py" and argv[i + 1] == "run"
 
 
 def _has_proc() -> bool:
     return Path("/proc/self/cmdline").exists()
 
 
-def _is_cc_mgr_process(pid: int, start: int | None = None) -> bool:
+def _is_cc_mgr_process(pid: int, start: int | str | None = None) -> bool:
     """True only if pid is alive here AND is a cc_mgr server we started.
 
     A pidfile can outlive its server and the PID can be reused by anything,
     so a bare "is the PID alive" check could make `stop` signal an unrelated
-    process. The command line must be `… cc-mgr.py run …` and, when the
-    pidfile recorded one, the process start time must match. If identity
-    can't be established, the answer is no.
+    process. The command line must be `python [opts] …/cc-mgr.py run …` and,
+    when the pidfile recorded one, the process start time must match. If
+    identity can't be established, the answer is no.
     """
     if not _pid_alive(pid):
         return False
-    if _has_proc():  # Linux
-        try:
-            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        except OSError:
-            return False
-        argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
-        if not _looks_like_server(argv):
-            return False
-        return start is None or _proc_start(pid) == start
-    if not IS_WINDOWS:  # macOS / BSD: ps shows the command line
-        try:
-            out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                                 capture_output=True, text=True, timeout=5).stdout
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return _looks_like_server(out.split())
-    # Windows: tasklist can't show command lines; ask CIM. Unverifiable -> no.
-    try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
-            capture_output=True, text=True, timeout=15).stdout
-    except (OSError, subprocess.SubprocessError):
+    actual_start, argv = _proc_info(pid)
+    if not _looks_like_server(argv):
         return False
-    return _looks_like_server([a.strip('"') for a in out.split()])
+    return start is None or actual_start == start
 
 
 def _terminate(pid: int) -> None:

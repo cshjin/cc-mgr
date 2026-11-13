@@ -38,9 +38,11 @@ pidfile `cc_mgr.<host>.pid` (0600, holds the token) and log `cc_mgr.<host>.log`
 (0600; neither the banner nor uvicorn's access log ever records the token) — the
 repo often sits on a filesystem every node mounts, and a PID only means something
 on its own host. Startup also tightens state/exports an older version left
-world-readable. `stop` signals a PID only if its command line is
-`… cc-mgr.py run …` and (Linux) its start time matches the pidfile — via `/proc`,
-`ps` on macOS/BSD, PowerShell/CIM on Windows; if identity can't be established it
+world-readable. `stop` signals a PID only if its command line is a Python
+interpreter running `…/cc-mgr.py run …` (parsed like the interpreter does, so
+`python -c …`/`-m …` or an editor on the file don't count) and its start time
+matches the one recorded in the pidfile — via `/proc` on Linux, `ps` on
+macOS/BSD, PowerShell/CIM on Windows; if identity can't be established it
 refuses. It then kills the process group (Windows: `taskkill /T`, POSIX:
 `killpg`). Note `_pid_alive` uses `tasklist` on Windows — never `os.kill(pid, 0)`,
 which would terminate the process there.
