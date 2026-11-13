@@ -88,12 +88,12 @@ def _security_env(host: str, token: str, read_only: bool) -> dict[str, str]:
 
 def _write_pidfile(pid: int, host: str, port: int, token: str = "") -> None:
     path = _pid_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # The pidfile holds the access token: create it owner-only.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump({"pid": pid, "host": host, "port": port, "token": token,
-                   "hostname": _host_tag()}, fh)
+                   "hostname": _host_tag(), "start": _proc_start(pid)}, fh)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -155,21 +155,52 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
-def _is_cc_mgr_process(pid: int) -> bool:
-    """True only if pid is alive here AND is a cc-mgr.py process.
+def _proc_start(pid: int) -> int | None:
+    """Process start time in clock ticks since boot (Linux), else None.
+
+    Recorded in the pidfile: a PID that was reused since has a different start.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        # field 22 (starttime); fields after "(comm)" start at field 3
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _looks_like_server(argv: list[str]) -> bool:
+    """argv of `python …/cc-mgr.py run …` (not merely any mention of the file)."""
+    return any(Path(a).name == "cc-mgr.py" and argv[i + 1] == "run"
+               for i, a in enumerate(argv[:-1]))
+
+
+def _is_cc_mgr_process(pid: int, start: int | None = None) -> bool:
+    """True only if pid is alive here AND is a cc_mgr server we started.
 
     A pidfile can outlive its server and the PID can be reused by anything,
     so a bare "is the PID alive" check could make `stop` signal an unrelated
-    process. Where /proc exists, the command line must mention cc-mgr.py.
+    process. The command line must be `… cc-mgr.py run …` and, when the
+    pidfile recorded one, the process start time must match.
     """
     if not _pid_alive(pid):
         return False
-    if Path("/proc/self/cmdline").exists():
+    if Path("/proc/self/cmdline").exists():  # Linux
         try:
-            return b"cc-mgr.py" in Path(f"/proc/{pid}/cmdline").read_bytes()
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
             return False
-    return True  # no /proc (macOS, Windows): best effort
+        argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        if not _looks_like_server(argv):
+            return False
+        return start is None or _proc_start(pid) == start
+    if not IS_WINDOWS:  # macOS / BSD: ps shows the command line
+        try:
+            out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return _looks_like_server(out.split())
+    return True  # Windows: tasklist can't show the command line; best effort
 
 
 def _terminate(pid: int) -> None:
@@ -316,8 +347,7 @@ def _serve(host: str, port: int, reload: bool, auto_port: bool = False,
               "travels unencrypted. Prefer the default bind plus `ssh -L`.", file=sys.stderr)
 
     _write_pidfile(os.getpid(), host, port, token)
-    print(f"cc_mgr serving on {_url(host, port, token)}  (pid {os.getpid()})"
-          + ("  [read-only]" if read_only else ""))
+    print(_banner(host, port, token, read_only, sys.stdout.isatty()))
     print("Press Ctrl+C to stop." if sys.stdout.isatty() else "", flush=True)
     try:
         # The dual-loopback default needs two listening sockets, which the
@@ -335,6 +365,29 @@ def _serve(host: str, port: int, reload: bool, auto_port: bool = False,
         _clear_pidfile()
 
 
+def _banner(host: str, port: int, token: str, read_only: bool, tty: bool) -> str:
+    """Startup line. The token stays out of logs: a background server's stdout
+    is a log file (`run --background` / `status` print the full URL from the
+    0600 pidfile instead)."""
+    shown = _url(host, port, token) if tty else (
+        _url(host, port) + ("?token=<see `cc-mgr.py status`>" if token else ""))
+    return (f"cc_mgr serving on {shown}  (pid {os.getpid()})"
+            + ("  [read-only]" if read_only else ""))
+
+
+def _open_log() -> int:
+    """Append-only fd for the background log, owner-only even if an older run
+    left a world-readable log behind."""
+    log_file = _log_file()
+    log_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.chmod(log_file, 0o600)
+    except OSError:
+        pass
+    return fd
+
+
 def _die_port_in_use(port: int, holder: str | None, no_alt: bool = False) -> None:
     msg = [f"Port {port} is already in use"]
     if holder:
@@ -350,7 +403,7 @@ def _die_port_in_use(port: int, holder: str | None, no_alt: bool = False) -> Non
 
 def cmd_run(args: argparse.Namespace) -> int:
     existing = _read_pidfile()
-    if existing and _is_cc_mgr_process(existing["pid"]):
+    if existing and _is_cc_mgr_process(existing["pid"], existing.get("start")):
         print(f"cc_mgr already running on {_host_tag()} (pid {existing['pid']} on "
               f"{_url(existing['host'], existing['port'], existing.get('token', ''))}). "
               f"Use `stop` first.")
@@ -375,8 +428,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.read_only:
         cmd.append("--read-only")
     log_file = _log_file()
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_file, "ab") as logf:  # the child keeps its own copy of the fd
+    with os.fdopen(_open_log(), "ab") as logf:  # the child keeps its own copy of the fd
         if IS_WINDOWS:
             flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             subprocess.Popen(cmd, stdout=logf, stderr=logf,
@@ -389,7 +441,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # The child writes its own pidfile at startup; give it a moment, then verify.
     time.sleep(1.5)
     info = _read_pidfile()
-    if info and _is_cc_mgr_process(info["pid"]):
+    if info and _is_cc_mgr_process(info["pid"], info.get("start")):
         print(f"cc_mgr started in background (pid {info['pid']}) on "
               f"{_url(info['host'], info['port'], info.get('token', ''))}")
         print(f"Logs: {log_file}")
@@ -408,7 +460,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
         # is provably a cc_mgr process on *this* host.
         legacy = DATA_DIR / LEGACY_PID_NAME
         linfo = _read_pidfile(legacy)
-        if linfo and _is_cc_mgr_process(linfo["pid"]):
+        if linfo and _is_cc_mgr_process(linfo["pid"], linfo.get("start")):
             info, path = linfo, legacy
         else:
             print(f"No cc_mgr pidfile for this host ({host}) — nothing to stop "
@@ -417,8 +469,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 print(f"  A pidfile from {other} lists pid {oinfo['pid']}; "
                       "run `stop` on that machine.")
             return 1
-    pid = info["pid"]
-    if not _is_cc_mgr_process(pid):
+    pid, start = info["pid"], info.get("start")
+    if not _is_cc_mgr_process(pid, start):
         print(f"cc_mgr not running on {host} (stale pidfile for pid {pid}); cleaning up.")
         _clear_pidfile(path)
         return 0
@@ -426,10 +478,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
     _terminate(pid)
     # wait briefly for it to die
     for _ in range(20):
-        if not _is_cc_mgr_process(pid):
+        if not _is_cc_mgr_process(pid, start):
             break
         time.sleep(0.1)
-    if _is_cc_mgr_process(pid):
+    if _is_cc_mgr_process(pid, start):
         print(f"Process {pid} did not exit; you may need to kill it manually.")
         return 1
     _clear_pidfile(path)
@@ -440,7 +492,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     host = _host_tag()
     info = _read_pidfile()
-    if info and _is_cc_mgr_process(info["pid"]):
+    if info and _is_cc_mgr_process(info["pid"], info.get("start")):
         print(f"cc_mgr running on {host} (pid {info['pid']}) on "
               f"{_url(info['host'], info['port'], info.get('token', ''))}")
         rc = 0

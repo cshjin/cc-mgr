@@ -71,3 +71,9 @@ def test_one_broken_adapter_neither_stops_nor_prunes(claude_home, gemini_home, m
     assert "gemini" in stats["errors"]
     assert index_db.search("gemini", agent="gemini") == before  # not pruned
     assert index_db.search("hello", agent="claude")  # the other agents still indexed
+
+
+def test_index_db_is_owner_only(claude_home):
+    import stat
+    index_db.reindex()
+    assert stat.S_IMODE(index_db.db_path().stat().st_mode) == 0o600  # it copies every conversation

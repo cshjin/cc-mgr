@@ -6,6 +6,7 @@ changed sessions, and drop rows for sessions/projects that no longer exist.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterator
@@ -26,7 +27,16 @@ def db_path() -> Path:
 
 def _connect() -> sqlite3.Connection:
     p = db_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
+    p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The index copies every conversation, so keep it owner-only (SQLite gives
+    # its -wal/-journal files the same mode as the database).
+    if not p.exists():
+        os.close(os.open(p, os.O_WRONLY | os.O_CREAT, 0o600))
+    else:
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
     return conn

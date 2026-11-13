@@ -285,8 +285,9 @@ def api_delete(project: str, session_id: str, req: DeleteRequest,
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:  # the agent's own CLI refused or failed
         raise HTTPException(status_code=502, detail=str(e))
-    try:  # the search index is a cache: keep it from offering a deleted session
-        index_db.remove_session(ad.capabilities.agent_id, session_id)
+    try:  # the search index is a cache: keep it from offering deleted sessions
+        for sid in result.get("sessions") or [session_id]:
+            index_db.remove_session(ad.capabilities.agent_id, sid)
     except sqlite3.Error as e:
         result.setdefault("warnings", []).append(f"search index not updated: {e}")
     result["export"] = export_path

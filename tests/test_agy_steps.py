@@ -69,6 +69,16 @@ def test_db_problems_are_reported_not_swallowed(agy_home):
     assert not (agy_home / "brain" / CID).exists()
 
 
+def test_soft_delete_aborts_when_the_summary_row_cannot_be_backed_up(agy_home):
+    import pytest
+    pname = _pname()
+    (agy_home / "conversation_summaries.db").write_bytes(b"definitely not a sqlite database " * 40)
+    with pytest.raises(RuntimeError, match="nothing was deleted"):
+        AgyAdapter().delete_session(pname, CID, hard=False)
+    assert (agy_home / "brain" / CID / ".system_generated").is_dir()  # untouched
+    assert not (agy_home / ".cc_mgr_trash").exists()
+
+
 def test_subagent_conversations_carry_their_parent(agy_home):
     child = "99999999-2222-3333-4444-555555555555"
     d = agy_home / "brain" / child / ".system_generated" / "logs"

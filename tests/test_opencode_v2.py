@@ -1,10 +1,16 @@
 """OpenCode v2 schema (#9) and v2-aware writes (#10)."""
 import json
+import os
+import socket
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from backend import index_db
 from backend.agents import UnsupportedCapability
 from backend.agents import opencode as oc
 from backend.agents.opencode import OpencodeAdapter
@@ -97,7 +103,7 @@ def test_v2_api_routes(opencode_v2_home):
 
 @pytest.fixture
 def fake_opencode_cli(opencode_v2_home, monkeypatch):
-    """Pretend the local `opencode` CLI manages this DB; record and apply its calls."""
+    """Pretend the running OpenCode service holds this DB; record and apply its calls."""
     db = opencode_v2_home / "opencode.db"
     calls = []
 
@@ -114,7 +120,7 @@ def fake_opencode_cli(opencode_v2_home, monkeypatch):
         conn.close()
 
     monkeypatch.setattr(oc, "_opencode_cli", lambda: "/fake/bin/opencode")
-    monkeypatch.setattr(oc, "_cli_paths", lambda: {"db": str(db)})
+    monkeypatch.setattr(oc, "_service_db_files", lambda: {os.path.realpath(db)})
     monkeypatch.setattr(oc, "_run_opencode", fake_run)
     return calls
 
@@ -133,24 +139,127 @@ def test_v2_hard_delete_goes_through_opencode(fake_opencode_cli):
     res = a.delete_session(_pname(), "ses_v2_parent", hard=True)
     assert fake_opencode_cli == [["session", "delete", "ses_v2_parent"]]
     assert res["trash"] is None
+    assert res["sessions"] == ["ses_v2_parent", "ses_v2_child"]  # cascaded descendants reported
     assert {s.session_id for s in a.list_sessions(_pname())} == {"ses_old"}  # child went too
+
+
+def test_v2_hard_delete_purges_descendants_from_the_index(fake_opencode_cli):
+    index_db.reindex()
+    assert any(h["session_id"] == "ses_v2_child" for h in index_db.search("sub task", agent="opencode"))
+    r = TestClient(app).post(f"/api/projects/{_pname()}/sessions/ses_v2_parent/delete",
+                             params={"agent": "opencode"}, json={"export_first": False, "hard": True})
+    assert r.status_code == 200, r.text
+    assert index_db.search("sub task", agent="opencode") == []
 
 
 def test_v2_delete_fails_loudly_if_opencode_did_nothing(opencode_v2_home, monkeypatch):
     db = opencode_v2_home / "opencode.db"
     monkeypatch.setattr(oc, "_opencode_cli", lambda: "/fake/bin/opencode")
-    monkeypatch.setattr(oc, "_cli_paths", lambda: {"db": str(db)})
+    monkeypatch.setattr(oc, "_service_db_files", lambda: {os.path.realpath(db)})
     monkeypatch.setattr(oc, "_run_opencode", lambda args: None)
     with pytest.raises(RuntimeError):
         OpencodeAdapter().delete_session(_pname(), "ses_v2_parent", hard=True)
 
 
-def test_v2_delete_refuses_a_db_opencode_does_not_manage(opencode_v2_home, monkeypatch, tmp_path):
+def test_v2_delete_refuses_a_db_the_service_does_not_hold(opencode_v2_home, monkeypatch, tmp_path):
     monkeypatch.setattr(oc, "_opencode_cli", lambda: "/fake/bin/opencode")
-    monkeypatch.setattr(oc, "_cli_paths", lambda: {"db": str(tmp_path / "other.db")})
+    monkeypatch.setattr(oc, "_service_db_files", lambda: {os.path.realpath(tmp_path / "other.db")})
     monkeypatch.setattr(oc, "_run_opencode", lambda args: pytest.fail("must not call opencode"))
     with pytest.raises(UnsupportedCapability):
         OpencodeAdapter().delete_session(_pname(), "ses_v2_parent", hard=True)
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc")
+def test_service_db_identity_comes_from_the_running_process(opencode_v2_home, monkeypatch, tmp_path):
+    # OPENCODE_DB points cc_mgr at the fixture DB, while "the service" (a real
+    # process) holds a different database open — writes must be refused.
+    other = tmp_path / "service.db"
+    sqlite3.connect(other).close()
+    holder = subprocess.Popen(
+        [sys.executable, "-c", f"import sys, time; f = open({str(other)!r}, 'rb'); "
+                               "print('ready', flush=True); time.sleep(60)"],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        info = {"pid": holder.pid, "hostname": socket.gethostname()}
+
+        class Proc:
+            returncode = 0
+            stderr = ""
+            stdout = json.dumps(info)
+
+        monkeypatch.setattr(oc, "_opencode_cli", lambda: "/fake/bin/opencode")
+        monkeypatch.setattr(oc.subprocess, "run", lambda *a, **k: Proc())
+        monkeypatch.setattr(oc, "_run_opencode", lambda args: pytest.fail("must not call opencode"))
+        assert oc._service_db_files() == {os.path.realpath(other)}
+        assert oc._is_cli_managed(other)
+        assert not oc._is_cli_managed(opencode_v2_home / "opencode.db")
+        with pytest.raises(UnsupportedCapability):
+            OpencodeAdapter().delete_session(_pname(), "ses_v2_parent", hard=True)
+        Proc.stdout = json.dumps({**info, "hostname": "another-node"})
+        assert oc._service_db_files() is None  # a service elsewhere can't be verified
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+# ---- context statistics (review follow-up) ----
+
+def _v2_db(path, messages):
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+            model TEXT, tokens_output INTEGER, time_created INTEGER, time_updated INTEGER,
+            time_archived INTEGER);
+        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+            time_created INTEGER, time_updated INTEGER, data TEXT);
+    """)
+    conn.execute("INSERT INTO session_v2 VALUES ('s', NULL, '/w', 't', NULL, 0, 1, 2, NULL)")
+    for seq, (mtype, data) in enumerate(messages, 1):
+        conn.execute("INSERT INTO session_message VALUES (?, 's', ?, ?, ?, ?, ?)",
+                     (f"m{seq}", mtype, seq, seq, seq, json.dumps(data)))
+    conn.commit()
+    conn.close()
+
+
+def _turn(model, ctx=None):
+    data = {"model": {"id": model}, "content": [{"type": "text", "text": "x"}]}
+    if ctx is not None:
+        data["tokens"] = {"input": ctx, "output": 0, "cache": {"read": 0, "write": 0}}
+    return ("assistant", data)
+
+
+@pytest.mark.parametrize("messages, expected", [
+    # a Claude turn above 200k proves the tier even without a compaction afterwards
+    ([_turn("claude-opus-5.5", 250_000), _turn("claude-opus-5.5", 100_000)], (100_000, True)),
+    # a GPT compaction at 300k proves nothing about the Claude window
+    ([("compaction", {"summary": "s", "model": {"id": "gpt-6-astra"},
+                      "tokens": {"input": 300_000}}), _turn("claude-opus-5.5", 100_000)],
+     (100_000, False)),
+    # unfinished (token-less) turns don't hide the last real context
+    ([_turn("claude-opus-5.5", 120_000)] + [_turn("claude-opus-5.5")] * 6, (120_000, False)),
+])
+def test_v2_context_uses_full_history_per_model(tmp_path, monkeypatch, messages, expected):
+    db = tmp_path / "ctx.db"
+    _v2_db(db, messages)
+    monkeypatch.setenv("OPENCODE_DB", str(db))
+    s = OpencodeAdapter().list_sessions("-w")[0]
+    assert (s.context_tokens, s.context_limit_known) == expected
+
+
+def test_v2_mixed_part_storage_keeps_both(tmp_path, monkeypatch):
+    db = tmp_path / "mixed.db"
+    _v2_db(db, [("assistant", {"model": {"id": "m"}, "content": [{"type": "text", "text": "tail"}]})])
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE session_part (message_id TEXT, session_id TEXT, ordinal INTEGER, "
+                 "type TEXT, call_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)")
+    conn.execute("INSERT INTO session_part VALUES ('m1', 's', 0, 'text', NULL, 1, 1, ?)",
+                 (json.dumps({"type": "text", "text": "prefix"}),))
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("OPENCODE_DB", str(db))
+    blocks = OpencodeAdapter().get_conversation("-w", "s")["turns"][0]["blocks"]
+    assert [b["text"] for b in blocks] == ["prefix", "tail"]
 
 
 # ---- locating the DB in v2 ----

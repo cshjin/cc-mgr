@@ -69,6 +69,58 @@ def test_legit_claude_delete_still_works(claude_home):
     assert (claude_home / "projects").is_dir()
 
 
+# ---- review follow-ups ----
+
+def test_deleting_session_memory_cannot_remove_shared_memory(claude_home):
+    mem = claude_home / "projects" / "-tmp-repo_claude" / "memory"
+    mem.mkdir()
+    (mem / "MEMORY.md").write_text("keep me")
+    r = client.post("/api/projects/-tmp-repo_claude/sessions/memory/delete",
+                    json={"export_first": False, "hard": True})
+    assert r.status_code == 400
+    assert (mem / "MEMORY.md").read_text() == "keep me"
+
+
+@pytest.mark.parametrize("agent", ["claude", "agy"])
+def test_deleting_a_session_that_does_not_exist_is_404(claude_home, agy_home, agent):
+    before = {h: _snapshot(h) for h in (claude_home, agy_home)}
+    r = client.post("/api/projects/-tmp-repo_claude/sessions/nope/delete", params={"agent": agent},
+                    json={"export_first": True, "hard": True})
+    assert r.status_code == 404, r.text
+    assert {h: _snapshot(h) for h in (claude_home, agy_home)} == before
+
+
+def test_symlinked_project_dir_cannot_redirect_a_delete(claude_home, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.jsonl").write_text('{"type": "user", "message": {"content": "hi"}}')
+    (claude_home / "projects" / "evil").symlink_to(outside, target_is_directory=True)
+    r = client.post("/api/projects/evil/sessions/victim/delete",
+                    json={"export_first": False, "hard": True})
+    assert r.status_code == 400
+    assert (outside / "victim.jsonl").exists()
+
+
+def test_symlinked_memory_file_cannot_redirect_a_write(claude_home, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("original")
+    mem = claude_home / "projects" / "-tmp-repo_claude" / "memory"
+    mem.mkdir()
+    (mem / "linked.md").symlink_to(outside)
+    r = client.put("/api/projects/-tmp-repo_claude/memory",
+                   json={"name": "linked.md", "content": "overwritten"})
+    assert r.status_code == 400
+    assert outside.read_text() == "original"
+
+
+def test_exports_are_owner_only(claude_home, tmp_path, monkeypatch):
+    import stat
+    monkeypatch.setenv("CC_MGR_EXPORT_DIR", str(tmp_path / "exports"))
+    out = store.export_session_to_file("-tmp-repo_claude", "sess-c1")
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert stat.S_IMODE((tmp_path / "exports").stat().st_mode) == 0o700
+
+
 def test_validators():
     assert is_safe_id("ses_e2e98941fffez5mDfexIFBs9vS")
     assert is_safe_id("session-2026-06-03T23-38-ab4cc0f2")

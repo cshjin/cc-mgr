@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -28,12 +29,30 @@ def is_safe_name(value: str | None) -> bool:
 
 
 def safe_join(root: Path, *parts: str) -> Path:
-    """Join parts under root, refusing any result that escapes root."""
-    base = os.path.abspath(root)
-    target = os.path.abspath(os.path.join(base, *parts))
+    """Join parts under root, refusing any result that escapes root.
+
+    Symlinks are resolved on both sides, so a symlinked project directory or
+    memory file can't redirect a write/move/delete outside root.
+    """
+    base = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(base, *parts))
     if target != base and not target.startswith(base + os.sep):
         raise ValueError(f"path escapes {root}: {parts!r}")
-    return Path(target)
+    return Path(os.path.abspath(os.path.join(root, *parts)))
+
+
+def private_mkdir(path: Path) -> Path:
+    """mkdir -p, creating missing directories owner-only (0700)."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def write_private(path: Path, text: str) -> Path:
+    """Write text to a file only its owner can read (0600)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -46,12 +65,18 @@ def data_dir() -> Path:
     return Path(env).expanduser() if env else REPO_DIR / "data"
 
 
+def export_root() -> Path:
+    """Where session exports go: $CC_MGR_EXPORT_DIR or <repo>/exports."""
+    env = os.environ.get("CC_MGR_EXPORT_DIR")
+    return Path(env).expanduser() if env else REPO_DIR / "exports"
+
+
 def default_export_dir(project: str) -> Path:
-    """<exports>/<project>/ for session exports ($CC_MGR_EXPORT_DIR or <repo>/exports)."""
+    """<export_root>/<project>/; exports hold full conversations, so the root is
+    created owner-only."""
     if not is_safe_name(project):
         raise ValueError("invalid project name")
-    env = os.environ.get("CC_MGR_EXPORT_DIR")
-    return safe_join(Path(env).expanduser() if env else REPO_DIR / "exports", project)
+    return safe_join(private_mkdir(export_root()), project)
 
 
 def connect_sqlite_ro(db_file: Path, timeout: float = 5.0) -> sqlite3.Connection:
@@ -60,10 +85,15 @@ def connect_sqlite_ro(db_file: Path, timeout: float = 5.0) -> sqlite3.Connection
     mode=ro takes the normal shared locks and reads the -wal file, so it sees
     every committed transaction and never returns torn pages. immutable=1 skips
     both: while the owner writes, it misses un-checkpointed data and can report
-    "database disk image is malformed". It is only a fallback for files mode=ro
-    can't open (e.g. no access to the -shm file).
+    "database disk image is malformed". So it is only a fallback for a file
+    mode=ro can't *open* (e.g. no access to the -shm file) — never for lock
+    contention, which must surface rather than turn into a stale read — and
+    it keeps mode=ro so it can't create a file either.
     """
-    uri = Path(db_file).resolve().as_uri()
+    path = Path(db_file)
+    if not path.is_file():
+        raise FileNotFoundError(f"no such database: {db_file}")
+    uri = path.resolve().as_uri()
     try:
         conn = sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=timeout)
         try:
@@ -71,10 +101,23 @@ def connect_sqlite_ro(db_file: Path, timeout: float = 5.0) -> sqlite3.Connection
         except sqlite3.Error:
             conn.close()
             raise
-    except sqlite3.Error:
-        conn = sqlite3.connect(f"{uri}?immutable=1", uri=True)
+    except sqlite3.OperationalError as e:
+        if not _cannot_open(e):
+            raise
+        logging.getLogger(__name__).warning(
+            "%s: read-only open failed (%s); reading it as immutable, so recent "
+            "writes may be missing", db_file, e)
+        conn = sqlite3.connect(f"{uri}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _cannot_open(e: sqlite3.Error) -> bool:
+    name = getattr(e, "sqlite_errorname", "") or ""
+    if name:
+        return name.startswith(("SQLITE_CANTOPEN", "SQLITE_READONLY"))
+    msg = str(e).lower()  # Python < 3.11 has no error names
+    return "unable to open" in msg or "readonly" in msg
 
 
 def context_limit_for(observed_tokens: int) -> dict[str, Any]:

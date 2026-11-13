@@ -55,12 +55,36 @@ def test_connect_sqlite_ro_falls_back_to_immutable(tmp_path, monkeypatch):
     c.commit()
     c.close()
     real_connect = sqlite3.connect
+    uris = []
 
     def fake_connect(database, *args, **kwargs):
-        if "mode=ro" in str(database):
+        uris.append(str(database))
+        if str(database).endswith("?mode=ro"):
             raise sqlite3.OperationalError("unable to open database file")
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(sqlite3, "connect", fake_connect)
     conn = common.connect_sqlite_ro(db)
     assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+    assert uris[-1].endswith("?mode=ro&immutable=1")  # still can't create or write
+
+
+def test_lock_contention_is_not_turned_into_a_stale_read(tmp_path):
+    db = tmp_path / "locked.db"
+    w = sqlite3.connect(db)  # rollback journal: an exclusive lock blocks readers
+    w.execute("CREATE TABLE t(x)")
+    w.commit()
+    w.execute("BEGIN EXCLUSIVE")
+    w.execute("INSERT INTO t VALUES (1)")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            common.connect_sqlite_ro(db, timeout=0.1)
+    finally:
+        w.rollback()
+        w.close()
+
+
+def test_missing_database_is_never_created(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        common.connect_sqlite_ro(tmp_path / "absent.db")
+    assert not (tmp_path / "absent.db").exists()

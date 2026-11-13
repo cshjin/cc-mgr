@@ -22,8 +22,8 @@ from typing import Any, Iterator
 
 from .agents.common import (  # re-exported: store's public names stay importable
     CTX_TIERS, STD_WINDOW, SessionSummary, context_limit_for as _context_limit_for,
-    context_window, default_export_dir, is_safe_id, is_safe_name, read_git_info,
-    safe_join,
+    context_window, default_export_dir, is_safe_id, is_safe_name, private_mkdir,
+    read_git_info, safe_join, write_private,
 )
 
 
@@ -62,7 +62,22 @@ def _project_dir(project: str) -> Path:
 def _session_id(session_id: str) -> str:
     if not is_safe_id(session_id):
         raise ValueError("invalid session id")
+    if session_id in _RESERVED_IDS:
+        raise ValueError(f"'{session_id}' is not a session id")
     return session_id
+
+
+# Directory names inside a project folder that are not session sidecars: a
+# "session" called memory would make delete_session remove the shared memory.
+_RESERVED_IDS = {"memory"}
+
+
+def _transcript(project: str, session_id: str) -> Path:
+    """The session's transcript; FileNotFoundError if there is none."""
+    path = safe_join(_project_dir(project), f"{_session_id(session_id)}.jsonl")
+    if not path.is_file():
+        raise FileNotFoundError(f"session {session_id} not found in {project}")
+    return path
 
 
 def _task_dir(session_id: str) -> Path:
@@ -410,7 +425,7 @@ def save_memory_file(project: str, name: str, content: str) -> Path:
         raise ValueError("memory files must end in .md")
     mem_dir = _project_dir(project) / "memory"
     mem_dir.mkdir(parents=True, exist_ok=True)
-    out = mem_dir / name
+    out = safe_join(mem_dir, name)  # also refuses a symlink pointing outside memory/
     out.write_text(content, encoding="utf-8")
     return out
 
@@ -477,7 +492,7 @@ def get_conversation(
     prompts, keeping the viewer focused on prompts and responses. Returns
     {total, offset, limit, turns} so the UI can lazily page huge sessions.
     """
-    path = _project_dir(project) / f"{_session_id(session_id)}.jsonl"
+    path = safe_join(_project_dir(project), f"{_session_id(session_id)}.jsonl")
     if not path.is_file():
         return {"total": 0, "offset": offset, "limit": limit, "turns": []}
 
@@ -547,13 +562,13 @@ def export_session_markdown(project: str, session_id: str) -> str:
 
 def export_session_to_file(project: str, session_id: str, out_dir: Path | None = None) -> Path:
     """Write the session export to exports/<project>/<session>.md and return the path."""
+    transcript = _transcript(project, session_id)
     if out_dir is None:
         out_dir = default_export_dir(project)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    private_mkdir(out_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_path = out_dir / f"{_session_id(session_id)}.{stamp}.md"
-    out_path.write_text(export_session_markdown(project, session_id), encoding="utf-8")
-    return out_path
+    out_path = out_dir / f"{transcript.stem}.{stamp}.md"
+    return write_private(out_path, export_session_markdown(project, session_id))
 
 
 def save_session_as_memory(project: str, session_id: str) -> Path:
@@ -629,8 +644,7 @@ def delete_session(project: str, session_id: str, hard: bool = False) -> dict[st
     Set hard=True to permanently remove instead.
     """
     proj_dir = _project_dir(project)
-    _session_id(session_id)
-    jsonl = proj_dir / f"{session_id}.jsonl"
+    jsonl = _transcript(project, session_id)  # only sessions that exist can be deleted
     sidecar = safe_join(proj_dir, session_id)
     tdir = _task_dir(session_id)
 

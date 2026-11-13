@@ -41,8 +41,8 @@ from typing import Any, Iterator
 from . import AgentAdapter, Capabilities
 from .common import (
     SessionSummary, connect_sqlite_ro, context_window, default_export_dir,
-    is_safe_id, iter_jsonl, read_doc_file, read_git_info, safe_join,
-    save_doc_file,
+    is_safe_id, iter_jsonl, private_mkdir, read_doc_file, read_git_info,
+    safe_join, save_doc_file, write_private,
 )
 
 # Step types that carry a tool's output.
@@ -640,7 +640,7 @@ class AgyAdapter(AgentAdapter):
             raise FileNotFoundError("no working directory known for this project")
         target_dir = Path(cwd) / ".agents" / "rules"
         target_dir.mkdir(parents=True, exist_ok=True)
-        out = target_dir / name
+        out = safe_join(target_dir, name)  # refuses a symlink pointing outside rules/
         out.write_text(content, encoding="utf-8")
         return out
 
@@ -671,16 +671,24 @@ class AgyAdapter(AgentAdapter):
             lines.append("")
         return "\n".join(lines)
 
-    def export_session_to_file(self, project: str, session_id: str, out_dir: Path | None = None) -> Path:
+    def _transcript(self, session_id: str) -> Path:
+        """The session's transcript; FileNotFoundError if it isn't a session."""
         if not is_safe_id(session_id):
             raise ValueError("invalid session id")
+        path = (safe_join(self._home() / "brain", session_id)
+                / ".system_generated" / "logs" / "transcript.jsonl")
+        if not path.is_file():
+            raise FileNotFoundError(f"session {session_id} not found")
+        return path
+
+    def export_session_to_file(self, project: str, session_id: str, out_dir: Path | None = None) -> Path:
+        self._transcript(session_id)
         if out_dir is None:
             out_dir = default_export_dir(project)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        private_mkdir(out_dir)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         out_path = out_dir / f"{session_id}.{stamp}.md"
-        out_path.write_text(self.export_session_markdown(project, session_id), encoding="utf-8")
-        return out_path
+        return write_private(out_path, self.export_session_markdown(project, session_id))
 
     def save_session_as_memory(self, project: str, session_id: str) -> Path:
         """Distill an AGY session into a summary markdown file in project memory."""
@@ -718,25 +726,28 @@ class AgyAdapter(AgentAdapter):
 
         target_dir = Path(cwd) / ".agents" / "rules"
         target_dir.mkdir(parents=True, exist_ok=True)
-        out = target_dir / f"session_{short}.md"
+        out = safe_join(target_dir, f"session_{short}.md")
         out.write_text("\n".join(body), encoding="utf-8")
         return out
 
     def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
         """Delete an AGY session.
 
-        Soft (default): brain/<id>, conversations/<id>.*, and annotations/<id>.*
-        move to .cc_mgr_trash/<id>.<stamp>/, and the session's
-        conversation_summaries row is saved there as conversation_summary.json
-        before it's removed from the DB, so everything can be restored.
+        Soft (default): the session's conversation_summaries row is first saved
+        as conversation_summary.json in .cc_mgr_trash/<id>.<stamp>/ — if that
+        backup can't be made, nothing is touched — then brain/<id>,
+        conversations/<id>.* and annotations/<id>.* move there too, and the row
+        is removed from the DB, so everything can be restored.
         Hard: the same items are deleted outright.
-        Problems with agy's DB (e.g. agy holding a lock) are reported in
+        A failure to remove the DB row (e.g. agy holding a lock) is reported in
         `warnings`, never swallowed.
         """
         if not is_safe_id(session_id):
             raise ValueError("invalid session id")
         home = self._home()
         brain_dir = safe_join(home / "brain", session_id)
+        if not brain_dir.is_dir():  # only real sessions can be deleted
+            raise FileNotFoundError(f"session {session_id} not found")
 
         def owned_files(dirname: str) -> list[Path]:
             d = home / dirname
@@ -750,23 +761,21 @@ class AgyAdapter(AgentAdapter):
         trash: Path | None = None
 
         if hard:
-            if brain_dir.is_dir():
-                shutil.rmtree(brain_dir)
-                moved.append(str(brain_dir))
+            shutil.rmtree(brain_dir)
+            moved.append(str(brain_dir))
             for f in files:
                 f.unlink()
                 moved.append(str(f))
         else:
+            row = self._summary_row(home, session_id)  # raises: then nothing is touched
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             trash = home / ".cc_mgr_trash" / f"{session_id}.{stamp}"
             trash.mkdir(parents=True, exist_ok=True)
-            row = self._summary_row(home, session_id, warnings)
             if row is not None:
                 (trash / "conversation_summary.json").write_text(
                     json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
-            if brain_dir.is_dir():
-                shutil.move(str(brain_dir), str(trash / "brain"))
-                moved.append(str(brain_dir))
+            shutil.move(str(brain_dir), str(trash / "brain"))
+            moved.append(str(brain_dir))
             for f in files:
                 (trash / f.parent.name).mkdir(exist_ok=True)
                 shutil.move(str(f), str(trash / f.parent.name / f.name))
@@ -792,8 +801,10 @@ class AgyAdapter(AgentAdapter):
         return result
 
     @staticmethod
-    def _summary_row(home: Path, session_id: str, warnings: list[str]) -> dict[str, Any] | None:
-        """The session's conversation_summaries row as JSON-safe data (BLOBs base64)."""
+    def _summary_row(home: Path, session_id: str) -> dict[str, Any] | None:
+        """The session's conversation_summaries row as JSON-safe data (BLOBs
+        base64); None if there is no DB or no row. Raises RuntimeError when the
+        DB can't be read, so a soft delete never drops a row it didn't back up."""
         db_file = home / "conversation_summaries.db"
         if not db_file.is_file():
             return None
@@ -805,8 +816,8 @@ class AgyAdapter(AgentAdapter):
             finally:
                 conn.close()
         except sqlite3.Error as e:
-            warnings.append(f"could not read conversation_summaries.db: {e}")
-            return None
+            raise RuntimeError(f"could not back up the session's conversation_summaries row "
+                               f"({e}); nothing was deleted") from e
         if row is None:
             return None
         return {k: ({"base64": base64.b64encode(v).decode("ascii")} if isinstance(v, bytes) else v)

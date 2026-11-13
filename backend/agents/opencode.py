@@ -27,11 +27,12 @@ Schemas (verified against real data, OpenCode 2.2.7):
   exists it is the only source of sessions. `todo` has no v2 equivalent (v2 has
   no todo tool); it still supplies read-only tasks for old sessions.
 
-Writes: on a v2 database that the local `opencode` CLI manages, archive and
-delete go through OpenCode itself (`opencode api session.update`,
-`opencode session delete`). Any other v2 database is read-only — raw SQL into
-a DB owned by a running v2 server would bypass its bookkeeping. Legacy
-v1-only databases keep the direct-SQL behaviour.
+Writes: archive and delete go through OpenCode itself (`opencode api
+session.update`, `opencode session delete`), and only when the running
+OpenCode service on this host has exactly this database file open (checked
+via `opencode api server.info` + /proc/<pid>/fd). Any other v2 database is
+read-only — raw SQL into a DB owned by a running v2 server would bypass its
+bookkeeping. Legacy v1-only databases keep the direct-SQL behaviour.
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ import functools
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -47,8 +49,9 @@ from typing import Any, Iterable, Iterator
 
 from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
-    SessionSummary, connect_sqlite_ro, context_window, default_export_dir,
-    is_safe_id, read_doc_file, read_git_info, save_doc_file,
+    STD_WINDOW, SessionSummary, connect_sqlite_ro, default_export_dir,
+    is_claude_model, is_safe_id, private_mkdir, read_doc_file,
+    read_git_info, save_doc_file, write_private,
 )
 
 
@@ -104,14 +107,53 @@ def opencode_db_path() -> Path | None:
 
 
 def _is_cli_managed(db_file: Path) -> bool:
-    """True if db_file is the database the local `opencode` CLI/service uses."""
-    cli_db = _cli_paths().get("db")
-    if not cli_db:
-        return False
+    """True only if the running OpenCode service — the process `opencode
+    session delete` / `opencode api` talk to — has exactly db_file open.
+
+    `opencode debug paths` can't tell: it inherits our environment, so with
+    OPENCODE_DB set it just echoes our override back, while the shared
+    service may be using a different database.
+    """
+    files = _service_db_files()
+    return bool(files) and os.path.realpath(db_file) in files
+
+
+def _service_db_files() -> set[str] | None:
+    """Real paths of the *.db files the running OpenCode service has open.
+
+    Asks the service for its pid and host (`opencode api server.info`) and
+    reads /proc/<pid>/fd. None when that can't be established: no CLI, no
+    service, a service on another host, or no /proc.
+    """
+    cli = _opencode_cli()
+    if not cli:
+        return None
     try:
-        return Path(cli_db).expanduser().resolve() == Path(db_file).resolve()
+        proc = subprocess.run([cli, "api", "server.info"], capture_output=True, text=True,
+                              timeout=30, stdin=subprocess.DEVNULL)
+        info = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if isinstance(info, dict) and isinstance(info.get("data"), dict):
+        info = info["data"]
+    if not isinstance(info, dict) or not isinstance(info.get("pid"), int):
+        return None
+    if str(info.get("hostname", "")).split(".")[0] != socket.gethostname().split(".")[0]:
+        return None
+    fd_dir = Path(f"/proc/{info['pid']}/fd")
+    try:
+        fds = list(fd_dir.iterdir())
     except OSError:
-        return False
+        return None
+    files = set()
+    for fd in fds:
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target.endswith(".db"):
+            files.add(os.path.realpath(target))
+    return files
 
 
 def _run_opencode(args: list[str]) -> None:
@@ -313,7 +355,8 @@ def _v2_turn(mid: str, mtype: str, data: dict[str, Any], created_ms: Any,
                 blocks.append({"type": "text", "text": f"[Attachment: {_file_label(f)}]"})
         return _turn(mid, "user", "user", ts, blocks) if blocks else None
     if mtype == "assistant":
-        blocks, has_text = _content_blocks(data.get("content") or extra_parts or [])
+        # Stored parts (session_part) come first, then the inline tail.
+        blocks, has_text = _content_blocks([*(extra_parts or []), *(data.get("content") or [])])
         if not blocks and data.get("error"):
             err = data["error"]
             msg = err.get("message") if isinstance(err, dict) else err
@@ -372,9 +415,10 @@ def _v2_turns(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]
     return turns
 
 
-def _v2_session_stats(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dict[str, Any]]:
+def _v2_session_stats(conn: sqlite3.Connection, ids: list[str],
+                      db_key: str = "") -> dict[str, dict[str, Any]]:
     stats = {sid: {"prompts": [], "user": 0, "assistant": 0, "context": 0, "peak": 0,
-                   "model": ""} for sid in ids}
+                   "peak_claude": 0, "model": ""} for sid in ids}
     for chunk in _chunks(ids):
         ph = ",".join("?" * len(chunk))
         for r in conn.execute(
@@ -388,29 +432,46 @@ def _v2_session_stats(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dic
                 f"WHERE session_id IN ({ph}) AND type IN ('user', 'assistant') "
                 f"GROUP BY session_id, type", chunk):
             stats[r["session_id"]][r["type"]] = r["n"]
-        # A compaction row records the context size when it was compacted, so a
-        # proven tier survives the drop in live context afterwards.
-        for r in conn.execute(
-                f"SELECT session_id, json_extract(data, '$.tokens') AS tokens FROM session_message "
-                f"WHERE session_id IN ({ph}) AND type = 'compaction'", chunk):
-            st = stats[r["session_id"]]
-            st["peak"] = max(st["peak"], _context_from_tokens(r["tokens"]))
-    # Live context = the newest assistant turn that has finished (has tokens).
-    # Reading every turn's tokens costs seconds on big sessions; the newest few
-    # rows come straight off the (session_id, type, seq) index.
     for sid in ids:
-        st = stats[sid]
-        for r in conn.execute(
-                "SELECT json_extract(data, '$.tokens') AS tokens, json_extract(data, '$.model') AS model "
-                "FROM session_message WHERE session_id = ? AND type = 'assistant' "
-                "ORDER BY seq DESC LIMIT 5", (sid,)):
-            st["model"] = st["model"] or _format_model_name(r["model"])
-            ctx = _context_from_tokens(r["tokens"])
+        stats[sid].update(_v2_context(conn, db_key, sid))
+    return stats
+
+
+# (db, session) -> (highest seq scanned, context stats). Reading every turn's
+# tokens means parsing every message's JSON (seconds on big sessions), so it is
+# done once and then only for rows added since.
+_CTX_CACHE: dict[tuple[str, str], tuple[int, dict[str, Any]]] = {}
+
+
+def _v2_context(conn: sqlite3.Connection, db_key: str, sid: str) -> dict[str, Any]:
+    """context = the newest finished assistant turn's tokens; peak_claude = the
+    largest context any Claude turn (or Claude compaction) reached — only that
+    can prove the 1M tier; peak = the largest context overall."""
+    top = conn.execute("SELECT MAX(seq) FROM session_message WHERE session_id = ? "
+                       "AND type IN ('assistant', 'compaction')", (sid,)).fetchone()[0] or 0
+    cached = _CTX_CACHE.get((db_key, sid))
+    if cached and cached[0] == top:
+        return dict(cached[1])
+    after, st = -1, {"context": 0, "peak": 0, "peak_claude": 0, "model": ""}
+    if cached and cached[0] < top:
+        after, st = cached[0], dict(cached[1])
+    for r in conn.execute(
+            "SELECT type, json_extract(data, '$.tokens') AS tokens, "
+            "json_extract(data, '$.model') AS model FROM session_message "
+            "WHERE session_id = ? AND type IN ('assistant', 'compaction') AND seq > ? "
+            "ORDER BY seq", (sid, after)):
+        ctx = _context_from_tokens(r["tokens"])
+        model = _format_model_name(r["model"])
+        if r["type"] == "assistant":
+            st["model"] = model or st["model"]
             if ctx:
                 st["context"] = ctx
-                break
-        st["peak"] = max(st["peak"], st["context"])
-    return stats
+        if ctx:
+            st["peak"] = max(st["peak"], ctx)
+            if is_claude_model(model):
+                st["peak_claude"] = max(st["peak_claude"], ctx)
+    _CTX_CACHE[(db_key, sid)] = (top, dict(st))
+    return st
 
 
 # ---------------------------------------------------------------------------
@@ -451,9 +512,10 @@ def _v1_turns(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]
     return turns
 
 
-def _v1_session_stats(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dict[str, Any]]:
+def _v1_session_stats(conn: sqlite3.Connection, ids: list[str],
+                      db_key: str = "") -> dict[str, dict[str, Any]]:
     stats = {sid: {"prompts": [], "user": 0, "assistant": 0, "context": 0, "peak": 0,
-                   "model": ""} for sid in ids}
+                   "peak_claude": 0, "model": ""} for sid in ids}
     for chunk in _chunks(ids):
         ph = ",".join("?" * len(chunk))
         for r in conn.execute(
@@ -475,11 +537,14 @@ def _v1_session_stats(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dic
             if role in ("user", "assistant"):
                 st[role] += 1
             if role == "assistant":
+                model = _format_model_name(data.get("modelID"))
                 ctx = _context_from_tokens(data.get("tokens"))
                 if ctx:
                     st["context"] = ctx
                     st["peak"] = max(st["peak"], ctx)
-                st["model"] = _format_model_name(data.get("modelID")) or st["model"]
+                    if is_claude_model(model):
+                        st["peak_claude"] = max(st["peak_claude"], ctx)
+                st["model"] = model or st["model"]
     return stats
 
 
@@ -612,7 +677,7 @@ class OpencodeAdapter(AgentAdapter):
                 f"AND (time_archived IS NULL OR time_archived = 0) ORDER BY time_updated DESC",
                 (cwd,)).fetchall()
             ids = [s["id"] for s in sessions]
-            stats = (_v2_session_stats if v2 else _v1_session_stats)(conn, ids)
+            stats = (_v2_session_stats if v2 else _v1_session_stats)(conn, ids, str(db_file))
             todos = _todo_counts(conn, ids)
         finally:
             conn.close()
@@ -629,7 +694,10 @@ class OpencodeAdapter(AgentAdapter):
             ctx = st.get("context", 0)
             total, opn = todos.get(sid, (0, 0))
             model = st.get("model") or _format_model_name(s["model"] if "model" in keys else "")
-            win = context_window(model, max(ctx, st.get("peak", 0)))
+            # Only a Claude turn's usage can prove the 1M tier (context_window's rule).
+            peak = max(ctx, st.get("peak", 0))
+            win = {"limit": 1_000_000 if peak > STD_WINDOW else STD_WINDOW,
+                   "known": st.get("peak_claude", 0) > STD_WINDOW}
             updated = s["time_updated"] or s["time_created"] or 0
             summaries.append(SessionSummary(
                 session_id=sid,
@@ -825,13 +893,12 @@ class OpencodeAdapter(AgentAdapter):
     def export_session_to_file(self, project: str, session_id: str, out_dir: Path | None = None) -> Path:
         if not is_safe_id(session_id):
             raise ValueError("invalid session id")
+        markdown = self.export_session_markdown(project, session_id)  # 404s unknown sessions
         if out_dir is None:
             out_dir = default_export_dir(project)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        private_mkdir(out_dir)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        out_path = out_dir / f"{session_id}.{stamp}.md"
-        out_path.write_text(self.export_session_markdown(project, session_id), encoding="utf-8")
-        return out_path
+        return write_private(out_dir / f"{session_id}.{stamp}.md", markdown)
 
     def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
         if not is_safe_id(session_id):
@@ -854,8 +921,16 @@ class OpencodeAdapter(AgentAdapter):
     def _delete_v2(self, db_file: Path, session_id: str, hard: bool) -> dict[str, Any]:
         if not _opencode_cli() or not _is_cli_managed(db_file):
             raise UnsupportedCapability(
-                "this OpenCode v2 database isn't the one the local `opencode` CLI manages, "
-                "so cc_mgr shows it read-only")
+                "this OpenCode v2 database isn't the one the running OpenCode service "
+                "has open, so cc_mgr shows it read-only")
+        conn = _connect_ro(db_file)
+        try:  # `opencode session delete` also removes every descendant session
+            tree = [r[0] for r in conn.execute(
+                "WITH RECURSIVE tree(id) AS (SELECT ? UNION "
+                "SELECT s.id FROM session_v2 s JOIN tree t ON s.parent_id = t.id) "
+                "SELECT id FROM tree", (session_id,))]
+        finally:
+            conn.close()
         if hard:
             _run_opencode(["session", "delete", session_id])
         else:
@@ -872,9 +947,9 @@ class OpencodeAdapter(AgentAdapter):
         if not hard and not (row and row["time_archived"]):
             raise RuntimeError(f"OpenCode did not archive session {session_id}")
         if hard:
-            return {"deleted": [session_id], "trash": None,
+            return {"deleted": [session_id], "trash": None, "sessions": tree,
                     "note": "Deleted in OpenCode (its subagent sessions too)."}
-        return {"deleted": [session_id], "trash": "opencode-archive",
+        return {"deleted": [session_id], "trash": "opencode-archive", "sessions": [session_id],
                 "note": "Archived in OpenCode; restore it from OpenCode's session list."}
 
     def _delete_v1(self, db_file: Path, session_id: str, hard: bool) -> dict[str, Any]:

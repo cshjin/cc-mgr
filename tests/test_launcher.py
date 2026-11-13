@@ -40,7 +40,7 @@ def test_other_hosts_pidfiles_are_left_alone(launcher, monkeypatch, capsys):
     legacy.write_text(json.dumps({"pid": 594419, "host": "loopback", "port": 8765}))
     killed = []
     monkeypatch.setattr(launcher, "_terminate", killed.append)
-    monkeypatch.setattr(launcher, "_is_cc_mgr_process", lambda pid: False)
+    monkeypatch.setattr(launcher, "_is_cc_mgr_process", lambda pid, start=None: False)
     assert launcher.cmd_stop(ARGS) == 1
     assert launcher.cmd_status(ARGS) == 1
     out = capsys.readouterr().out
@@ -60,9 +60,10 @@ def test_terminate_survives_permission_errors(launcher, monkeypatch):
 
 @pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
 def test_stop_terminates_a_real_cc_mgr_process(launcher):
-    # Stand-in whose command line mentions cc-mgr.py, in its own session like --background.
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "cc-mgr.py"],
-                            start_new_session=True)
+    # Stand-in with a server's command line (`… cc-mgr.py run …`), in its own
+    # session like --background.
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                             "cc-mgr.py", "run"], start_new_session=True)
     try:
         launcher._write_pidfile(proc.pid, "loopback", 8765)
         assert launcher.cmd_status(ARGS) == 0
@@ -72,3 +73,37 @@ def test_stop_terminates_a_real_cc_mgr_process(launcher):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+@pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
+def test_identity_needs_the_server_argv_and_the_recorded_start(launcher):
+    mention = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                                "/somewhere/cc-mgr.py"])  # e.g. an editor on the file
+    server = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                               "cc-mgr.py", "run"])
+    try:
+        assert not launcher._is_cc_mgr_process(mention.pid)
+        assert launcher._is_cc_mgr_process(server.pid)
+        start = launcher._proc_start(server.pid)
+        assert launcher._is_cc_mgr_process(server.pid, start)
+        assert not launcher._is_cc_mgr_process(server.pid, start + 1)  # PID reused since
+    finally:
+        for p in (mention, server):
+            p.kill()
+            p.wait()
+
+
+def test_background_log_never_contains_the_token(launcher):
+    line = launcher._banner("loopback", 8765, "s3cret-token", read_only=False, tty=False)
+    assert "s3cret-token" not in line and "cc-mgr.py status" in line
+    assert "s3cret-token" in launcher._banner("loopback", 8765, "s3cret-token", False, tty=True)
+
+
+def test_log_is_owner_only_even_if_it_existed(launcher):
+    import stat
+    launcher.DATA_DIR.mkdir(parents=True)
+    log = launcher._log_file()
+    log.write_text("old\n")
+    log.chmod(0o644)
+    os.close(launcher._open_log())
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600

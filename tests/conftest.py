@@ -19,6 +19,9 @@ AGENT_ENV_VARS = (
     "OPENCODE_DB", "OPENCODE_BASE", "XDG_DATA_HOME", "CC_MGR_TOKEN",
     "CC_MGR_READ_ONLY", "CC_MGR_ALLOWED_HOSTS",
 )
+# Pointed at (empty) sandbox paths, so no adapter falls back to a real home.
+AGENT_ROOT_VARS = ("CLAUDE_HOME", "AGY_HOME", "GEMINI_HOME", "CODEX_HOME",
+                   "COPILOT_HOME", "OPENCODE_DB")
 AGENT_CLIS = {"opencode", "agy", "claude", "codex", "copilot", "gemini"}
 
 
@@ -27,14 +30,20 @@ def _isolate_from_real_agent_data(tmp_path_factory, monkeypatch):
     """Never let a test read real agent data or run a real agent CLI.
 
     Autouse fixtures run before the per-agent fixtures below, which then point
-    their own env var at a synthetic home. Everything else resolves into an
-    empty sandbox (HOME and XDG_DATA_HOME included), and agent CLIs are hidden
+    their own env var at a synthetic home. Every other agent root points into
+    an empty sandbox, and so do HOME / USERPROFILE / Path.home() (Windows
+    resolves ~ from USERPROFILE) and XDG_DATA_HOME. Agent CLIs are hidden
     from shutil.which and refused by subprocess.run.
     """
     sandbox = tmp_path_factory.mktemp("no_real_data")
     for var in AGENT_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("HOME", str(sandbox / "home"))
+    for var in AGENT_ROOT_VARS:
+        monkeypatch.setenv(var, str(sandbox / f"unset_{var.lower()}"))
+    home = sandbox / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setenv("XDG_DATA_HOME", str(sandbox / "xdg_data"))
     # cc_mgr's own state (search index, exports) must never land in the repo.
     monkeypatch.setenv("CC_MGR_DATA_DIR", str(sandbox / "cc_mgr_data"))
@@ -557,7 +566,7 @@ def opencode_v2_home(tmp_path, monkeypatch):
             "error": {"type": "tool.execution", "message": "File not found: /nope"}}},
     ], "tokens": {"input": 5, "output": 7, "reasoning": 0, "cache": {"read": 1000, "write": 10}}})
     msg(p, 3, "idle", {"outcome": "succeeded"})
-    msg(p, 4, "compaction", {"summary": "## Objective\nsummary text", "reason": "auto",
+    msg(p, 4, "compaction", {"summary": "## Objective\nsummary text", "reason": "auto", "model": claude,
                              "tokens": {"input": 250000, "output": 100, "cache": {"read": 0, "write": 0}}})
     msg(p, 5, "synthetic", {"text": "<shell id=\"sh_1\">done</shell>", "description": "bg"})
     msg(p, 6, "model-switched", {"model": claude, "previous": gpt})
