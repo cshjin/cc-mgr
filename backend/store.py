@@ -11,17 +11,17 @@ Nothing is mutated here; this module is read-only.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from .agents.common import (
-    context_limit_for as _context_limit_for, context_window, default_export_dir,
-    is_safe_id, is_safe_name, safe_join,
+    SessionSummary, context_limit_for as _context_limit_for, context_window,
+    default_export_dir, is_safe_id, is_safe_name, safe_join,
 )
 
 
@@ -209,31 +209,6 @@ def _block_text(content: Any) -> str:
     return ""
 
 
-@dataclass
-class SessionSummary:
-    session_id: str
-    project: str
-    file: str
-    size_bytes: int
-    mtime: float
-    first_prompt: str = ""
-    last_prompt: str = ""
-    message_count: int = 0
-    user_turns: int = 0
-    assistant_turns: int = 0
-    context_tokens: int = 0  # peak observed context (input+cache+output) of last turn
-    context_limit: int = 200_000  # window size; assumed default unless context_limit_known
-    context_limit_known: bool = False  # True only when usage proves the tier
-    total_output_tokens: int = 0
-    model: str = ""
-    git_branch: str = ""
-    cwd: str = ""
-    has_memory: bool = False
-    open_tasks: int = 0
-    total_tasks: int = 0
-    title: str = ""
-
-
 def list_projects() -> list[dict[str, Any]]:
     """Project rows with cheap aggregates: latest activity, task progress, git.
 
@@ -291,21 +266,49 @@ def list_projects() -> list[dict[str, Any]]:
 
 
 def _scan_session(path: Path, project: str) -> SessionSummary:
-    """Single pass over a JSONL to build a lightweight summary."""
+    """Summary of one transcript, re-parsed only when the file changed.
+
+    Transcripts run to hundreds of MB and listing a project used to re-read
+    every one of them on each request (~24 s for a 100 MB project), so
+    summaries are cached by (path, mtime, size). Callers get a copy they may
+    modify (has_memory, task counts).
+    """
     stat = path.stat()
+    key = str(path)
+    hit = _SCAN_CACHE.get(key)
+    if not (hit and hit[0] == stat.st_mtime_ns and hit[1] == stat.st_size):
+        if len(_SCAN_CACHE) >= _SCAN_CACHE_MAX:
+            _SCAN_CACHE.clear()
+        hit = (stat.st_mtime_ns, stat.st_size, _scan_session_uncached(path, project, stat))
+        _SCAN_CACHE[key] = hit
+    return dataclasses.replace(hit[2], project=project)
+
+
+_SCAN_CACHE: dict[str, tuple[int, int, SessionSummary]] = {}
+_SCAN_CACHE_MAX = 4096
+
+
+def _scan_session_uncached(path: Path, project: str, stat: os.stat_result) -> SessionSummary:
+    """Single pass over a JSONL to build a lightweight summary."""
     summ = SessionSummary(
         session_id=path.stem,
         project=project,
         file=str(path),
         size_bytes=stat.st_size,
         mtime=stat.st_mtime,
+        agent="claude",
     )
     last_assistant_context = 0
     peak_assistant_context = 0
     first_user_seen = False
+    custom_title = ai_title = ""
     for rec in _iter_jsonl(path):
         rtype = rec.get("type")
-        if rtype == "user":
+        if rtype == "custom-title" and rec.get("customTitle"):
+            custom_title = rec["customTitle"]
+        elif rtype == "ai-title" and rec.get("aiTitle"):
+            ai_title = rec["aiTitle"]
+        elif rtype == "user":
             msg = rec.get("message", {})
             text = _block_text(msg.get("content"))
             # skip tool_result-only user records for prompt display
@@ -341,6 +344,7 @@ def _scan_session(path: Path, project: str) -> SessionSummary:
                 if ctx > peak_assistant_context:
                     peak_assistant_context = ctx
     summ.context_tokens = last_assistant_context
+    summ.title = custom_title or ai_title  # a name the user set beats the generated one
     # Tier is proven by the PEAK context ever reached, not the last turn: a
     # `compact` drops the live context below 200k, but if usage ever crossed
     # 200k the window must be the 1M tier — that fact must not be forgotten.
@@ -359,6 +363,8 @@ def list_sessions(project: str) -> list[SessionSummary]:
     sessions = []
     for f in d.glob("*.jsonl"):
         summ = _scan_session(f, project)
+        if summ.message_count == 0:
+            continue  # metadata-only transcript: nothing to open (it would 404)
         summ.has_memory = has_mem
         tdir = tasks_dir() / summ.session_id
         if tdir.is_dir():
@@ -724,4 +730,9 @@ def _structured_blocks(content: Any) -> list[dict[str, Any]]:
         elif t == "tool_result":
             res = blk.get("content")
             out.append({"type": "tool_result", "text": _block_text(res)})
+        elif t in ("document", "image"):
+            # Never echo the inline base64; just say what was attached.
+            src = blk.get("source") if isinstance(blk.get("source"), dict) else {}
+            what = blk.get("title") or src.get("media_type") or t
+            out.append({"type": "text", "text": f"[{t}: {what}]"})
     return out
