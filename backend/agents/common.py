@@ -73,6 +73,26 @@ def context_limit_for(observed_tokens: int) -> dict[str, Any]:
     return {"limit": STD_WINDOW, "known": False}
 
 
+_CLAUDE_HINTS = ("claude", "opus", "sonnet", "haiku")
+
+
+def is_claude_model(model: str | None) -> bool:
+    m = (model or "").lower()
+    return any(h in m for h in _CLAUDE_HINTS)
+
+
+def context_window(model: str | None, peak_tokens: int) -> dict[str, Any]:
+    """Window to show for a session that peaked at peak_tokens.
+
+    The 200k / 1M rule is Claude-specific: only for a Claude model does usage
+    above 200k prove the 1M tier. For any other (or unknown) model no tier is
+    ever claimed; the bar just scales to the tier above the observed usage.
+    """
+    if is_claude_model(model):
+        return context_limit_for(peak_tokens)
+    return {"limit": 1_000_000 if peak_tokens > STD_WINDOW else STD_WINDOW, "known": False}
+
+
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:

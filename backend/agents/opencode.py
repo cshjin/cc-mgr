@@ -47,7 +47,7 @@ from typing import Any, Iterable, Iterator
 
 from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
-    SessionSummary, connect_sqlite_ro, context_limit_for, default_export_dir,
+    SessionSummary, connect_sqlite_ro, context_window, default_export_dir,
     is_safe_id, read_doc_file, read_git_info, save_doc_file,
 )
 
@@ -624,9 +624,9 @@ class OpencodeAdapter(AgentAdapter):
             user_turns = st.get("user", 0)
             asst_turns = st.get("assistant", 0)
             ctx = st.get("context", 0)
-            win = context_limit_for(max(ctx, st.get("peak", 0)))
             total, opn = todos.get(sid, (0, 0))
             model = st.get("model") or _format_model_name(s["model"] if "model" in keys else "")
+            win = context_window(model, max(ctx, st.get("peak", 0)))
             updated = s["time_updated"] or s["time_created"] or 0
             summaries.append(SessionSummary(
                 session_id=sid,

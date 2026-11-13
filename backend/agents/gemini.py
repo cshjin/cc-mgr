@@ -26,7 +26,7 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, context_limit_for, iter_jsonl, read_doc_file, read_git_info,
+    SessionSummary, context_window, iter_jsonl, read_doc_file, read_git_info,
     save_doc_file,
 )
 
@@ -201,6 +201,7 @@ class GeminiAdapter(AgentAdapter):
                 return txt[:500] if txt else ""
             first = ""
             last = ""
+            model = ""
             total_output = 0
             last_total_ctx = 0
             for t in turns:
@@ -209,6 +210,8 @@ class GeminiAdapter(AgentAdapter):
                     if not first:
                         first = ut
                     last = ut
+                if t.get("model"):
+                    model = t["model"]
                 tok = t.get("tokens") or {}
                 total_output += tok.get("output", 0) or 0
                 if tok.get("total"):
@@ -220,9 +223,9 @@ class GeminiAdapter(AgentAdapter):
                 message_count=len(turns), user_turns=user_turns,
                 assistant_turns=asst_turns, cwd=cwd, git_branch=branch,
                 total_output_tokens=total_output, context_tokens=last_total_ctx,
-                agent="gemini",
+                agent="gemini", model=model,
             )
-            win = context_limit_for(last_total_ctx)
+            win = context_window(model, last_total_ctx)
             summ.context_limit = win["limit"]
             summ.context_limit_known = win["known"]
             out.append(summ)

@@ -19,7 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .agents.common import default_export_dir, is_safe_id, is_safe_name, safe_join
+from .agents.common import (
+    context_limit_for as _context_limit_for, context_window, default_export_dir,
+    is_safe_id, is_safe_name, safe_join,
+)
 
 
 def claude_home() -> Path:
@@ -94,10 +97,9 @@ def context_limit_for(observed_tokens: int) -> dict[str, Any]:
     Returns {limit, known}. `known` is True only when usage proves the tier
     (i.e. it exceeded the standard 200k window, so it must be the 1M variant).
     When False, `limit` is an assumed default (200k) for display, NOT a fact.
+    Shared with the other adapters (agents.common).
     """
-    if observed_tokens > STD_WINDOW * 0.98:
-        return {"limit": 1_000_000, "known": True}
-    return {"limit": STD_WINDOW, "known": False}
+    return _context_limit_for(observed_tokens)
 
 
 def read_git_info(cwd: str | None) -> dict[str, Any] | None:
@@ -342,7 +344,8 @@ def _scan_session(path: Path, project: str) -> SessionSummary:
     # Tier is proven by the PEAK context ever reached, not the last turn: a
     # `compact` drops the live context below 200k, but if usage ever crossed
     # 200k the window must be the 1M tier — that fact must not be forgotten.
-    win = context_limit_for(peak_assistant_context)
+    # (Claude Code pointed at a non-Claude model via a proxy proves nothing.)
+    win = context_window(summ.model or "claude", peak_assistant_context)
     summ.context_limit = win["limit"]
     summ.context_limit_known = win["known"]
     return summ

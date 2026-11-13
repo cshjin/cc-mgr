@@ -31,10 +31,17 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, connect_sqlite_ro, context_limit_for, default_export_dir,
+    SessionSummary, connect_sqlite_ro, context_window, default_export_dir,
     is_safe_id, iter_jsonl, read_doc_file, read_git_info, safe_join,
     save_doc_file,
 )
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def agy_home() -> Path:
@@ -332,18 +339,28 @@ class AgyAdapter(AgentAdapter):
             asst_turns = 0
             total_turns = 0
             model = s_info.get("default_model", "")
-            total_chars = 0
+            chars_since_checkpoint = 0
             asst_chars = 0
+            last_ctx = peak_ctx = real_output = 0
 
             for rec in iter_jsonl(tfile):
                 stype = rec.get("type")
                 src = rec.get("source")
                 content = rec.get("content") or ""
                 thinking = rec.get("thinking") or ""
+                if stype == "CHECKPOINT":
+                    chars_since_checkpoint = 0  # a compaction resets the live context
                 if isinstance(content, str):
-                    total_chars += len(content)
+                    chars_since_checkpoint += len(content)
                 if isinstance(thinking, str):
-                    total_chars += len(thinking)
+                    chars_since_checkpoint += len(thinking)
+                if "input_tokens" in rec:  # real usage, recorded on PLANNER_RESPONSE
+                    ctx = (_int(rec.get("input_tokens")) + _int(rec.get("cache_read_tokens"))
+                           + _int(rec.get("output_tokens")))
+                    if ctx:
+                        last_ctx = ctx
+                        peak_ctx = max(peak_ctx, ctx)
+                    real_output += _int(rec.get("output_tokens"))
 
                 if stype == "USER_INPUT" or src == "USER_EXPLICIT":
                     user_turns += 1
@@ -365,9 +382,12 @@ class AgyAdapter(AgentAdapter):
                 ):
                     total_turns += 1
 
-            est_context = total_chars // 4
-            est_output = asst_chars // 4
-            win = context_limit_for(est_context)
+            # Real token counts when agy recorded them; otherwise a rough estimate
+            # of the live context (text since the last compaction / 4). No tier is
+            # claimed: agy doesn't record which model a session used.
+            est_context = last_ctx or chars_since_checkpoint // 4
+            est_output = real_output or asst_chars // 4
+            win = context_window("", max(peak_ctx, est_context))
 
             # Check if this session has artifacts
             s_brain = home / "brain" / cid
@@ -450,7 +470,8 @@ class AgyAdapter(AgentAdapter):
                             "input": _clean_args(tc.get("args", {})),
                         })
                 if blocks:
-                    out_tok = len(content) // 4 if isinstance(content, str) else 0
+                    out_tok = _int(rec.get("output_tokens")) or (
+                        len(content) // 4 if isinstance(content, str) else 0)
                     turns.append({
                         "uuid": str(idx),
                         "role": "assistant",

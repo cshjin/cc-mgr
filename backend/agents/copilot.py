@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, block_text, context_limit_for, iter_jsonl, read_doc_file,
+    SessionSummary, block_text, context_window, iter_jsonl, read_doc_file,
     read_git_info, save_doc_file, structured_blocks,
 )
 
@@ -105,7 +105,7 @@ class CopilotAdapter(AgentAdapter):
                 user_turns=user_turns, assistant_turns=asst_turns,
                 cwd=cwd, git_branch=branch, agent="copilot",
             )
-            win = context_limit_for(0)
+            win = context_window("", 0)
             summ.context_limit = win["limit"]
             summ.context_limit_known = win["known"]
             out.append(summ)
