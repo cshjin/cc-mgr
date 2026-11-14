@@ -14,6 +14,9 @@ class ClaudeAdapter(AgentAdapter):
         agent_id="claude", label="Claude", doc_filename="CLAUDE.md",
         has_memory=True, has_tasks=True, can_edit_doc=True,
         can_delete=True, can_export=True,
+        delete_note=("A soft delete moves the transcript, its sidecar files and tasks to "
+                     "~/.claude/.cc_mgr_trash/ (reversible). Project memory is only removed "
+                     "when you ask for it."),
     )
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -38,14 +41,14 @@ class ClaudeAdapter(AgentAdapter):
     def get_doc(self, project):
         return store.get_claude_md(project)
 
-    def save_doc(self, project, content):
-        return store.save_claude_md(project, content)
+    def save_doc(self, project, content, expect_cwd=None):
+        return store.save_claude_md(project, content, expect_cwd)
 
     def get_memory(self, project):
         return store.get_memory(project)
 
-    def save_memory_file(self, project, name, content):
-        return store.save_memory_file(project, name, content)
+    def save_memory_file(self, project, name, content, expect_dir=None):
+        return store.save_memory_file(project, name, content, expect_dir)
 
     def get_tasks(self, session_id):
         return store.get_tasks(session_id)
@@ -67,3 +70,13 @@ class ClaudeAdapter(AgentAdapter):
 
     def delete_session(self, project, session_id, hard=False):
         return store.delete_session(project, session_id, hard=hard)
+
+    def project_delete_preview(self, project):
+        return store.project_delete_preview(project)
+
+    def delete_project(self, project, hard=False, include_memory=False, export_first=False,
+                       expect_cwd=None, guard=None):
+        # The name is the folder under projects/: it can't come to mean another
+        # directory, so the route's expect_cwd check covers this agent.
+        return store.delete_project(project, hard=hard, include_memory=include_memory,
+                                    export_first=export_first)

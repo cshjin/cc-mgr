@@ -40,12 +40,14 @@ const state = {
   projView: "sessions", // sessions | tasks | memory | claude
   showPrompts: true,
   sortBy: "time", // time | name
+  onlyMissing: false, // sidebar filter: only projects whose directory is gone
   convOffset: 0,
   convTotal: 0,
   agent: localStorage.getItem("cc_agent") || "",
   agents: [],
   caps: null,
   showSubagents: localStorage.getItem("cc_showSubagents") === "1",
+  pendingView: null, // the project view whose request is in flight (loadProjView)
 };
 
 const CONV_PAGE = 40;
@@ -135,6 +137,8 @@ async function loadAgents() {
     .join("");
   sel.value = state.agent;
   sel.addEventListener("change", async () => {
+    // A dialog belongs to the agent it was opened for: never let it act on another one.
+    document.querySelectorAll(".modal-overlay").forEach((o) => o.remove());
     state.agent = sel.value;
     localStorage.setItem("cc_agent", state.agent);
     state.caps = currentCaps();
@@ -160,12 +164,38 @@ function updateSubLabel() {
 
 async function loadProjects() {
   state.projects = await api("/api/projects");
+  if (state.activeProject) {
+    const p = followProject(state.projects, state.activeProject, (state.activeProjectMeta || {}).cwd);
+    if (!p) {
+      deselectProject();  // re-renders the list
+      return;
+    }
+    const renamed = p.name !== state.activeProject;
+    state.activeProject = p.name;
+    state.activeProjectMeta = p;
+    renderProjNav();  // its counts come from the project row
+    updateSearchPlaceholder();  // shows the project name
+    // a view still loading under the old name will be dropped when it answers: ask again
+    if (renamed && state.pendingView) loadProjView();
+  }
   renderProjects();
 }
 
-function sortedProjects() {
-  const ps = [...state.projects];
-  if (state.sortBy === "name") {
+// The row that is still the open project after the list reloads. Directories
+// decide, since names can change (a directory that mangles alike appeared or
+// went): the same name and directory, else the same directory under its new
+// name; a project without a known directory goes by its name. null when the
+// directory is gone, even if its old name now means another directory.
+function followProject(projects, name, cwd) {
+  if (!cwd) return projects.find((p) => p.name === name) || null;
+  return projects.find((p) => p.name === name && p.cwd === cwd)
+    || projects.find((p) => p.cwd === cwd) || null;
+}
+
+// Projects to show, filtered (only those whose directory is gone) and sorted.
+function visibleProjects(projects, sortBy, onlyMissing) {
+  const ps = projects.filter((p) => !onlyMissing || p.cwd_missing);
+  if (sortBy === "name") {
     ps.sort((a, b) => a.name.localeCompare(b.name));
   } else {
     ps.sort((a, b) => b.mtime - a.mtime);
@@ -173,19 +203,33 @@ function sortedProjects() {
   return ps;
 }
 
+function renderMissingFilter() {
+  const btn = $("#missingFilter");
+  const n = state.projects.filter((p) => p.cwd_missing).length;
+  if (!n) state.onlyMissing = false;  // nothing left to filter: never strand the list empty
+  btn.hidden = !n;
+  btn.textContent = `⚠ missing ${n}`;
+  btn.classList.toggle("active", state.onlyMissing);
+}
+
 function renderProjects() {
   const el = $("#projectList");
+  renderMissingFilter();
   if (!state.projects.length) {
     el.innerHTML = '<div class="empty">No projects found.</div>';
     return;
   }
-  el.innerHTML = sortedProjects().map((p) => {
+  const canDelete = Boolean(state.caps && state.caps.can_delete);
+  el.innerHTML = visibleProjects(state.projects, state.sortBy, state.onlyMissing).map((p) => {
     const git = p.git
       ? `<span class="pchip git" title="git repository">⎇ ${esc(p.git.branch || p.git.repo)}</span>`
       : "";
     const mem = p.has_memory ? '<span class="pchip mem">◆ mem</span>' : "";
     const docName = (state.caps && state.caps.doc_filename) || "CLAUDE.md";
     const cmd = p.has_claude_md ? `<span class="pchip cmd">${esc(docName)}</span>` : "";
+    const missing = p.cwd_missing
+      ? `<span class="pchip missing" title="This working directory no longer exists: renamed, moved, deleted, or on another machine. Its sessions are still here, under the old path.">⚠ dir missing</span>`
+      : "";
     let task = "";
     let prog = "";
     if (p.total_tasks) {
@@ -197,16 +241,25 @@ function renderProjects() {
       const donePct = ((p.total_tasks - p.open_tasks) / p.total_tasks) * 100;
       prog = `<div class="pprog"><div class="pfill" style="width:${donePct}%"></div></div>`;
     }
+    const del = canDelete
+      ? `<button class="pdel" data-name="${esc(p.name)}" title="Delete this project's sessions…">🗑</button>`
+      : "";
     return `
-      <div class="project ${p.name === state.activeProject ? "active" : ""}" data-name="${esc(p.name)}">
+      <div class="project ${p.name === state.activeProject ? "active" : ""} ${p.cwd_missing ? "gone" : ""}" data-name="${esc(p.name)}">
         <div class="pname" title="${esc(p.display_path || p.name)}">${esc(p.display_path || p.name)}</div>
-        <div class="ptime">${p.session_count} session${p.session_count === 1 ? "" : "s"} · ${fmtTime(p.mtime)}</div>
-        <div class="pbadges">${git}${mem}${cmd}${task}</div>
+        <div class="ptime">${p.session_count} session${p.session_count === 1 ? "" : "s"} · ${fmtTime(p.mtime)}${del}</div>
+        <div class="pbadges">${missing}${git}${mem}${cmd}${task}</div>
         ${prog}
       </div>`;
-  }).join("");
+  }).join("") || '<div class="empty">No projects with a missing directory.</div>';
   el.querySelectorAll(".project").forEach((node) => {
     node.addEventListener("click", () => selectProject(node.dataset.name));
+  });
+  el.querySelectorAll(".pdel").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();  // don't also open the project
+      openProjectDeleteModal(btn.dataset.name);
+    });
   });
 }
 
@@ -275,22 +328,37 @@ function renderProjNav() {
 async function loadProjView() {
   const el = $("#sessionPane");
   el.innerHTML = '<div class="loading">loading…</div>';
+  // What this view is for; a response for anything else (the user moved on
+  // meanwhile) is dropped, so an editor never shows one project's file bound
+  // to another.
+  const view = { agent: state.agent, project: state.activeProject, kind: state.projView };
+  state.pendingView = view;
+  // only the latest request may render: an older one is stale even when the name it was
+  // for comes back (hashed → plain → hashed)
+  const current = () => state.pendingView === view && state.agent === view.agent
+    && state.activeProject === view.project && state.projView === view.kind;
+  const path = (what) => `/api/projects/${encodeURIComponent(view.project)}/${what}` +
+    `?agent=${encodeURIComponent(view.agent)}`;
   try {
-    if (state.projView === "sessions") {
-      state.sessions = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions`);
+    if (view.kind === "sessions") {
+      const sessions = await api(path("sessions"));
+      if (!current()) return;
+      state.sessions = sessions;
       renderSessions();
-    } else if (state.projView === "tasks") {
-      const tasks = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/tasks`);
-      renderProjectTasks(el, tasks);
-    } else if (state.projView === "memory") {
-      const mem = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`);
-      renderMemory(el, mem, true);
-    } else if (state.projView === "claude") {
-      const cm = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/doc`);
-      renderClaudeMd(el, cm);
+    } else if (view.kind === "tasks") {
+      const tasks = await api(path("tasks"));
+      if (current()) renderProjectTasks(el, tasks);
+    } else if (view.kind === "memory") {
+      const mem = await api(path("memory"));
+      if (current()) renderMemory(el, mem, view);
+    } else if (view.kind === "claude") {
+      const cm = await api(path("doc"));
+      if (current()) renderClaudeMd(el, cm, view);
     }
   } catch (e) {
-    el.innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`;
+    if (current()) el.innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`;
+  } finally {
+    if (state.pendingView === view) state.pendingView = null;
   }
 }
 
@@ -418,7 +486,10 @@ function renderProjectTasks(el, tasks) {
   wireKanban(el, { perCard: true });
 }
 
-function renderClaudeMd(el, cm) {
+// view: the {agent, project} the document was loaded for; saving goes there,
+// with the directory shown here, so the server refuses (409) if the project
+// means another directory by now.
+function renderClaudeMd(el, cm, view) {
   const docName = (state.caps && state.caps.doc_filename) || "CLAUDE.md";
   if (!cm.cwd) {
     el.innerHTML = '<div class="empty">No working directory known for this project (no session has a cwd yet).</div>';
@@ -452,22 +523,25 @@ function renderClaudeMd(el, cm) {
         <span class="editor-status" id="cmStatus">${esc(status)}</span>
       </div>
     </div>`;
-  $("#cmSave").addEventListener("click", async () => {
-    $("#cmStatus").textContent = "saving…";
+  // The elements this editor was rendered with: the pane may show something else by the
+  // time a save finishes.
+  const editor = el.querySelector("#cmEditor");
+  const statusEl = el.querySelector("#cmStatus");
+  el.querySelector("#cmSave").addEventListener("click", async () => {
+    statusEl.textContent = "saving…";
     try {
-      const u = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/doc`,
-                        location.origin);
-      u.searchParams.set("agent", state.agent);
+      const u = new URL(`/api/projects/${encodeURIComponent(view.project)}/doc`, location.origin);
+      u.searchParams.set("agent", view.agent);
       const r = await fetch(u, {
         method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: $("#cmEditor").value }),
+        body: JSON.stringify({ content: editor.value, expect_cwd: cm.cwd }),
       });
       if (!r.ok) throw await httpError(r);
       const res = await r.json();
-      $("#cmStatus").textContent = "saved ✓";
+      statusEl.textContent = "saved ✓";
       flash(docName + " saved to " + res.saved);
     } catch (e) {
-      $("#cmStatus").textContent = "failed: " + e.message;
+      statusEl.textContent = "failed: " + e.message;
     }
   });
 }
@@ -543,8 +617,7 @@ function openDeleteModal() {
       <h3>Delete session ${esc(sid)}?</h3>
       <p>This removes the transcript, sidecar files, and tasks. By default it
          is a <b>soft delete</b> (moved to a trash folder, reversible).</p>
-      ${state.agent === "opencode" ? `<p>OpenCode: the soft delete archives the session inside
-         OpenCode; a permanent delete also removes its subagent sessions.</p>` : ""}
+      ${(state.caps || {}).delete_note ? `<p>${esc(state.caps.delete_note)}</p>` : ""}
       <label class="mrow"><input type="checkbox" id="mExport" checked /> Export to Markdown first</label>
       ${(state.caps || {}).has_memory ? '<label class="mrow"><input type="checkbox" id="mMemory" /> Save a summary to project memory</label>' : ""}
       <label class="mrow"><input type="checkbox" id="mHard" /> Permanent delete (skip trash)</label>
@@ -555,18 +628,27 @@ function openDeleteModal() {
       <div class="modal-status" id="mStatus"></div>
     </div>`;
   document.body.appendChild(overlay);
+  // Bound now: the dialog acts on exactly the session it was opened for.
+  const agent = state.agent;
+  const project = state.activeProject;
+  const session = state.activeSession;
   const close = () => overlay.remove();
   overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
-  $("#mCancel").addEventListener("click", close);
-  $("#mConfirm").addEventListener("click", async () => {
-    const exportFirst = $("#mExport").checked;
-    const saveMemory = Boolean($("#mMemory") && $("#mMemory").checked);
-    const hard = $("#mHard").checked;
-    $("#mStatus").textContent = "deleting…";
+  // this dialog's own elements: switching agents may remove it mid-request
+  const q = (sel) => overlay.querySelector(sel);
+  const confirmBtn = q("#mConfirm");
+  const statusEl = q("#mStatus");
+  q("#mCancel").addEventListener("click", close);
+  confirmBtn.addEventListener("click", async () => {
+    const exportFirst = q("#mExport").checked;
+    const saveMemory = Boolean(q("#mMemory") && q("#mMemory").checked);
+    const hard = q("#mHard").checked;
+    confirmBtn.disabled = true;  // one request at a time
+    statusEl.textContent = "deleting…";
     try {
-      const du = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}/delete`,
+      const du = new URL(`/api/projects/${encodeURIComponent(project)}/sessions/${encodeURIComponent(session)}/delete`,
                          location.origin);
-      du.searchParams.set("agent", state.agent);
+      du.searchParams.set("agent", agent);
       const r = await fetch(du, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ export_first: exportFirst, save_memory: saveMemory, hard }),
@@ -574,9 +656,11 @@ function openDeleteModal() {
       if (!r.ok) throw await httpError(r);
       const res = await r.json();
       close();
-      closeDetail();
-      state.sessions = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions`);
-      renderSessions();
+      if (state.agent === agent && state.activeProject === project) {
+        if (state.activeSession === session) closeDetail();
+        state.sessions = await api(`/api/projects/${encodeURIComponent(project)}/sessions`);
+        renderSessions();
+      }
       const note = res.export ? ` Exported.` : "";
       const mem = res.memory ? ` Saved to memory.` : "";
       const where = res.note ? ` ${res.note}`
@@ -584,7 +668,8 @@ function openDeleteModal() {
       const warn = res.warnings && res.warnings.length ? ` Warning: ${res.warnings.join("; ")}` : "";
       flash(`Session deleted.${note}${mem}${where}${warn}`);
     } catch (e) {
-      $("#mStatus").textContent = "Failed: " + e.message;
+      statusEl.textContent = "Failed: " + e.message;
+      confirmBtn.disabled = false;
     }
   });
 }
@@ -594,7 +679,165 @@ function flash(msg) {
   f.className = "flash";
   f.textContent = msg;
   document.body.appendChild(f);
-  setTimeout(() => f.remove(), 6000);
+  setTimeout(() => f.remove(), msg.length > 160 ? 12000 : 6000);
+}
+
+// ---------------------------------------------------------------------------
+// Project delete (every session of a project)
+// ---------------------------------------------------------------------------
+
+function plural(n, word) {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+// "3 sessions (+2 subagent sessions) · 1 not listed (empty or archived) · 4 memory files"
+function projectDeleteSummary(pv) {
+  let head = plural(pv.sessions || 0, "session");
+  if (pv.subagents) head += ` (+${plural(pv.subagents, "subagent session")})`;
+  const parts = [head];
+  if (pv.hidden) parts.push(`${pv.hidden} not listed (empty or archived)`);
+  if (pv.memory_files) parts.push(plural(pv.memory_files, "memory file"));
+  return parts.join(" · ");
+}
+
+// What the user types to confirm a permanent delete: the folder's own name.
+function confirmWord(p) {
+  const path = String(p.display_path || p.name).replace(/[\\/]+$/, "");
+  return path.split(/[\\/]/).pop() || p.name;
+}
+
+function projectDeleteResultText(res, hard) {
+  const n = (res.sessions || []).length;
+  const trash = res.trash || [];
+  let msg = hard ? `Permanently deleted ${plural(n, "session")}.`
+    : `Removed ${plural(n, "session")} (reversible${trash.length === 1 ? `: ${trash[0]}`
+      : trash.length ? `: ${trash.length} trash folders` : ""}).`;
+  if (res.exported && res.exported.length) msg += ` Exported ${res.exported.length} to Markdown first.`;
+  if ((res.kept || []).includes("memory")) msg += " The project memory was kept.";
+  const errors = Object.entries(res.errors || {});
+  if (errors.length) {
+    msg += ` Not deleted (${errors.length}): ` +
+      errors.map(([sid, m]) => `${sid.slice(0, 8)}: ${m}`).join("; ");
+  }
+  if (res.warnings && res.warnings.length) msg += ` Warning: ${res.warnings.join("; ")}`;
+  return msg;
+}
+
+async function openProjectDeleteModal(name) {
+  const p = state.projects.find((x) => x.name === name);
+  if (!p) return;
+  // Bound now: the preview and the delete are for this agent's project, whatever
+  // the agent dropdown says later (switching agents also closes the dialog).
+  const agent = state.agent;
+  const caps = state.caps || {};
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>Delete this project's sessions?</h3>
+      <p class="mpath">${esc(p.display_path || p.name)}</p>
+      <div id="pdBody"><div class="loading">checking…</div></div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  const body = overlay.querySelector("#pdBody");
+  let pv;
+  try {
+    pv = await api(`/api/projects/${encodeURIComponent(name)}/delete-preview?agent=${encodeURIComponent(agent)}`);
+  } catch (e) {
+    body.innerHTML = `<p class="mwarn">${esc(e.message)}</p>
+      <div class="modal-actions"><button class="dbtn" id="pdClose">Close</button></div>`;
+    overlay.querySelector("#pdClose").addEventListener("click", close);
+    return;
+  }
+  const word = confirmWord(p);
+  body.innerHTML = `
+    ${p.cwd_missing ? `<p class="mwarn">⚠ Its working directory no longer exists (renamed, moved,
+       or on another machine). The sessions below are still stored under the old path.</p>` : ""}
+    <p>${esc(projectDeleteSummary(pv))}${pv.newest ? ` · last active ${esc(fmtTime(pv.newest))}` : ""}</p>
+    <p>All of them are removed; by default it is a <b>soft delete</b> (reversible).
+       Files in the working directory itself (e.g. ${esc(caps.doc_filename || "CLAUDE.md")}) are never touched.</p>
+    ${caps.delete_note ? `<p>${esc(caps.delete_note)}</p>` : ""}
+    ${caps.can_export ? '<label class="mrow"><input type="checkbox" id="pdExport" checked /> Export every session to Markdown first</label>' : ""}
+    ${pv.memory_files ? `<label class="mrow"><input type="checkbox" id="pdMemory" /> Also delete the project memory (${plural(pv.memory_files, "file")})</label>
+       <p class="mhint">Unticked, the memory stays and the project remains listed with its memory only.</p>` : ""}
+    <label class="mrow"><input type="checkbox" id="pdHard" ${pv.outside ? "disabled" : ""} /> Permanent delete (skip trash / archive)</label>
+    ${pv.outside ? `<p class="mhint">Not available: it would also delete ${plural(pv.outside, "subagent session")}
+       stored under other directories.</p>` : ""}
+    <div class="mrow" id="pdTypeRow" hidden>Type <b>${esc(word)}</b> to confirm:
+      <input type="text" id="pdType" class="mtext" autocomplete="off" /></div>
+    <div class="modal-actions">
+      <button class="dbtn" id="pdCancel">Cancel</button>
+      <button class="dbtn danger" id="pdConfirm"></button>
+    </div>
+    <div class="modal-status" id="pdStatus"></div>`;
+  const hardBox = body.querySelector("#pdHard");
+  const memBox = body.querySelector("#pdMemory");
+  const typed = body.querySelector("#pdType");
+  const confirmBtn = body.querySelector("#pdConfirm");
+  const total = (pv.sessions || 0) + (pv.subagents || 0);
+  const what = total ? plural(total, "session")
+    : (pv.hidden ? `${pv.hidden} unlisted` : "the project");
+  let busy = false;  // a request is running: nothing may re-enable the button
+  let stale = false;  // the server says the project changed since this dialog opened
+  const sync = () => {
+    const hard = hardBox.checked;
+    body.querySelector("#pdTypeRow").hidden = !hard;
+    body.querySelectorAll("input").forEach((i) => {
+      i.disabled = busy || stale || (i === hardBox && Boolean(pv.outside));
+    });
+    // A project whose only content is memory that is being kept: nothing would change.
+    const nothing = !total && !pv.hidden && pv.memory_files && !(memBox && memBox.checked);
+    confirmBtn.textContent = nothing ? "Nothing to remove unless the memory goes too"
+      : (hard ? `Delete ${what} permanently` : `Remove ${what}`);
+    confirmBtn.disabled = busy || stale || Boolean(nothing) || (hard && typed.value.trim() !== word);
+  };
+  hardBox.addEventListener("change", sync);
+  if (memBox) memBox.addEventListener("change", sync);
+  typed.addEventListener("input", sync);
+  sync();
+  body.querySelector("#pdCancel").addEventListener("click", close);
+  confirmBtn.addEventListener("click", async () => {
+    if (busy || stale) return;
+    const hard = hardBox.checked;
+    const exportFirst = Boolean(body.querySelector("#pdExport") && body.querySelector("#pdExport").checked);
+    const includeMemory = Boolean(memBox && memBox.checked);
+    busy = true;
+    sync();
+    body.querySelector("#pdStatus").textContent =
+      "deleting… (agents that go through their own CLI take about a second per session)";
+    try {
+      const u = new URL(`/api/projects/${encodeURIComponent(name)}/delete`, location.origin);
+      u.searchParams.set("agent", agent);
+      const r = await fetch(u, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        // the directory this dialog showed: the server refuses if the name means another one now
+        body: JSON.stringify({ export_first: exportFirst, include_memory: includeMemory, hard,
+                               expect_cwd: p.cwd || "" }),
+      });
+      if (!r.ok) {
+        const err = await httpError(r);
+        if (r.status === 409) {
+          stale = true;
+          if (state.agent === agent) await loadProjects().catch(() => {});
+        }
+        throw err;
+      }
+      const res = await r.json();
+      close();
+      if (state.agent === agent) {
+        if (state.activeProject === name) deselectProject();
+        await loadProjects();
+      }
+      flash(projectDeleteResultText(res, hard));
+    } catch (e) {
+      body.querySelector("#pdStatus").textContent = "Failed: " + e.message +
+        (stale ? " The list has been refreshed: open this dialog again from it." : "");
+      busy = false;
+      sync();
+    }
+  });
 }
 
 function closeDetail() {
@@ -820,7 +1063,10 @@ async function reloadTasksView() {
   }
 }
 
-function renderMemory(scope, mem, editable) {
+// editFor: null for a read-only view, else the {agent, project} the memory was
+// loaded for; saves go there, with the directory shown here (409 if it moved).
+function renderMemory(scope, mem, editFor) {
+  const editable = Boolean(editFor);
   if (!mem.index && !mem.files.length) {
     scope.innerHTML = `<div class="md"><div class="empty">No memory for this project.</div>
       <div class="mem-path">dir: ${esc(mem.dir || "")}</div></div>`;
@@ -836,7 +1082,7 @@ function renderMemory(scope, mem, editable) {
   }
   html += "</div>";
   scope.innerHTML = html;
-  if (editable) wireMemoryEditors(scope);
+  if (editable) wireMemoryEditors(scope, editFor, mem.dir || "");
 }
 
 function memBlock(name, path, content, editable) {
@@ -860,7 +1106,7 @@ function memBlock(name, path, content, editable) {
     </div>`;
 }
 
-function wireMemoryEditors(scope) {
+function wireMemoryEditors(scope, view, dir) {
   scope.querySelectorAll(".mem-file").forEach((blk) => {
     const btn = blk.querySelector(".mem-save");
     if (!btn) return;
@@ -870,12 +1116,11 @@ function wireMemoryEditors(scope) {
       const status = blk.querySelector(".editor-status");
       status.textContent = "saving…";
       try {
-        const mu = new URL(`/api/projects/${encodeURIComponent(state.activeProject)}/memory`,
-                           location.origin);
-        mu.searchParams.set("agent", state.agent);
+        const mu = new URL(`/api/projects/${encodeURIComponent(view.project)}/memory`, location.origin);
+        mu.searchParams.set("agent", view.agent);
         const r = await fetch(mu, {
           method: "PUT", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, content }),
+          body: JSON.stringify({ name, content, expect_dir: dir }),
         });
         if (!r.ok) throw await httpError(r);
         status.textContent = "saved ✓";
@@ -1062,12 +1307,17 @@ $("#showPrompts").addEventListener("change", (e) => {
   document.querySelectorAll(".session-prompt").forEach((p) => p.classList.toggle("hidden", !state.showPrompts));
 });
 
-document.querySelectorAll(".sortbtn").forEach((b) => {
+document.querySelectorAll(".sortbtn[data-sort]").forEach((b) => {
   b.addEventListener("click", () => {
     state.sortBy = b.dataset.sort;
-    document.querySelectorAll(".sortbtn").forEach((x) => x.classList.toggle("active", x === b));
+    document.querySelectorAll(".sortbtn[data-sort]").forEach((x) => x.classList.toggle("active", x === b));
     renderProjects();
   });
+});
+
+$("#missingFilter").addEventListener("click", () => {
+  state.onlyMissing = !state.onlyMissing;
+  renderProjects();
 });
 
 initTheme();

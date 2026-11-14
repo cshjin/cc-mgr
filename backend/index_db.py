@@ -181,11 +181,13 @@ def reindex(force: bool = False) -> dict[str, Any]:
                 for summ in adapter.list_sessions(pname):
                     seen_sessions.add(summ.session_id)
                     row = conn.execute(
-                        "SELECT mtime, size FROM sessions WHERE agent=? AND session_id=?",
+                        "SELECT mtime, size, project FROM sessions WHERE agent=? AND session_id=?",
                         (agent, summ.session_id),
                     ).fetchone()
+                    # unchanged, and still under the same project name (names can
+                    # change when a directory that mangles alike appears or goes)
                     if (row and not force and row["mtime"] == summ.mtime
-                            and row["size"] == summ.size_bytes):
+                            and row["size"] == summ.size_bytes and row["project"] == pname):
                         skipped += 1
                         continue
 
@@ -267,10 +269,22 @@ def _prune(conn, fts, agent: str, seen_sessions: set[str], seen_projects: set[st
 
 def remove_session(agent: str, session_id: str) -> None:
     """Drop one session from the index right away (after it was deleted)."""
+    remove_sessions(agent, [session_id])
+
+
+def remove_sessions(agent: str, session_ids: list[str], project_docs: str | None = None) -> None:
+    """Drop sessions (and, with project_docs, that project's indexed memory and
+    doc) from the index right away, after they were deleted."""
     conn = _connect()
     try:
         fts = init_db(conn)
-        _delete_session_rows(conn, fts, agent, session_id)
+        for sid in session_ids:
+            _delete_session_rows(conn, fts, agent, sid)
+        if project_docs is not None:
+            conn.execute("DELETE FROM docs WHERE agent=? AND project=?", (agent, project_docs))
+            if fts:
+                conn.execute("DELETE FROM docs_fts WHERE agent=? AND project=?",
+                             (agent, project_docs))
         conn.commit()
     finally:
         conn.close()

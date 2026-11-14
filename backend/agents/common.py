@@ -1,15 +1,21 @@
 """Agent-neutral helpers shared by all adapters."""
 from __future__ import annotations
 
+import errno
+import functools
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
 import stat
+import sys
+from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 CTX_TIERS = (200_000, 1_000_000)
 STD_WINDOW = 200_000
@@ -91,6 +97,214 @@ def default_export_dir(project: str) -> Path:
     if not is_safe_name(project):
         raise ValueError("invalid project name")
     return safe_join(private_mkdir(export_root()), project)
+
+
+def new_trash_dir(home: Path, name: str) -> Path:
+    """A fresh owner-only <home>/.cc_mgr_trash/<name>.<UTC stamp>/ for a soft
+    delete (name: a session id or project name, one path component)."""
+    root = private_mkdir(Path(home) / ".cc_mgr_trash")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path, n = safe_join(root, f"{name}.{stamp}"), 1
+    while path.exists():  # two deletes within the same second
+        path, n = safe_join(root, f"{name}.{stamp}.{n}"), n + 1
+    return private_mkdir(path)
+
+
+def pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists on this host. Never signals it
+    (on Windows os.kill(pid, 0) would terminate the process). When it can't
+    tell, it says alive: callers use it to refuse destructive actions."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import subprocess
+        try:
+            proc = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                                  capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return True
+        if proc.returncode != 0:  # the query failed: unknown, so alive
+            return True
+        return str(pid) in proc.stdout.split()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # PermissionError: it exists but belongs to someone else
+        return True
+    return True
+
+
+def resolves_inside(path: Path, root: Path) -> bool:
+    """Whether path, with symlinks resolved, is root or lies under it."""
+    real, base = os.path.realpath(path), os.path.realpath(root)
+    return real == base or real.startswith(base + os.sep)
+
+
+def mangle(cwd: str) -> str:
+    """A working directory as a single folder-like name (lossy: / \\ : → -)."""
+    return cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
+
+
+# How every generated project name ends; no plain name may end like this.
+_GENERATED_NAME = re.compile(r"~[0-9a-f]{12,}$")
+
+
+def project_names(cwds: Iterable[str]) -> dict[str, str]:
+    """A unique project name for each working directory.
+
+    The name is the mangled path, unless another directory mangles alike
+    (repo-x vs repo/x) or the mangled path itself ends like a generated name;
+    then it is the mangled path plus "~" and 12 hex digits of the path's
+    sha256. Plain names never end in "~<12+ hex digits>" and generated ones
+    always do, so the two kinds can't meet; generated names that still clash
+    get longer hashes. Every final name is unique (else ValueError), and the
+    result doesn't depend on the order of cwds.
+    """
+    cwds = sorted(set(cwds))
+    mangled = {cwd: mangle(cwd) for cwd in cwds}
+    count = Counter(mangled.values())
+    names = dict(mangled)
+    pending = [c for c in cwds if count[mangled[c]] > 1 or _GENERATED_NAME.search(mangled[c])]
+    for length in (12, 16, 24, 32, 64):
+        if not pending:
+            return names
+        for cwd in pending:
+            digest = hashlib.sha256(cwd.encode("utf-8", "surrogatepass")).hexdigest()
+            names[cwd] = f"{mangled[cwd]}~{digest[:length]}"
+        taken = Counter(names.values())
+        pending = [c for c in cwds if taken[names[c]] > 1]
+    if pending:  # needs equal 256-bit hashes of distinct paths
+        raise ValueError("project names are not unique")
+    return names
+
+
+def restore_dir(src: Path, dst: Path) -> bool:
+    """Move the directory src back to dst, never replacing anything there.
+
+    One atomic no-replace rename where the system supports it; otherwise (e.g.
+    Lustre, which lacks RENAME_NOREPLACE) dst is claimed with mkdir and src's
+    entries move in one by one, each with a step that can't replace anything
+    either: a hard link for files and symlinks (then the old name goes), the
+    same claim for directories. Whatever can't go back without replacing
+    something — dst existed, even as an empty directory (a plain os.rename
+    would silently replace that); an entry of that name appeared meanwhile;
+    the filesystem refused — stays in src. src is never followed through a
+    symlink. True when everything went back and src is gone.
+    """
+    src, dst = os.fspath(src), os.fspath(dst)
+    if os.path.islink(src) or not os.path.isdir(src):
+        return False
+    try:
+        if rename_noreplace(src, dst):
+            return True
+    except FileExistsError:
+        return False
+    return _merge_back(src, dst)
+
+
+def _merge_back(src: str, dst: str) -> bool:
+    try:
+        os.mkdir(dst)  # the claim: fails if anything is at dst
+    except FileExistsError:
+        return False
+    st = os.lstat(src)
+    complete = True
+    for name in sorted(os.listdir(src)):
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        try:
+            if stat.S_ISDIR(os.lstat(s).st_mode):
+                complete = _merge_back(s, d) and complete
+            else:
+                os.link(s, d, follow_symlinks=False)  # fails if d exists
+                os.unlink(s)
+        except OSError:  # d appeared meanwhile, or this filesystem has no hard links
+            complete = False
+    os.chmod(dst, stat.S_IMODE(st.st_mode))
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    if complete:
+        os.rmdir(src)
+    else:
+        try:
+            os.rmdir(dst)  # nothing got in: leave no empty stand-in behind
+        except OSError:
+            pass
+    return complete
+
+
+@functools.lru_cache(maxsize=1)
+def _renameat2():
+    """(libc renameat2, ctypes.get_errno), or None: not Linux, no ctypes, or a
+    libc without renameat2."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        fn = ctypes.CDLL(None, use_errno=True).renameat2
+    except (ImportError, OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    return fn, ctypes.get_errno
+
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+def rename_noreplace(src, dst) -> bool:
+    """Rename src to dst in one atomic step that never replaces anything at dst
+    (FileExistsError if something is there, even an empty directory). False if
+    this system or filesystem can't do that; then nothing happened."""
+    if os.name == "nt":  # Windows' rename never replaces an existing file or directory
+        os.rename(src, dst)
+        return True
+    found = _renameat2()
+    if found is None:
+        return False
+    renameat2, get_errno = found
+    if renameat2(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst), _RENAME_NOREPLACE) == 0:
+        return True
+    err = get_errno()
+    if err in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(err, os.strerror(err), os.fspath(dst))
+    if err in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):  # the flag isn't supported here
+        return False
+    raise OSError(err, os.strerror(err), os.fspath(src))
+
+
+def _fenced(text: str, lang: str = "") -> str:
+    """A Markdown code fence that the text itself can't close early."""
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return f"{fence}{lang}\n{text}\n{fence}"
+
+
+def render_markdown(agent_label: str, project: str, session_id: str,
+                    turns: list[dict[str, Any]], title: str = "") -> str:
+    """A conversation (normalized turns, as get_conversation returns them) as
+    Markdown — the export format for adapters without a richer one."""
+    lines = [f"# Session: {title or session_id}", "",
+             f"- **Agent:** {agent_label}", f"- **Session ID:** `{session_id}`",
+             f"- **Project:** `{project}`", f"- **Turns:** {len(turns)}", "", "---", ""]
+    for t in turns:
+        ts = f" ({t['timestamp']})" if t.get("timestamp") else ""
+        lines += [f"### {str(t.get('role') or '?').capitalize()}{ts}", ""]
+        for b in t.get("blocks") or []:
+            bt = b.get("type")
+            if bt == "text":
+                lines.append(str(b.get("text", "")))
+            elif bt == "thinking":
+                lines.append("> **Thinking:**\n> " + str(b.get("text", "")).replace("\n", "\n> "))
+            elif bt == "tool_use":
+                args = json.dumps(b.get("input", {}), indent=2, ensure_ascii=False, default=str)
+                lines.append(f"**→ tool: {b.get('name', '')}**\n\n{_fenced(args, 'json')}")
+            elif bt == "tool_result":
+                lines.append(f"**tool result**\n\n{_fenced(str(b.get('text', '')))}")
+            lines.append("")
+        lines += ["---", ""]
+    return "\n".join(lines)
 
 
 def connect_sqlite_ro(db_file: Path, timeout: float = 5.0) -> sqlite3.Connection:
@@ -263,6 +477,11 @@ def read_git_info(cwd: str | None) -> dict[str, Any] | None:
     return {"repo": root.name, "branch": branch, "detached": detached}
 
 
+class ProjectChanged(Exception):
+    """A project name now stands for a different directory than the caller
+    saw (names can shift when a directory that mangles alike appears or goes)."""
+
+
 def read_doc_file(cwd: str, filename: str) -> dict[str, Any]:
     """Read a root doc (CLAUDE.md/GEMINI.md/AGENTS.md) from a project's cwd."""
     if not cwd:
@@ -275,10 +494,21 @@ def read_doc_file(cwd: str, filename: str) -> dict[str, Any]:
     return {"exists": False, "path": str(path), "content": "", "cwd": cwd}
 
 
-def save_doc_file(cwd: str, filename: str, content: str) -> Path:
-    """Write a root doc into a project's cwd, with a name guard."""
+def check_cwd(cwd: str, expect_cwd: str | None) -> None:
+    """ProjectChanged unless the project's directory is still the one the
+    caller showed the user (None: no expectation)."""
+    if expect_cwd is not None and cwd != expect_cwd:
+        raise ProjectChanged(f"this project now refers to {cwd or 'no directory'}, not "
+                             f"{expect_cwd or 'no directory'}; reload and try again")
+
+
+def save_doc_file(cwd: str, filename: str, content: str, expect_cwd: str | None = None) -> Path:
+    """Write a root doc into a project's cwd, with a name guard. expect_cwd: the
+    directory the editor showed; a project that means another one by now is
+    refused (ProjectChanged) rather than written."""
     if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
         raise ValueError("invalid doc file name")
+    check_cwd(cwd, expect_cwd)
     if not cwd:
         raise FileNotFoundError("no working directory known for this project")
     base = Path(cwd)

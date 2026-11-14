@@ -8,7 +8,8 @@ def test_caps(gemini_home):
     assert c.doc_filename == "GEMINI.md"
     assert c.can_edit_doc is False  # retired CLI: read-only; agy edits GEMINI.md
     assert c.has_tasks is False and c.has_memory is False
-    assert c.can_delete is False and c.can_export is False
+    assert c.can_delete is True and c.can_export is True  # #24: files are moved, no CLI needed
+    assert "trash" in c.delete_note
 
 
 def test_list_projects_uses_project_root(gemini_home):

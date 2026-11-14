@@ -5,12 +5,17 @@ to an adapter selected by ?agent=. Default is claude.
 """
 from __future__ import annotations
 
+import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
-from .common import SessionSummary  # re-export-friendly
+from .common import (  # SessionSummary and ProjectChanged are re-exported
+    ProjectChanged, SessionSummary, default_export_dir, is_safe_id, private_mkdir,
+    render_markdown, write_private,
+)
 
 
 class UnsupportedCapability(Exception):
@@ -27,6 +32,8 @@ class Capabilities:
     can_edit_doc: bool
     can_delete: bool
     can_export: bool
+    # What a delete does for this agent, shown in the confirmation dialogs.
+    delete_note: str = ""
 
 
 class AgentAdapter(ABC):
@@ -55,14 +62,19 @@ class AgentAdapter(ABC):
     def get_doc(self, project: str) -> dict[str, Any]:
         raise UnsupportedCapability("get_doc not implemented")
 
-    def save_doc(self, project: str, content: str) -> Path:
+    def save_doc(self, project: str, content: str, expect_cwd: str | None = None) -> Path:
+        """Write the root doc into the project's directory. expect_cwd: the one
+        the editor showed (get_doc's "cwd"); ProjectChanged if it differs now."""
         raise UnsupportedCapability("doc editing not supported")
 
     # ---- Claude-only extras (base raises) ----
     def get_memory(self, project: str) -> dict[str, Any]:
         raise UnsupportedCapability("memory not supported")
 
-    def save_memory_file(self, project: str, name: str, content: str) -> Path:
+    def save_memory_file(self, project: str, name: str, content: str,
+                         expect_dir: str | None = None) -> Path:
+        """expect_dir: the memory dir the editor showed (get_memory's "dir");
+        ProjectChanged if the project's memory lives elsewhere now."""
         raise UnsupportedCapability("memory not supported")
 
     def get_tasks(self, session_id: str) -> list[dict[str, Any]]:
@@ -75,16 +87,126 @@ class AgentAdapter(ABC):
         raise UnsupportedCapability("tasks not supported")
 
     def export_session_markdown(self, project: str, session_id: str) -> str:
-        raise UnsupportedCapability("export not supported")
+        """The session as Markdown, rendered from get_conversation (adapters
+        with a richer format override this). Unknown or empty sessions raise
+        FileNotFoundError."""
+        data = self.get_conversation(project, session_id, offset=0, limit=None)
+        if not data.get("total"):
+            raise FileNotFoundError(f"session {session_id} not found or empty")
+        return render_markdown(self.capabilities.label, project, session_id, data["turns"],
+                               self._session_title(project, session_id))
+
+    def _session_title(self, project: str, session_id: str) -> str:
+        return ""
 
     def export_session_to_file(self, project: str, session_id: str, out_dir=None) -> Path:
-        raise UnsupportedCapability("export not supported")
+        """Write the Markdown export to <exports>/<project>/<session>.<stamp>.md (0600)."""
+        if not is_safe_id(session_id):
+            raise ValueError("invalid session id")
+        markdown = self.export_session_markdown(project, session_id)
+        if out_dir is None:
+            out_dir = default_export_dir(project)
+        private_mkdir(Path(out_dir))
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return write_private(Path(out_dir) / f"{session_id}.{stamp}.md", markdown)
 
     def save_session_as_memory(self, project: str, session_id: str) -> Path:
         raise UnsupportedCapability("memory not supported")
 
     def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
         raise UnsupportedCapability("delete not supported")
+
+    # ---- whole-project delete ----
+    def project_delete_preview(self, project: str) -> dict[str, Any]:
+        """What deleting the whole project would remove, for the confirmation.
+
+        hidden: files that are removed too but aren't listed as sessions (e.g.
+        transcripts without any message); memory_files: project memory that is
+        only removed on request."""
+        sessions = self.list_sessions(project)
+        return {"sessions": sum(1 for s in sessions if not s.parent_id),
+                "subagents": sum(1 for s in sessions if s.parent_id),
+                "newest": max((s.mtime for s in sessions), default=0.0),
+                "hidden": 0, "memory_files": 0}
+
+    def delete_project(self, project: str, hard: bool = False, include_memory: bool = False,
+                       export_first: bool = False, expect_cwd: str | None = None,
+                       guard: Callable[[str], None] | None = None) -> dict[str, Any]:
+        """Delete every session of a project through delete_session (soft by
+        default), optionally exporting them all first.
+
+        expect_cwd: the directory the caller confirmed; if any session to delete
+        lives elsewhere, ProjectChanged is raised before anything happens.
+        guard(session_id), if given, runs right before each delete and may
+        raise to refuse that session.
+
+        Exports all happen before any delete, and parents go first, so a
+        permanent delete that cascades (OpenCode) takes its subagent sessions
+        along only after they were exported; sessions already gone are skipped.
+        A session that fails is reported in `errors` and the rest continue. If
+        the first session is refused for a reason that refuses them all
+        (UnsupportedCapability), that is raised instead.
+        """
+        if not self.capabilities.can_delete:
+            raise UnsupportedCapability("delete not supported")
+        sessions = sorted(self.list_sessions(project), key=lambda s: bool(s.parent_id))
+        if not sessions:
+            raise FileNotFoundError(f"no sessions to delete in {project}")
+        if expect_cwd is not None:
+            elsewhere = sorted({s.cwd for s in sessions if s.cwd and s.cwd != expect_cwd})
+            if elsewhere:
+                raise ProjectChanged(f"project {project} now refers to {', '.join(elsewhere)}, "
+                                     f"not {expect_cwd}; reload and try again")
+        result: dict[str, Any] = {"sessions": [], "deleted": [], "trash": [], "exported": [],
+                                  "errors": {}, "warnings": []}
+        if export_first:  # all of them before any delete: a cascade must not outrun its export
+            for s in sessions:
+                try:
+                    result["exported"].append(str(self.export_session_to_file(project, s.session_id)))
+                except FileNotFoundError:
+                    pass  # nothing to export: the session has no turns
+        gone: set[str] = set()
+        for s in sessions:
+            sid = s.session_id
+            if sid in gone:
+                continue
+            try:
+                if guard is not None:
+                    guard(sid)
+                res = self.delete_session(project, sid, hard=hard)
+            except FileNotFoundError:  # already removed, e.g. along with its parent
+                gone.add(sid)
+                continue
+            except UnsupportedCapability as e:
+                if not result["sessions"]:
+                    raise
+                result["errors"][sid] = f"stopped: {e}"
+                break
+            except (RuntimeError, ValueError, OSError, sqlite3.Error) as e:
+                result["errors"][sid] = str(e)
+                continue
+            removed = res.get("sessions") or [sid]
+            gone.update(removed)
+            result["sessions"].extend(removed)
+            result["deleted"].extend(res.get("deleted") or [])
+            if res.get("trash"):
+                result["trash"].append(res["trash"])
+            result["warnings"].extend(res.get("warnings") or [])
+            if res.get("note"):
+                result["note"] = res["note"]
+        result["sessions"] = list(dict.fromkeys(result["sessions"]))
+        result["project_removed"] = not any(p["name"] == project for p in self.list_projects())
+        return result
+
+    def _export_all(self, project: str) -> list[str]:
+        """Export every listed session of the project (empty ones have nothing to export)."""
+        out = []
+        for s in self.list_sessions(project):
+            try:
+                out.append(str(self.export_session_to_file(project, s.session_id)))
+            except FileNotFoundError:
+                continue
+        return out
 
 
 # Registry is populated at import time below.

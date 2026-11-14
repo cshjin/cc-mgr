@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,12 +67,22 @@ def _stand_in_server(tmp_path: Path) -> Path:
     return script
 
 
+def _spawn(argv, **kw):
+    """Popen that returns once the child's command line is visible in /proc
+    (Popen can return while the child is still inside execve)."""
+    proc = subprocess.Popen(argv, **kw)
+    deadline = time.time() + 10
+    while not Path(f"/proc/{proc.pid}/cmdline").read_bytes():
+        assert time.time() < deadline, "the child never showed its command line"
+        time.sleep(0.05)
+    return proc
+
+
 @pytest.mark.skipif(not Path("/proc/self/cmdline").exists(), reason="needs /proc")
 def test_stop_terminates_a_real_cc_mgr_process(launcher, tmp_path):
     # Same command line as a server (`python …/cc-mgr.py run …`), in its own
     # session like --background.
-    proc = subprocess.Popen([sys.executable, str(_stand_in_server(tmp_path)), "run"],
-                            start_new_session=True)
+    proc = _spawn([sys.executable, str(_stand_in_server(tmp_path)), "run"], start_new_session=True)
     try:
         launcher._write_pidfile(proc.pid, "loopback", 8765)
         assert launcher.cmd_status(ARGS) == 0
@@ -92,7 +103,7 @@ def test_identity_needs_the_server_argv_and_the_recorded_start(launcher, tmp_pat
         "not the run command": [sys.executable, script],
         "server": [sys.executable, "-u", script, "run", "--port", "1"],
     }
-    procs = {name: subprocess.Popen(argv) for name, argv in argvs.items()}
+    procs = {name: _spawn(argv) for name, argv in argvs.items()}
     try:
         assert {name: launcher._is_cc_mgr_process(p.pid) for name, p in procs.items()} == {
             "mentions the file": False, "python -c … cc-mgr.py run": False,

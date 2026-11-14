@@ -17,10 +17,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import index_db, store
-from .agents import UnsupportedCapability, get_adapter, list_agents
+from .agents import ProjectChanged, UnsupportedCapability, get_adapter, list_agents
 from .agents.common import is_safe_id, is_safe_name
 
-app = FastAPI(title="cc_mgr", version="0.5.0")
+app = FastAPI(title="cc_mgr", version="0.6.0")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
@@ -138,7 +138,13 @@ def api_agents():
 
 @app.get("/api/projects")
 def api_projects(agent: str | None = None):
-    return _adapter(agent).list_projects()
+    projects = _adapter(agent).list_projects()
+    for p in projects:
+        # The recorded working directory is gone: renamed, moved, deleted, or
+        # on another machine. The sessions are still here, under the old path.
+        cwd = p.get("cwd") or ""
+        p["cwd_missing"] = bool(cwd) and not os.path.isdir(cwd)
+    return projects
 
 
 @app.get("/api/projects/{project}/sessions")
@@ -158,13 +164,18 @@ def api_get_doc(project: str, agent: str | None = None):
 
 class DocRequest(BaseModel):
     content: str
+    # The directory the editor showed (the doc GET's "cwd"). A project name can
+    # come to mean another directory; then the save is refused (409).
+    expect_cwd: str
 
 
 @app.put("/api/projects/{project}/doc")
 def api_save_doc(project: str, req: DocRequest, agent: str | None = None):
     _project(project)
     try:
-        path = _adapter(agent).save_doc(project, req.content)
+        path = _adapter(agent).save_doc(project, req.content, expect_cwd=req.expect_cwd)
+    except ProjectChanged as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except UnsupportedCapability as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
@@ -197,13 +208,17 @@ def api_memory(project: str, agent: str | None = None):
 class MemoryFileRequest(BaseModel):
     name: str
     content: str
+    expect_dir: str  # the memory dir the editor showed (the memory GET's "dir"); else 409
 
 
 @app.put("/api/projects/{project}/memory")
 def api_save_memory_file(project: str, req: MemoryFileRequest, agent: str | None = None):
     _project(project)
     try:
-        path = _adapter(agent).save_memory_file(project, req.name, req.content)
+        path = _adapter(agent).save_memory_file(project, req.name, req.content,
+                                                expect_dir=req.expect_dir)
+    except ProjectChanged as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except UnsupportedCapability as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
@@ -328,6 +343,71 @@ def api_save_memory(project: str, session_id: str, agent: str | None = None):
         raise HTTPException(status_code=404, detail="session not found")
     except ValueError as e:  # e.g. a memory path that would escape the project
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/projects/{project}/delete-preview")
+def api_project_delete_preview(project: str, agent: str | None = None):
+    _project(project)
+    ad = _adapter(agent)
+    if not ad.capabilities.can_delete:
+        raise HTTPException(status_code=404, detail="delete not supported")
+    try:
+        return ad.project_delete_preview(project)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class ProjectDeleteRequest(BaseModel):
+    export_first: bool = True
+    include_memory: bool = False
+    hard: bool = False
+    # The working directory the confirmation showed ("" if none). A project
+    # name can come to mean another directory (names change when one that
+    # mangles alike appears or goes), so the delete only goes ahead while the
+    # name still means this one.
+    expect_cwd: str
+
+
+@app.post("/api/projects/{project}/delete")
+def api_project_delete(project: str, req: ProjectDeleteRequest, agent: str | None = None):
+    """Delete every session of a project (soft by default); per-session
+    failures come back in `errors`, the rest still go. 409 if the project
+    name no longer means the directory the caller confirmed."""
+    _project(project)
+    ad = _adapter(agent)
+    if not ad.capabilities.can_delete:
+        raise HTTPException(status_code=404, detail="delete not supported")
+    current = {p["name"]: p.get("cwd") or "" for p in ad.list_projects()}
+    if project not in current:
+        raise HTTPException(status_code=404, detail=f"project {project} not found; reload the list")
+    if current[project] != req.expect_cwd:
+        raise HTTPException(
+            status_code=409,
+            detail=f"project {project} now refers to {current[project] or 'no directory'}, "
+                   f"not {req.expect_cwd or 'no directory'}; reload the list and try again")
+    try:
+        result = ad.delete_project(project, hard=req.hard, include_memory=req.include_memory,
+                                   export_first=req.export_first, expect_cwd=req.expect_cwd)
+    except ProjectChanged as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except UnsupportedCapability as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:  # the agent's own CLI refused or failed
+        raise HTTPException(status_code=502, detail=str(e))
+    except OSError as e:  # e.g. an export that couldn't be written: nothing was deleted
+        raise HTTPException(status_code=500, detail=str(e))
+    try:  # the search index is a cache: keep it from offering deleted sessions
+        index_db.remove_sessions(ad.capabilities.agent_id, result.get("sessions") or [],
+                                 project if result.get("project_removed") else None)
+    except sqlite3.Error as e:
+        result.setdefault("warnings", []).append(f"search index not updated: {e}")
+    return result
 
 
 @app.get("/api/search")

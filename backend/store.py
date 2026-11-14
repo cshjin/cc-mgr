@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .agents.common import (  # re-exported: store's public names stay importable
-    CTX_TIERS, STD_WINDOW, SessionSummary, context_limit_for as _context_limit_for,
-    context_window, default_export_dir, is_safe_id, is_safe_name, private_mkdir,
-    read_git_info, safe_join, write_private,
+    CTX_TIERS, STD_WINDOW, SessionSummary, check_cwd, context_limit_for as _context_limit_for,
+    context_window, default_export_dir, is_safe_id, is_safe_name, new_trash_dir,
+    private_mkdir, read_git_info, safe_join, write_private,
 )
 
 
@@ -181,8 +181,9 @@ def _block_text(content: Any) -> str:
 def list_projects() -> list[dict[str, Any]]:
     """Project rows with cheap aggregates: latest activity, task progress, git.
 
-    Deliberately avoids full transcript parsing — only stat() and a short head
-    peek of the most-recent session for cwd/git — so the list stays fast.
+    Deliberately avoids full transcript parsing — stat(), a short head peek of
+    the most-recent session for cwd/git, and (cached) a read up to the first
+    message of each transcript, so session_count matches the session list.
     """
     root = projects_dir()
     if not root.is_dir():
@@ -222,8 +223,8 @@ def list_projects() -> list[dict[str, Any]]:
             "name": d.name,
             "display_path": cwd or unmangle_path(d.name),
             "cwd": cwd,
-            "session_count": len(sessions),
-            "has_memory": (d / "memory").is_dir(),
+            "session_count": sum(1 for s in sessions if _has_messages(s)),
+            "has_memory": bool(_memory_files(d)),
             "has_claude_md": bool(cwd and (Path(cwd) / "CLAUDE.md").is_file()),
             "open_tasks": open_tasks,
             "total_tasks": total_tasks,
@@ -232,6 +233,34 @@ def list_projects() -> list[dict[str, Any]]:
         })
     out.sort(key=lambda p: p["mtime"], reverse=True)
     return out
+
+
+def _memory_files(proj_dir: Path) -> list[Path]:
+    """Files in a project's memory/ dir (an empty dir doesn't count as memory)."""
+    mem = proj_dir / "memory"
+    return [p for p in mem.rglob("*") if p.is_file()] if mem.is_dir() else []
+
+
+_HAS_MESSAGES: dict[str, tuple[int, int, bool]] = {}
+
+
+def _has_messages(path: Path) -> bool:
+    """Whether a transcript holds any user/assistant record — list_sessions
+    skips the ones that don't (nothing to open). Reads only up to the first
+    such record, and is cached by (path, mtime, size) like the summaries."""
+    st = path.stat()
+    key = str(path)
+    hit = _SCAN_CACHE.get(key)
+    if hit and hit[:2] == (st.st_mtime_ns, st.st_size):
+        return hit[2].message_count > 0
+    known = _HAS_MESSAGES.get(key)
+    if known and known[:2] == (st.st_mtime_ns, st.st_size):
+        return known[2]
+    found = any(rec.get("type") in ("user", "assistant") for rec in _iter_jsonl(path))
+    if len(_HAS_MESSAGES) >= _SCAN_CACHE_MAX:
+        _HAS_MESSAGES.clear()
+    _HAS_MESSAGES[key] = (st.st_mtime_ns, st.st_size, found)
+    return found
 
 
 def _scan_session(path: Path, project: str) -> SessionSummary:
@@ -328,7 +357,7 @@ def list_sessions(project: str) -> list[SessionSummary]:
     d = _project_dir(project)
     if not d.is_dir():
         return []
-    has_mem = (d / "memory").is_dir()
+    has_mem = bool(_memory_files(d))
     sessions = []
     for f in d.glob("*.jsonl"):
         summ = _scan_session(f, project)
@@ -414,15 +443,17 @@ def get_memory(project: str) -> dict[str, Any]:
     }
 
 
-def save_memory_file(project: str, name: str, content: str) -> Path:
+def save_memory_file(project: str, name: str, content: str, expect_dir: str | None = None) -> Path:
     """Write a memory file (MEMORY.md or *.md) under the project's memory dir.
 
     `name` is a bare filename — path components are rejected to prevent escapes.
+    expect_dir: the memory dir the editor showed (get_memory's "dir").
     """
     if "/" in name or "\\" in name or name in ("", ".", ".."):
         raise ValueError("invalid memory file name")
     if not name.endswith(".md"):
         raise ValueError("memory files must end in .md")
+    check_cwd(str(_project_dir(project) / "memory"), expect_dir)
     # Anchored at projects/, so neither a symlinked memory/ dir nor a symlinked
     # file can point the write outside the Claude data root.
     out = safe_join(projects_dir(), _project_dir(project).name, "memory", name)
@@ -456,9 +487,12 @@ def get_claude_md(project: str) -> dict[str, Any]:
     return {"exists": False, "path": str(path), "content": "", "cwd": cwd}
 
 
-def save_claude_md(project: str, content: str) -> Path:
-    """Write CLAUDE.md into the project's working directory."""
+def save_claude_md(project: str, content: str, expect_cwd: str | None = None) -> Path:
+    """Write CLAUDE.md into the project's working directory. expect_cwd: the
+    directory the editor showed; ProjectChanged if the project's newest session
+    now says another one."""
     cwd = _project_cwd(project)
+    check_cwd(cwd, expect_cwd)
     if not cwd:
         raise FileNotFoundError("no working directory known for this project")
     base = Path(cwd)
@@ -674,6 +708,78 @@ def delete_session(project: str, session_id: str, hard: bool = False) -> dict[st
         shutil.move(str(tdir), str(trash / f"tasks_{session_id}"))
         moved.append(str(tdir))
     return {"deleted": moved, "trash": str(trash)}
+
+
+def _project_folder(project: str) -> Path:
+    proj_dir = _project_dir(project)
+    if proj_dir.is_symlink():
+        raise ValueError("the project folder is a symlink; refusing to delete through it")
+    if not proj_dir.is_dir():
+        raise FileNotFoundError(f"project {project} not found")
+    return proj_dir
+
+
+def project_delete_preview(project: str) -> dict[str, Any]:
+    """Counts for the project-delete confirmation, without parsing transcripts."""
+    proj_dir = _project_folder(project)
+    files = list(proj_dir.glob("*.jsonl"))
+    listed = sum(1 for f in files if _has_messages(f))
+    return {"sessions": listed, "subagents": 0,
+            "newest": max((f.stat().st_mtime for f in files), default=0.0),
+            "hidden": len(files) - listed, "memory_files": len(_memory_files(proj_dir))}
+
+
+def delete_project(project: str, hard: bool = False, include_memory: bool = False,
+                   export_first: bool = False) -> dict[str, Any]:
+    """Delete a whole project folder: every transcript (listed or not), the
+    sidecar dirs, and the sessions' tasks.
+
+    The project memory (memory/, shared by every session) is kept unless
+    include_memory is set or it holds no files; with it gone, the folder goes
+    too and the project disappears from the list. Soft by default: everything
+    moves to <claude_home>/.cc_mgr_trash/<project>.<stamp>/. Nothing outside
+    the Claude data dir (e.g. CLAUDE.md in the working directory) is touched.
+    """
+    proj_dir = _project_folder(project)
+    transcripts = sorted(proj_dir.glob("*.jsonl"))
+    session_ids = [f.stem for f in transcripts]
+    exported = []
+    if export_first:
+        for f in transcripts:
+            if is_safe_id(f.stem) and f.stem not in _RESERVED_IDS and _has_messages(f):
+                exported.append(str(export_session_to_file(project, f.stem)))
+    keep_memory = not include_memory and bool(_memory_files(proj_dir))
+    items = [p for p in proj_dir.iterdir() if not (keep_memory and p.name == "memory")]
+    task_dirs = [_task_dir(sid) for sid in session_ids
+                 if is_safe_id(sid) and sid not in _RESERVED_IDS and _task_dir(sid).is_dir()]
+    if keep_memory and not items and not task_dirs:  # only the kept memory: nothing to do
+        return {"sessions": [], "deleted": [], "trash": [], "exported": exported, "errors": {},
+                "warnings": [], "kept": ["memory"], "project_removed": False}
+    trash = None
+    if hard:
+        targets = items if keep_memory else [proj_dir]
+        for p in targets + task_dirs:
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+    else:
+        trash = new_trash_dir(claude_home(), project)
+        if keep_memory:
+            (trash / "project").mkdir()
+            for p in items:
+                shutil.move(str(p), str(trash / "project" / p.name))
+        else:
+            shutil.move(str(proj_dir), str(trash / "project"))
+        if task_dirs:
+            (trash / "tasks").mkdir()
+            for t in task_dirs:
+                shutil.move(str(t), str(trash / "tasks" / t.name))
+    return {"sessions": session_ids,
+            "deleted": [str(p) for p in (items if keep_memory else [proj_dir])] + [str(t) for t in task_dirs],
+            "trash": [str(trash)] if trash else [], "exported": exported, "errors": {},
+            "warnings": [], "kept": ["memory"] if keep_memory else [],
+            "project_removed": not proj_dir.exists()}
 
 
 def _structured_blocks(content: Any) -> list[dict[str, Any]]:

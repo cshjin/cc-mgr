@@ -2,18 +2,18 @@
 
 A lightweight, portable web UI for viewing your local **coding-agent** projects —
 Claude Code, Antigravity CLI (agy), OpenCode, Codex, GitHub Copilot CLI, and the
-retired Gemini CLI (legacy, read-only) — selectable from a dropdown next to the
-title. Agents that have data on this machine are listed first.
+retired Gemini CLI (legacy) — selectable from a dropdown next to the title.
+Agents that have data on this machine are listed first.
 
 Reads each agent's on-disk data — Claude's `~/.claude/projects/`, `~/.claude/tasks/`
 and per-project `memory/`; Antigravity's `~/.gemini/antigravity-cli/brain/`;
 OpenCode's SQLite database; Codex's `$CODEX_HOME/sessions/`; Copilot CLI's
 `~/.copilot/session-store.db` + `session-state/`; Gemini CLI's `~/.gemini/tmp/` —
 with no account or network access required. The active agent scopes the whole UI
-and search. Claude Code, Antigravity (agy) and OpenCode support session browsing,
-search, Markdown export, and soft/hard session deletion (Claude and agy also
-memory/artifacts; OpenCode archives/deletes through OpenCode itself). Codex and
-Copilot support browsing, search, and root doc editing; Gemini CLI is browse-only.
+and search. Every agent supports session browsing, search, Markdown export, and
+soft/permanent deletion of single sessions or whole projects (Claude and agy also
+memory/artifacts). Where an agent has its own commands, deletes go through them:
+OpenCode (`opencode` CLI/API) and Codex (`codex archive` / `codex delete`).
 
 Each agent's data root can be relocated via an env var: `CLAUDE_HOME` /
 `CLAUDE_CONFIG_DIR`, `AGY_HOME` / `ANTIGRAVITY_HOME`, `OPENCODE_DB` (else
@@ -25,8 +25,19 @@ Each agent's data root can be relocated via an env var: `CLAUDE_HOME` /
 
 - **Projects list** sorted by recency or name (toggle), showing each project's
   latest activity time, aggregated task progress, memory/root-doc presence, and
-  git branch (read directly from `.git/HEAD`). Sidebar collapses; all three panes
-  are resizable via draggable splitters (widths persist in `localStorage`).
+  git branch (read directly from `.git/HEAD`). Projects whose working directory no
+  longer exists (renamed, moved, or synced from another machine) are flagged
+  "⚠ dir missing" — their sessions are still there under the old path — and the
+  "⚠ missing" button filters the list down to them. Sidebar collapses; all three
+  panes are resizable via draggable splitters (widths persist in `localStorage`).
+- **Project delete** — the 🗑 on a project (shown on hover) removes all of its
+  sessions after a confirmation that shows what goes: session and subagent counts,
+  empty transcripts, last activity. Export-everything-first is on by default; soft
+  (reversible) by default, and a permanent delete asks you to type the folder name.
+  A Claude project's memory is only removed if you tick it. Files in the working
+  directory itself (CLAUDE.md, AGENTS.md, …) are never touched. The delete is bound
+  to the directory the dialog showed: if the project changed meanwhile, it is
+  refused and the list reloads.
 - **Project-level nav** — jump straight to a project's aggregated Tasks board
   (kanban across all its sessions), project Memory, or root doc (CLAUDE.md /
   AGENTS.md / GEMINI.md) without opening a session.
@@ -46,8 +57,14 @@ Each agent's data root can be relocated via an env var: `CLAUDE_HOME` /
   completed; the new status is written back to the task JSON.
 - **Memory tab** — renders `MEMORY.md` and all memory files for the project.
 - **Session export + delete** — export any session to Markdown; delete with an
-  export-first prompt. Delete is a soft-delete (moved to `.cc_mgr_trash/`, or
-  archived in OpenCode — reversible) unless you opt into permanent removal.
+  export-first prompt. Delete is soft (reversible) unless you opt into permanent
+  removal. What "soft" means depends on the agent and is spelled out in the dialog:
+  - Claude, agy: moved to `.cc_mgr_trash/`.
+  - OpenCode: archived inside OpenCode.
+  - Codex: `codex archive` (undo with `codex unarchive <id>`).
+  - Copilot: its database rows and `session-state/` folder go to
+    `~/.copilot/.cc_mgr_trash/`; sessions Copilot has open are refused.
+  - Gemini CLI: the chat file moves to `~/.gemini/.cc_mgr_trash/`.
 - **Full-text search (local knowledge base)** — a SQLite + FTS5 (trigram) index over
   every turn in every session **plus** every project's memory files and root doc,
   in any language (CJK included). Search all folders or scope to the current one.

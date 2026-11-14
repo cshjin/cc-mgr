@@ -40,9 +40,9 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, connect_sqlite_ro, context_window, default_export_dir,
-    is_safe_id, iter_jsonl, private_mkdir, read_doc_file, read_git_info,
-    safe_join, save_doc_file, write_private,
+    SessionSummary, check_cwd, connect_sqlite_ro, context_window, default_export_dir,
+    is_safe_id, iter_jsonl, private_mkdir, project_names, read_doc_file, read_git_info,
+    resolves_inside, safe_join, save_doc_file, write_private,
 )
 
 # Step types that carry a tool's output.
@@ -123,10 +123,6 @@ def agy_home() -> Path:
     if not default.exists() and (Path.home() / ".antigravity").exists():
         return Path.home() / ".antigravity"
     return default
-
-
-def _mangle(cwd: str) -> str:
-    return cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
 
 
 def _clean_user_prompt(text: str) -> str:
@@ -334,6 +330,9 @@ class AgyAdapter(AgentAdapter):
         can_edit_doc=True,
         can_delete=True,
         can_export=True,
+        delete_note=("A soft delete moves brain/<id>/ and the session's conversations/ and "
+                     "annotations/ files to .cc_mgr_trash/, with its conversation_summaries "
+                     "row saved there (reversible)."),
     )
 
     def _home(self) -> Path:
@@ -344,27 +343,26 @@ class AgyAdapter(AgentAdapter):
         return brain.is_dir() and any(brain.iterdir())
 
     def _project_cwd(self, project: str) -> str:
-        """Resolve a project name (mangled cwd) back to its working directory.
+        """Resolve a project name back to its working directory.
 
         Unknown names resolve to "" (never a guessed path that a doc save
         could write into).
         """
         projects, _ = _scan_sessions(self._home())
-        for cwd in projects:
-            if _mangle(cwd) == project or cwd == project:
-                return cwd
-        return ""
+        names = project_names(projects)
+        return next((cwd for cwd in projects if names[cwd] == project), "")
 
     def list_projects(self) -> list[dict[str, Any]]:
         home = self._home()
         projects, _ = _scan_sessions(home)
+        names = project_names(projects)
         out: list[dict[str, Any]] = []
 
         for cwd, sessions in projects.items():
             if not sessions:
                 continue
             mtimes = [s["mtime"] for s in sessions]
-            name = _mangle(cwd)
+            name = names[cwd]
             # Check if memory/artifacts exist
             brain = home / "brain"
             has_mem = False
@@ -407,13 +405,6 @@ class AgyAdapter(AgentAdapter):
         projects, _ = _scan_sessions(home)
         cwd = self._project_cwd(project)
         sessions = projects.get(cwd, [])
-        if not sessions:
-            # Fallback search by matching mangled name
-            for w, s_list in projects.items():
-                if _mangle(w) == project:
-                    cwd = w
-                    sessions = s_list
-                    break
 
         git = read_git_info(cwd)
         branch = git["branch"] if git else ""
@@ -555,26 +546,21 @@ class AgyAdapter(AgentAdapter):
                 return read_doc_file(cwd, fname)
         return read_doc_file(cwd, "GEMINI.md")
 
-    def save_doc(self, project: str, content: str) -> Path:
+    def save_doc(self, project: str, content: str, expect_cwd: str | None = None) -> Path:
         cwd = self._project_cwd(project)
+        check_cwd(cwd, expect_cwd)
         if not cwd:
             raise FileNotFoundError("no working directory known for this project")
         # If AGENTS.md exists and GEMINI.md doesn't, write to AGENTS.md
         if (Path(cwd) / "AGENTS.md").is_file() and not (Path(cwd) / "GEMINI.md").is_file():
-            return save_doc_file(cwd, "AGENTS.md", content)
-        return save_doc_file(cwd, "GEMINI.md", content)
+            return save_doc_file(cwd, "AGENTS.md", content, expect_cwd)
+        return save_doc_file(cwd, "GEMINI.md", content, expect_cwd)
 
     def get_memory(self, project: str) -> dict[str, Any]:
         cwd = self._project_cwd(project)
         home = self._home()
         projects, _ = _scan_sessions(home)
         sessions = projects.get(cwd, [])
-        if not sessions:
-            for w, s_list in projects.items():
-                if _mangle(w) == project:
-                    cwd = w
-                    sessions = s_list
-                    break
 
         files: list[dict[str, Any]] = []
         seen_paths: set[str] = set()
@@ -630,12 +616,14 @@ class AgyAdapter(AgentAdapter):
             "files": files,
         }
 
-    def save_memory_file(self, project: str, name: str, content: str) -> Path:
+    def save_memory_file(self, project: str, name: str, content: str,
+                         expect_dir: str | None = None) -> Path:
         if "/" in name or "\\" in name or name in ("", ".", ".."):
             raise ValueError("invalid memory file name")
         if not name.endswith(".md"):
             raise ValueError("memory files must end in .md")
         cwd = self._project_cwd(project)
+        check_cwd(cwd, expect_dir)  # get_memory reports the cwd as its "dir"
         if not cwd:
             raise FileNotFoundError("no working directory known for this project")
         # Anchored at the project cwd: a symlinked .agents/ or rules file can't
@@ -749,6 +737,10 @@ class AgyAdapter(AgentAdapter):
         brain_dir = safe_join(home / "brain", session_id)
         if not brain_dir.is_dir():  # only real sessions can be deleted
             raise FileNotFoundError(f"session {session_id} not found")
+        summaries = home / "conversation_summaries.db"
+        if summaries.exists() and not resolves_inside(summaries, home):
+            raise ValueError("conversation_summaries.db resolves outside the agy home; "
+                             "refusing to modify it")
 
         def owned_files(dirname: str) -> list[Path]:
             d = home / dirname

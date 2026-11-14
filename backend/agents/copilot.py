@@ -23,11 +23,23 @@ Real on-disk format (verified with Copilot CLI 1.0.x):
 
 The older guess — history/<mangled-cwd>/*.jsonl with Claude-like records — is
 still read when present (no Copilot version has been seen writing it).
+
+The CLI has no command to delete a session (`copilot sessions` only has
+`import`), so cc_mgr edits the store itself: every table with a session_id
+column plus the sessions row, in one transaction, and session-state/<id>/.
+A soft delete first saves those rows (db_rows.json) and the folder under
+.cc_mgr_trash/. A session a running Copilot holds open
+(session-state/<id>/inuse.<pid>.lock) or that was active moments ago is
+refused.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
+import shutil
+import sqlite3
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -35,18 +47,15 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, block_text, connect_sqlite_ro, context_window, iter_jsonl,
-    read_doc_file, read_git_info, save_doc_file, structured_blocks,
+    SessionSummary, block_text, connect_sqlite_ro, context_window, is_safe_id,
+    is_safe_name, iter_jsonl, new_trash_dir, pid_alive, project_names, read_doc_file,
+    read_git_info, resolves_inside, restore_dir, safe_join, save_doc_file, structured_blocks,
 )
 
 
 def copilot_home() -> Path:
     env = os.environ.get("COPILOT_HOME")
     return Path(env).expanduser() if env else Path.home() / ".copilot"
-
-
-def _mangle(cwd: str) -> str:
-    return cwd.replace("/", "-").replace("\\", "-").replace(":", "-")
 
 
 def _int(value: Any) -> int:
@@ -231,11 +240,164 @@ def _session_turns(home: Path, info: dict[str, Any]) -> tuple[list[dict[str, Any
     return _db_turns(home, info["id"])
 
 
+# ---------------------------------------------------------------------------
+# delete: the CLI can't, so edit session-store.db + session-state/ directly
+# ---------------------------------------------------------------------------
+
+def _quote(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _session_tables(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(table, column) for every table holding a session's rows; the sessions
+    row itself comes last, since the others reference it. FTS5 shadow tables
+    (search_index_*) are maintained by search_index itself."""
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")]
+    out = [(t, "session_id") for t in tables
+           if t != "sessions" and not t.startswith("search_index_")
+           and "session_id" in {c[1] for c in conn.execute(f"PRAGMA table_info({_quote(t)})")}]
+    return out + ([("sessions", "id")] if "sessions" in tables else [])
+
+
+def _jsonable(value: Any) -> Any:
+    return {"base64": base64.b64encode(value).decode("ascii")} if isinstance(value, bytes) else value
+
+
+_LOCK_TIMEOUT = 10.0  # seconds to wait for Copilot's own writes to finish
+
+
+def _delete_store_session(home: Path, db: Path | None, state_dir: Path, session_id: str,
+                          hard: bool) -> dict[str, Any]:
+    """Remove a session's rows (one transaction) and its session-state folder.
+
+    The write transaction is taken first. Holding it, the session is checked
+    for activity once more (anything Copilot did while we waited for the lock
+    is visible now), and the backup is read: no writer can slip rows in
+    between, so a soft delete saves exactly what it deletes. If anything fails
+    before the commit, the transaction rolls back and the folder is put back
+    (never over one that reappeared meanwhile — then the trash copy is kept).
+    """
+    conn = None
+    if db is not None:
+        conn = sqlite3.connect(db, timeout=_LOCK_TIMEOUT, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as e:
+            conn.close()
+            raise RuntimeError(f"session-store.db is busy ({e}); nothing was deleted") from e
+    trash: Path | None = None
+    moved = False
+    deleted: list[str] = []
+    try:
+        if conn is not None:
+            row = conn.execute("SELECT updated_at, created_at FROM sessions WHERE id = ?",
+                               (session_id,)).fetchone()
+            busy = _busy_reason(home, session_id,
+                                _iso_to_epoch(row["updated_at"] or row["created_at"]) if row else 0.0)
+            if busy:
+                raise RuntimeError(f"not deleting Copilot session {session_id}: {busy}")
+        tables = _session_tables(conn) if conn is not None else []
+        if not hard:
+            backup = {}
+            for table, col in tables:
+                rows = conn.execute(f"SELECT * FROM {_quote(table)} WHERE {col} = ?",
+                                    (session_id,)).fetchall()
+                if rows:
+                    backup[table] = [{k: _jsonable(r[k]) for k in r.keys()} for r in rows]
+            trash = new_trash_dir(home, session_id)
+            (trash / "db_rows.json").write_text(
+                json.dumps({"db": str(db), "session_id": session_id, "rows": backup},
+                           ensure_ascii=False, indent=1), encoding="utf-8")
+            if state_dir.is_symlink():  # became one since delete_session looked
+                raise ValueError("the session's folder is a symlink; refusing to move it")
+            if state_dir.is_dir():
+                os.rename(state_dir, trash / "session-state")  # same filesystem: both under home
+                moved = True
+                deleted.append(str(state_dir))
+        rows = sum(conn.execute(f"DELETE FROM {_quote(table)} WHERE {col} = ?",
+                                (session_id,)).rowcount for table, col in tables)
+        if conn is not None:
+            conn.execute("COMMIT")
+    except BaseException as e:
+        if conn is not None and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        kept = ""
+        if moved:
+            try:
+                restored = restore_dir(trash / "session-state", state_dir)
+            except OSError:
+                restored = False
+            if not restored:
+                kept = (f"; the session folder couldn't all go back without replacing something "
+                        f"that appeared meanwhile, so its previous copy is kept in {trash}")
+        if trash is not None and not kept:
+            shutil.rmtree(trash, ignore_errors=True)
+        if isinstance(e, (sqlite3.Error, OSError)):
+            raise RuntimeError(f"could not delete the session ({e}); nothing was deleted{kept}") from e
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+    if rows:
+        deleted.append(f"{db} ({rows} rows)")
+    result: dict[str, Any] = {"deleted": deleted, "trash": str(trash) if trash else None}
+    if trash:
+        result["note"] = f"Moved to {trash} (its database rows are in db_rows.json)."
+    if hard and state_dir.is_dir():
+        try:
+            shutil.rmtree(state_dir)
+            deleted.append(str(state_dir))
+        except OSError as e:
+            result["warnings"] = [f"could not remove {state_dir}: {e}"]
+    return result
+
+
+_ACTIVE_SECONDS = 120
+
+
+def _is_copilot_process(pid: int) -> bool:
+    if not pid_alive(pid):
+        return False
+    try:  # Linux: rule out an unrelated process that reused a stale lock's pid
+        return b"copilot" in Path(f"/proc/{pid}/cmdline").read_bytes().lower()
+    except FileNotFoundError:
+        return not Path("/proc/self").exists()  # no /proc: can't tell, assume it is
+    except OSError:
+        return True
+
+
+def _busy_reason(home: Path, session_id: str, updated: float = 0.0) -> str:
+    """Why the session must not be deleted right now ("" if it may be).
+
+    updated: the session's last activity as the store records it (sessions.
+    updated_at, or the events.jsonl mtime), so DB-only sessions count too."""
+    d = home / "session-state" / session_id
+    if d.is_dir():
+        for lock in d.glob("inuse.*.lock"):
+            try:
+                pid = int(lock.name.split(".")[1])
+            except (IndexError, ValueError):
+                continue
+            if _is_copilot_process(pid):
+                return f"it is open in a running Copilot CLI (pid {pid}); close it first"
+    stamps = [updated] + [p.stat().st_mtime for p in (d, d / "events.jsonl") if p.exists()]
+    if time.time() - max(stamps) < _ACTIVE_SECONDS:
+        return ("it was active in the last two minutes; Copilot may still be running it "
+                "(perhaps on another node), so try again once it is closed")
+    return ""
+
+
 class CopilotAdapter(AgentAdapter):
     capabilities = Capabilities(
         agent_id="copilot", label="Copilot", doc_filename="AGENTS.md",
         has_memory=False, has_tasks=False, can_edit_doc=True,
-        can_delete=False, can_export=False,
+        can_delete=True, can_export=True,
+        delete_note=("The Copilot CLI has no delete command, so cc_mgr edits its store: a soft "
+                     "delete first saves the session's database rows (db_rows.json) and its "
+                     "session-state folder to ~/.copilot/.cc_mgr_trash/. Sessions open in a "
+                     "running Copilot, or active in the last two minutes, are refused."),
     )
 
     def _home(self) -> Path:
@@ -252,16 +414,19 @@ class CopilotAdapter(AgentAdapter):
         return self._home() / "history"
 
     def _store_sessions(self, project: str) -> list[dict[str, Any]]:
-        return [s for s in _all_sessions(self._home()).values() if _mangle(s["cwd"]) == project]
+        sessions = list(_all_sessions(self._home()).values())
+        names = project_names({s["cwd"] for s in sessions})
+        return [s for s in sessions if names[s["cwd"]] == project]
 
     def list_projects(self) -> list[dict[str, Any]]:
         groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for s in _all_sessions(self._home()).values():
             groups[s["cwd"]].append(s)
+        names = project_names(groups)
         out = []
         for cwd, sessions in groups.items():
             out.append({
-                "name": _mangle(cwd),
+                "name": names[cwd],
                 "display_path": cwd,
                 "cwd": cwd,
                 "session_count": len(sessions),
@@ -334,8 +499,44 @@ class CopilotAdapter(AgentAdapter):
     def get_doc(self, project):
         return read_doc_file(self._project_cwd(project), "AGENTS.md")
 
-    def save_doc(self, project, content):
-        return save_doc_file(self._project_cwd(project), "AGENTS.md", content)
+    def save_doc(self, project, content, expect_cwd=None):
+        return save_doc_file(self._project_cwd(project), "AGENTS.md", content, expect_cwd)
+
+    def _session_title(self, project: str, session_id: str) -> str:
+        info = next((s for s in self._store_sessions(project) if s["id"] == session_id), None)
+        return (info or {}).get("title", "")
+
+    def delete_session(self, project: str, session_id: str, hard: bool = False) -> dict[str, Any]:
+        if not is_safe_id(session_id):
+            raise ValueError("invalid session id")
+        home = self._home()
+        info = next((s for s in self._store_sessions(project) if s["id"] == session_id), None)
+        if info is None:
+            return self._delete_history_session(project, session_id, hard)
+        busy = _busy_reason(home, session_id, info.get("updated") or 0.0)
+        if busy:
+            raise RuntimeError(f"not deleting Copilot session {session_id}: {busy}")
+        db = _store_db(home)
+        if db is not None and not resolves_inside(db, home):
+            raise ValueError("session-store.db resolves outside the Copilot home; refusing to modify it")
+        state_dir = safe_join(home / "session-state", session_id)
+        if state_dir.is_symlink():  # it would point at another session's (or any) folder
+            raise ValueError("the session's folder is a symlink; refusing to move or delete through it")
+        return _delete_store_session(home, db, state_dir, session_id, hard)
+
+    def _delete_history_session(self, project: str, session_id: str, hard: bool) -> dict[str, Any]:
+        """A session in the legacy history/<project>/ layout: just its file."""
+        if not is_safe_name(project):
+            raise ValueError("invalid project name")
+        path = safe_join(self._history_root(), project, f"{session_id}.jsonl")
+        if not path.is_file():
+            raise FileNotFoundError(f"session {session_id} not found in {project}")
+        if hard:
+            path.unlink()
+            return {"deleted": [str(path)], "trash": None}
+        trash = new_trash_dir(self._home(), session_id)
+        shutil.move(str(path), str(trash / path.name))
+        return {"deleted": [str(path)], "trash": str(trash)}
 
     # ---- legacy history/<mangled-cwd>/*.jsonl (Claude-like records) ----
 
