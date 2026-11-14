@@ -149,10 +149,12 @@ Three layers, all under `backend/` + `frontend/`:
   widths + active agent persist in `localStorage`. Delete dialogs bind the agent,
   project (and its `cwd`, sent as `expect_cwd`) and session when they open; the doc
   and memory editors bind the project they were loaded for and send the directory
-  they showed; a project view drops a response that arrives after the user moved
-  on. When the project list reloads, the open project is followed by its directory
-  if its name changed (`followProject`), and let go of if its directory is gone —
-  even when its old name now means another directory.
+  they showed; only a project view's latest request may render
+  (`state.pendingView`), and one still in flight when the open project is renamed
+  is asked for again under the new name. When the project list reloads, the open
+  project is followed by its directory if its name changed (`followProject`), and
+  let go of if its directory is gone — even when its old name now means another
+  directory.
 
 ## On-disk data model (what `store.py` reads — verified, not assumed)
 
