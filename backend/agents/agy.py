@@ -40,9 +40,10 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, check_cwd, connect_sqlite_ro, context_window, default_export_dir,
-    is_safe_id, iter_jsonl, private_mkdir, project_names, read_doc_file, read_git_info,
-    resolves_inside, safe_join, save_doc_file, write_private,
+    SessionSummary, annotate_turn_timings, check_cwd, connect_sqlite_ro, context_window,
+    default_export_dir, is_safe_id, iter_jsonl, parse_timestamp_ms, private_mkdir,
+    project_names, read_doc_file, read_git_info, resolves_inside, safe_join,
+    save_doc_file, write_private,
 )
 
 # Step types that carry a tool's output.
@@ -50,6 +51,24 @@ _TOOL_STEPS = frozenset({
     "GENERIC", "VIEW_FILE", "RUN_COMMAND", "CODE_ACTION", "LIST_DIRECTORY",
     "GREP_SEARCH", "SEARCH_WEB", "READ_URL_CONTENT", "ASK_QUESTION",
 })
+
+_AGY_CREATED_RE = re.compile(r"Created At:\s*(\S+)")
+_AGY_COMPLETED_RE = re.compile(r"Completed At:\s*(\S+)")
+
+
+def _parse_tool_window(text: str) -> dict[str, float] | None:
+    """Extract Created At / Completed At epoch ms from an AGY tool output header."""
+    if not text or "Created At:" not in text:
+        return None
+    head = text[:240]
+    m_start = _AGY_CREATED_RE.search(head)
+    m_end = _AGY_COMPLETED_RE.search(head)
+    start_ms = parse_timestamp_ms(m_start.group(1)) if m_start else None
+    end_ms = parse_timestamp_ms(m_end.group(1)) if m_end else None
+    if start_ms is not None and end_ms is not None and end_ms >= start_ms:
+        dur = max(0.0, end_ms - start_ms)
+        return {"started_at": start_ms, "ended_at": end_ms, "duration_ms": dur, "tool_ms": dur}
+    return None
 
 
 def _int(value: Any) -> int:
@@ -100,7 +119,11 @@ def _step_turn(rec: dict[str, Any]) -> dict[str, Any] | None:
         return turn("assistant", "assistant", blocks, out_tokens)
     if stype in _TOOL_STEPS:
         text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-        return turn("user", "tool", [{"type": "tool_result", "text": text}])
+        t = turn("user", "tool", [{"type": "tool_result", "text": text}])
+        win = _parse_tool_window(text)
+        if win:
+            t["_raw_timing"] = win
+        return t
     if stype == "CHECKPOINT":
         text = content if isinstance(content, str) else ""
         return turn("system", "system", [{"type": "text", "text": f"[checkpoint]\n{text}".rstrip()}])
@@ -515,6 +538,45 @@ class AgyAdapter(AgentAdapter):
             return {"total": 0, "offset": offset, "limit": limit, "turns": []}
 
         turns = [t for t in (_step_turn(rec) for rec in iter_jsonl(tfile)) if t]
+        # In live AGY logs, PLANNER_RESPONSE.created_at is stamped when the step
+        # starts (often the same second as the preceding USER_INPUT or tool
+        # completion), and the following tool step's Created At marks when the
+        # planner response finished.
+        start_stamped = any("_raw_timing" in t for t in turns)
+        if not start_stamped:
+            for i in range(1, len(turns)):
+                if turns[i]["role"] == "assistant":
+                    t_cur = parse_timestamp_ms(turns[i].get("timestamp"))
+                    t_prev = parse_timestamp_ms(turns[i - 1].get("timestamp"))
+                    if t_cur is not None and t_prev is not None and t_cur <= t_prev:
+                        start_stamped = True
+                        break
+        if start_stamped:
+            prev_end: float | None = None
+            for i, t in enumerate(turns):
+                ts_ms = parse_timestamp_ms(t.get("timestamp"))
+                raw = t.get("_raw_timing")
+                if raw and raw.get("ended_at") is not None:
+                    prev_end = max(prev_end or 0.0, float(raw["ended_at"]))
+                    continue
+                if t["role"] == "assistant" and not raw:
+                    start_ms = max(ts_ms or 0.0, prev_end or 0.0) or ts_ms
+                    next_start: float | None = None
+                    if i + 1 < len(turns):
+                        nxt = turns[i + 1]
+                        nxt_raw = nxt.get("_raw_timing") or {}
+                        next_start = nxt_raw.get("started_at") or parse_timestamp_ms(nxt.get("timestamp"))
+                    if start_ms is not None and next_start is not None and next_start >= start_ms:
+                        t["_raw_timing"] = {
+                            "started_at": start_ms,
+                            "ended_at": float(next_start),
+                            "duration_ms": float(next_start) - start_ms,
+                        }
+                        prev_end = float(next_start)
+                        continue
+                if ts_ms is not None:
+                    prev_end = max(prev_end or 0.0, ts_ms)
+        annotate_turn_timings(turns)
 
         total = len(turns)
         end = total if limit is None else min(total, offset + limit)

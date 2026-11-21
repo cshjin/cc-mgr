@@ -150,3 +150,123 @@ def test_follow_project_after_the_list_reloads():
                  "noCwd": "-mem-only",        # nothing else to go by
                  "nameNowElsewhere": None,    # its old name means another directory now
                  "cwdChanged": None}          # (an editor open on it must not move along)
+
+
+def test_frontend_trajectory_derivation_and_timeline_projections():
+    turns = [
+        {
+            "role": "user", "kind": "user", "timestamp": "2026-06-01T00:00:00.000Z",
+            "blocks": [{"type": "text", "text": "hello trajectory"}],
+        },
+        {
+            "role": "assistant", "kind": "assistant", "timestamp": "2026-06-01T00:00:04.000Z",
+            "model": "claude-opus-4-8", "output_tokens": 50,
+            "blocks": [
+                {"type": "thinking", "text": "t" * 100},
+                {"type": "text", "text": "o" * 100},
+                {"type": "tool_use", "name": "bash", "input": {"cmd": "ls"}},
+            ],
+            "timing": {
+                "started_at": 1780272000000.0, "ended_at": 1780272004000.0,
+                "duration_ms": 4000.0, "thinking_ms": 2400.0, "output_ms": 1600.0,
+                "tool_ms": None, "tools": ["bash"], "split_source": "recorded",
+            },
+        },
+        {
+            "role": "user", "kind": "tool", "timestamp": "2026-06-01T00:00:06.000Z",
+            "blocks": [{"type": "tool_result", "text": "a.py"}],
+            "timing": {
+                "started_at": 1780272004000.0, "ended_at": 1780272006000.0,
+                "duration_ms": 2000.0, "thinking_ms": None, "output_ms": None,
+                "tool_ms": 2000.0, "tools": ["bash"], "split_source": "recorded",
+            },
+        },
+    ]
+    r = run_js(
+        ["fmtDuration", "parseTsMs", "turnPreview", "deriveTrajectory",
+         "projectTrajectoryTimeline", "trajectoryFocusSeqs"],
+        f"""
+        const turns = {json.dumps(turns)};
+        const traj = deriveTrajectory(turns);
+        const pDur = projectTrajectoryTimeline(traj, "duration");
+        const pWall = projectTrajectoryTimeline(traj, "wall");
+        const pSeq = projectTrajectoryTimeline(traj, "sequence");
+        const focus = trajectoryFocusSeqs(pSeq, {{ start: 1.1, end: 2.5 }});
+        process.stdout.write(JSON.stringify({{
+          fmt: [fmtDuration(0), fmtDuration(450), fmtDuration(2400), fmtDuration(65000)],
+          summary: traj.summary,
+          lanes: traj.spans.map(s => [s.kind, s.lane, s.thinkingMs, s.outputMs, s.toolMs, Math.round(s.thinkingPct)]),
+          modes: [pDur.mode, pWall.mode, pSeq.mode],
+          focus,
+        }}));
+        """
+    )
+    assert r["fmt"] == ["0ms", "450ms", "2.40s", "1m 5s"]
+    s = r["summary"]
+    assert (s["userTurns"], s["modelTurns"], s["toolCalls"]) == (1, 1, 1)
+    assert (s["thinkingMs"], s["outputMs"], s["modelMs"], s["toolMs"], s["activeMs"]) == (
+        2400, 1600, 4000, 2000, 6000
+    )
+    assert (round(s["modelThinkingPct"]), round(s["modelOutputPct"])) == (60, 40)
+    assert r["lanes"] == [
+        ["user", 0, 0, 0, 0, 0],
+        ["model", 1, 2400, 1600, 0, 60],
+        ["tool", 2, 0, 0, 2000, 0],
+    ]
+    assert r["modes"] == ["duration", "wall", "sequence"]
+    assert r["focus"] == [1, 2]
+
+
+def test_frontend_trajectory_overview_html_and_badges():
+    turns = [
+        {
+            "role": "user", "kind": "user", "timestamp": "2026-06-01T00:00:00.000Z",
+            "blocks": [{"type": "text", "text": "prompt 1"}],
+            "timing": {"started_at": 1780272000000.0, "ended_at": 1780272000000.0, "duration_ms": 0.0},
+        },
+        {
+            "role": "assistant", "kind": "assistant", "timestamp": "2026-06-01T00:00:05.000Z",
+            "model": "claude-opus-4-8", "output_tokens": 100,
+            "blocks": [
+                {"type": "thinking", "text": "deep reasoning"},
+                {"type": "text", "text": "final answer"},
+            ],
+            "timing": {
+                "started_at": 1780272000000.0, "ended_at": 1780272005000.0,
+                "duration_ms": 5000.0, "thinking_ms": 3000.0, "output_ms": 2000.0,
+                "tool_ms": None, "tools": [], "split_source": "recorded",
+            },
+        },
+        {
+            "role": "user", "kind": "tool", "timestamp": "2026-06-01T00:00:06.500Z",
+            "blocks": [{"type": "tool_result", "text": "done"}],
+            "timing": {
+                "started_at": 1780272005000.0, "ended_at": 1780272006500.0,
+                "duration_ms": 1500.0, "tool_ms": 1500.0, "tools": ["run_command"],
+            },
+        },
+    ]
+    r = run_js(
+        ["esc", "fmtTokens", "fmtDuration", "fmtClockTime", "parseTsMs", "shortModel",
+         "turnPreview", "turnTimingBadges", "deriveTrajectory", "projectTrajectoryTimeline",
+         "trajectoryFocusSeqs", "spanTooltipText", "renderTrajectoryOverviewHtml"],
+        f"""
+        const state = {{ trajMode: "duration", trajRange: null }};
+        const turns = {json.dumps(turns)};
+        const traj = deriveTrajectory(turns);
+        const proj = projectTrajectoryTimeline(traj, "duration");
+        const html = renderTrajectoryOverviewHtml(traj, proj, {{ showOpenTabBtn: true }});
+        process.stdout.write(JSON.stringify({{
+          asstBadge: turnTimingBadges(turns[1]),
+          toolBadge: turnTimingBadges(turns[2]),
+          tip: spanTooltipText(proj.spans[1]),
+          htmlHasLanes: html.includes("Input") && html.includes("Model") && html.includes("Tools"),
+          htmlHasSplit: html.includes("Think 3.00s (60%)") && html.includes("Out 2.00s (40%)"),
+          htmlHasGradientVar: html.includes("--traj-think-pct:60.0%"),
+        }}));
+        """
+    )
+    assert "3.00s think" in r["asstBadge"] and "2.00s out" in r["asstBadge"]
+    assert "run_command · 1.50s" in r["toolBadge"]
+    assert "Thinking: 3.00s (60%) · Output: 2.00s (40%)" in r["tip"]
+    assert r["htmlHasLanes"] and r["htmlHasSplit"] and r["htmlHasGradientVar"]

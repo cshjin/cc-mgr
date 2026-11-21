@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .agents.common import (  # re-exported: store's public names stay importable
-    CTX_TIERS, STD_WINDOW, SessionSummary, check_cwd, context_limit_for as _context_limit_for,
-    context_window, default_export_dir, is_safe_id, is_safe_name, new_trash_dir,
-    private_mkdir, read_git_info, safe_join, write_private,
+    CTX_TIERS, STD_WINDOW, SessionSummary, annotate_turn_timings, check_cwd,
+    context_limit_for as _context_limit_for, context_window, default_export_dir,
+    is_safe_id, is_safe_name, new_trash_dir, private_mkdir, read_git_info,
+    safe_join, write_private,
 )
 
 
@@ -534,6 +535,12 @@ def get_conversation(
     turns: list[dict[str, Any]] = []
     for rec in _iter_jsonl(path):
         rtype = rec.get("type")
+        if rtype == "system" and rec.get("durationMs") and turns:
+            # Claude Code records a system turn_duration record after a turn finishes.
+            prev = turns[-1]
+            if prev["role"] == "assistant" and "_raw_timing" not in prev:
+                prev["_raw_timing"] = {"duration_ms": float(rec["durationMs"])}
+            continue
         if rtype not in ("user", "assistant"):
             continue
         msg = rec.get("message", {})
@@ -556,6 +563,7 @@ def get_conversation(
             "output_tokens": usage.get("output_tokens", 0),
         })
 
+    annotate_turn_timings(turns)
     total = len(turns)
     end = total if limit is None else min(total, offset + limit)
     window = turns[offset:end]

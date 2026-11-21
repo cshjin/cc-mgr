@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from . import index_db, store
 from .agents import ProjectChanged, UnsupportedCapability, get_adapter, list_agents
-from .agents.common import is_safe_id, is_safe_name
+from .agents.common import build_trajectory, is_safe_id, is_safe_name
 
 app = FastAPI(title="cc_mgr", version="0.6.0")
 
@@ -242,12 +242,26 @@ def api_conversation(project: str, session_id: str, offset: int = 0,
                      limit: int = 40, agent: str | None = None):
     _project(project)
     _ident(session_id, "session id")
+    eff_limit = None if limit <= 0 else limit
     result = _adapter(agent).get_conversation(project, session_id,
-                                              offset=offset, limit=limit)
+                                              offset=offset, limit=eff_limit)
     if result["total"] == 0:
         raise HTTPException(status_code=404, detail="session not found or empty")
     result["session_id"] = session_id
     return result
+
+
+@app.get("/api/projects/{project}/sessions/{session_id}/trajectory")
+def api_trajectory(project: str, session_id: str, agent: str | None = None):
+    _project(project)
+    _ident(session_id, "session id")
+    conv = _adapter(agent).get_conversation(project, session_id, offset=0, limit=None)
+    if conv["total"] == 0:
+        raise HTTPException(status_code=404, detail="session not found or empty")
+    traj = build_trajectory(conv["turns"])
+    traj["session_id"] = session_id
+    traj["total"] = conv["total"]
+    return traj
 
 
 @app.get("/api/sessions/{session_id}/tasks")
