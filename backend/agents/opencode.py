@@ -49,9 +49,10 @@ from typing import Any, Callable, Iterable, Iterator
 
 from . import AgentAdapter, Capabilities, ProjectChanged, UnsupportedCapability
 from .common import (
-    STD_WINDOW, SessionSummary, connect_sqlite_ro, default_export_dir,
-    is_claude_model, is_safe_id, private_mkdir, project_names, read_doc_file,
-    read_git_info, save_doc_file, write_private,
+    STD_WINDOW, SessionSummary, annotate_turn_timings, connect_sqlite_ro,
+    default_export_dir, is_claude_model, is_safe_id, parse_timestamp_ms,
+    private_mkdir, project_names, read_doc_file, read_git_info, save_doc_file,
+    write_private,
 )
 
 
@@ -363,8 +364,79 @@ def _chunks(seq: list[str], size: int = 500) -> Iterator[list[str]]:
 # v2: session_v2 + session_message
 # ---------------------------------------------------------------------------
 
+def _extract_opencode_raw_timing(
+    parts: Iterable[Any],
+    msg_time: dict[str, Any] | None,
+    created_ms: Any,
+    updated_ms: Any,
+    tokens: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Derive exact started_at, ended_at, thinking_ms, output_ms, tool_ms from OpenCode part/msg times."""
+    mt = msg_time if isinstance(msg_time, dict) else {}
+    start_ms = parse_timestamp_ms(mt.get("created") or created_ms)
+    end_ms = parse_timestamp_ms(mt.get("completed") or mt.get("streamed") or updated_ms)
+    think_start: float | None = None
+    think_end: float | None = None
+    think_dur = 0.0
+    tool_dur = 0.0
+    has_think_time = False
+    has_tool_time = False
+
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        ptype = p.get("type")
+        pt = p.get("time") if isinstance(p.get("time"), dict) else {}
+        st = p.get("state") if isinstance(p.get("state"), dict) else {}
+        st_time = st.get("time") if isinstance(st.get("time"), dict) else {}
+        p_start = parse_timestamp_ms(
+            pt.get("created") or pt.get("start") or st_time.get("start") or p.get("_time_created")
+        )
+        p_end = parse_timestamp_ms(
+            pt.get("completed") or pt.get("end") or st_time.get("end") or p.get("_time_updated")
+        )
+        if ptype == "reasoning":
+            if p_start is not None:
+                think_start = p_start if think_start is None else min(think_start, p_start)
+            if p_end is not None:
+                think_end = p_end if think_end is None else max(think_end, p_end)
+            if p_start is not None and p_end is not None and p_end >= p_start:
+                think_dur += p_end - p_start
+                has_think_time = True
+        elif ptype == "tool":
+            t_run = parse_timestamp_ms(pt.get("ran") or pt.get("created") or pt.get("start") or st_time.get("start"))
+            t_done = parse_timestamp_ms(pt.get("completed") or pt.get("end") or st_time.get("end"))
+            if t_run is not None and t_done is not None and t_done >= t_run:
+                tool_dur += t_done - t_run
+                has_tool_time = True
+
+    raw: dict[str, Any] = {}
+    r_tok = _int((tokens or {}).get("reasoning"))
+    if r_tok > 0:
+        raw["reasoning_tokens"] = r_tok
+
+    if start_ms is not None and end_ms is not None and end_ms > start_ms:
+        total_ms = end_ms - start_ms
+        raw["started_at"] = start_ms
+        raw["ended_at"] = end_ms
+        raw["duration_ms"] = total_ms
+        if has_tool_time:
+            tool_dur = min(tool_dur, total_ms)
+            raw["tool_ms"] = round(tool_dur, 1)
+        model_ms = max(0.0, total_ms - (tool_dur if has_tool_time else 0.0))
+        if has_think_time:
+            # In OpenCode v2, thinking spans from turn start (or think_start) to think_end.
+            span_from_start = (think_end - start_ms) if (think_end is not None and think_end >= start_ms) else think_dur
+            th_ms = min(model_ms, max(think_dur, span_from_start))
+            raw["thinking_ms"] = round(th_ms, 1)
+            raw["output_ms"] = round(max(0.0, model_ms - th_ms), 1)
+            raw["split_source"] = "recorded"
+    return raw
+
+
 def _v2_turn(mid: str, mtype: str, data: dict[str, Any], created_ms: Any,
-             extra_parts: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+             extra_parts: list[dict[str, Any]] | None,
+             updated_ms: Any = None) -> dict[str, Any] | None:
     ts = _ms_to_iso(created_ms or (data.get("time") or {}).get("created"))
     if mtype == "user":
         blocks = [{"type": "text", "text": data["text"]}] if data.get("text") else []
@@ -374,7 +446,8 @@ def _v2_turn(mid: str, mtype: str, data: dict[str, Any], created_ms: Any,
         return _turn(mid, "user", "user", ts, blocks) if blocks else None
     if mtype == "assistant":
         # Stored parts (session_part) come first, then the inline tail.
-        blocks, has_text = _content_blocks([*(extra_parts or []), *(data.get("content") or [])])
+        all_parts = [*(extra_parts or []), *(data.get("content") or [])]
+        blocks, has_text = _content_blocks(all_parts)
         if not blocks and data.get("error"):
             err = data["error"]
             msg = err.get("message") if isinstance(err, dict) else err
@@ -382,8 +455,12 @@ def _v2_turn(mid: str, mtype: str, data: dict[str, Any], created_ms: Any,
         if not blocks:
             return None
         tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
-        return _turn(mid, "assistant", "assistant" if has_text else "tool", ts, blocks,
-                     _format_model_name(data.get("model")), _int(tokens.get("output")))
+        t = _turn(mid, "assistant", "assistant" if has_text else "tool", ts, blocks,
+                  _format_model_name(data.get("model")), _int(tokens.get("output")))
+        raw = _extract_opencode_raw_timing(all_parts, data.get("time"), created_ms, updated_ms, tokens)
+        if raw:
+            t["_raw_timing"] = raw
+        return t
     if mtype == "compaction":
         if not data.get("summary"):
             return None
@@ -424,10 +501,10 @@ def _v2_turns(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]
             parts_by_msg.setdefault(pr["message_id"], []).append(part)
     turns = []
     for r in conn.execute(
-            "SELECT id, type, time_created, data FROM session_message WHERE session_id = ? "
+            "SELECT id, type, time_created, time_updated, data FROM session_message WHERE session_id = ? "
             "ORDER BY seq", (session_id,)):
         turn = _v2_turn(r["id"], r["type"], _json(r["data"]), r["time_created"],
-                        parts_by_msg.get(r["id"]))
+                        parts_by_msg.get(r["id"]), r["time_updated"])
         if turn:
             turns.append(turn)
     return turns
@@ -515,12 +592,15 @@ def _v2_context(conn: sqlite3.Connection, db_key: str, sid: str) -> dict[str, An
 def _v1_turns(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
     parts_by_msg: dict[str, list[dict[str, Any]]] = {}
     for pr in conn.execute(
-            "SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created, id",
+            "SELECT message_id, time_created, time_updated, data FROM part WHERE session_id = ? ORDER BY time_created, id",
             (session_id,)):
-        parts_by_msg.setdefault(pr["message_id"], []).append(_json(pr["data"]))
+        pdata = dict(_json(pr["data"]))
+        pdata["_time_created"] = pr["time_created"]
+        pdata["_time_updated"] = pr["time_updated"]
+        parts_by_msg.setdefault(pr["message_id"], []).append(pdata)
     turns = []
     for m in conn.execute(
-            "SELECT id, time_created, data FROM message WHERE session_id = ? "
+            "SELECT id, time_created, time_updated, data FROM message WHERE session_id = ? "
             "ORDER BY time_created, id", (session_id,)):
         data = _json(m["data"])
         parts = parts_by_msg.get(m["id"], [])
@@ -541,8 +621,13 @@ def _v1_turns(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]
             blocks = [{"type": "text", "text": summary}]
         kind = "user" if role == "user" else ("assistant" if has_text else "tool")
         ts = _ms_to_iso(m["time_created"] or (data.get("time") or {}).get("created"))
-        turns.append(_turn(m["id"], role, kind, ts, blocks,
-                           _format_model_name(data.get("modelID") or data.get("model")), out_tokens))
+        t = _turn(m["id"], role, kind, ts, blocks,
+                  _format_model_name(data.get("modelID") or data.get("model")), out_tokens)
+        if role == "assistant":
+            raw = _extract_opencode_raw_timing(parts, data.get("time"), m["time_created"], m["time_updated"], tokens)
+            if raw:
+                t["_raw_timing"] = raw
+        turns.append(t)
     return turns
 
 
@@ -764,9 +849,10 @@ class OpencodeAdapter(AgentAdapter):
     def _turns(self, db_file: Path, session_id: str) -> list[dict[str, Any]]:
         conn = _connect_ro(db_file)
         try:
-            return _v2_turns(conn, session_id) if _is_v2(conn) else _v1_turns(conn, session_id)
+            turns = _v2_turns(conn, session_id) if _is_v2(conn) else _v1_turns(conn, session_id)
         finally:
             conn.close()
+        return annotate_turn_timings(turns)
 
     def get_conversation(self, project: str, session_id: str,
                          offset: int = 0, limit: int | None = None) -> dict[str, Any]:

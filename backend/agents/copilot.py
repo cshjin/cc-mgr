@@ -47,9 +47,10 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, block_text, connect_sqlite_ro, context_window, is_safe_id,
-    is_safe_name, iter_jsonl, new_trash_dir, pid_alive, project_names, read_doc_file,
-    read_git_info, resolves_inside, restore_dir, safe_join, save_doc_file, structured_blocks,
+    SessionSummary, annotate_turn_timings, block_text, connect_sqlite_ro, context_window,
+    is_safe_id, is_safe_name, iter_jsonl, new_trash_dir, parse_timestamp_ms, pid_alive,
+    project_names, read_doc_file, read_git_info, resolves_inside, restore_dir, safe_join,
+    save_doc_file, structured_blocks,
 )
 
 
@@ -146,11 +147,21 @@ def _event_turns(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Conversation turns + usage {context, peak, output, model} from events.jsonl."""
     turns: list[dict[str, Any]] = []
     usage = {"context": 0, "peak": 0, "output": 0, "model": ""}
+    pending_model_start: float | None = None
+    tool_starts: dict[str, float] = {}
     for e in iter_jsonl(path):
         etype = e.get("type")
         data = e.get("data") if isinstance(e.get("data"), dict) else {}
         ts = e.get("timestamp")
-        if etype == "user.message":
+        ts_ms = parse_timestamp_ms(ts)
+        if etype in ("assistant.turn_start", "model.turn_started", "model.model_call_started"):
+            if ts_ms is not None and pending_model_start is None:
+                pending_model_start = ts_ms
+        elif etype == "tool.execution_start":
+            cid = data.get("toolCallId")
+            if cid and ts_ms is not None:
+                tool_starts[str(cid)] = ts_ms
+        elif etype == "user.message":
             blocks = [{"type": "text", "text": data["content"]}] if data.get("content") else []
             for a in data.get("attachments") or []:
                 if isinstance(a, dict):
@@ -170,8 +181,16 @@ def _event_turns(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     blocks.append({"type": "tool_use", "name": req.get("name", ""),
                                    "input": req.get("arguments") or {}})
             if blocks:
-                turns.append(_turn(e.get("id"), "assistant", "assistant" if has_text else "tool",
-                                   ts, blocks, data.get("model") or ""))
+                t = _turn(e.get("id"), "assistant", "assistant" if has_text else "tool",
+                          ts, blocks, data.get("model") or "")
+                if pending_model_start is not None and ts_ms is not None and ts_ms >= pending_model_start:
+                    t["_raw_timing"] = {
+                        "started_at": pending_model_start,
+                        "ended_at": ts_ms,
+                        "duration_ms": ts_ms - pending_model_start,
+                    }
+                turns.append(t)
+            pending_model_start = None
         elif etype == "tool.execution_complete":
             result = data.get("result")
             if data.get("success") is False or data.get("error"):
@@ -182,7 +201,14 @@ def _event_turns(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     else json.dumps(result, ensure_ascii=False)
             else:
                 text = "" if result is None else str(result)
-            turns.append(_turn(e.get("id"), "user", "tool", ts, [{"type": "tool_result", "text": text}]))
+            t = _turn(e.get("id"), "user", "tool", ts, [{"type": "tool_result", "text": text}])
+            cid = str(data.get("toolCallId") or "")
+            t_start = tool_starts.pop(cid, None)
+            if t_start is not None and ts_ms is not None and ts_ms >= t_start:
+                dur = ts_ms - t_start
+                t["_raw_timing"] = {"started_at": t_start, "ended_at": ts_ms,
+                                    "duration_ms": dur, "tool_ms": dur}
+            turns.append(t)
         elif etype == "session.compaction_complete" and data.get("summaryContent"):
             turns.append(_turn(e.get("id"), "system", "system", ts, [
                 {"type": "text", "text": f"[compaction]\n{data['summaryContent']}"}]))
@@ -197,6 +223,7 @@ def _event_turns(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 usage["peak"] = max(usage["peak"], ctx)
             usage["output"] += _int(u.get("outputTokens"))
             usage["model"] = u.get("model") or usage["model"]
+    annotate_turn_timings(turns)
     return turns, usage
 
 
@@ -231,6 +258,7 @@ def _db_turns(home: Path, session_id: str) -> tuple[list[dict[str, Any]], dict[s
             pass
     finally:
         conn.close()
+    annotate_turn_timings(turns)
     return turns, usage
 
 
@@ -619,6 +647,7 @@ class CopilotAdapter(AgentAdapter):
             turns.append(_turn(rec.get("uuid"), rtype, "tool" if is_tool_only else rtype,
                                rec.get("timestamp"), blocks, msg.get("model", ""),
                                (msg.get("usage") or {}).get("output_tokens", 0)))
+        annotate_turn_timings(turns)
         total = len(turns)
         end = total if limit is None else min(total, offset + limit)
         return {"total": total, "offset": offset, "limit": limit, "turns": turns[offset:end]}

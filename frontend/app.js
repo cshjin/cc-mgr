@@ -48,6 +48,12 @@ const state = {
   caps: null,
   showSubagents: localStorage.getItem("cc_showSubagents") === "1",
   pendingView: null, // the project view whose request is in flight (loadProjView)
+  convTurns: [], // turns currently loaded in the Conversation tab
+  trajMode: localStorage.getItem("cc_trajMode") || "duration", // duration | wall | sequence
+  trajRange: null, // active timeline filter range { start, end } in projected domain
+  trajSearch: "", // filter query in the Trajectory tab
+  trajFoldTurns: false, // whether all turns are folded in the Trajectory tab
+  trajShowPhases: true, // whether model rows expand Thinking / Output sub-phase bars
 };
 
 const CONV_PAGE = 40;
@@ -90,6 +96,38 @@ function fmtTime(ts) {
   if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
   if (diff < 604800) return Math.floor(diff / 86400) + "d ago";
   return d.toLocaleDateString();
+}
+
+function fmtDuration(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "";
+  if (ms === 0) return "0ms";
+  if (ms < 1000) return Math.round(ms) + "ms";
+  const sec = ms / 1000;
+  if (sec < 60) return (sec < 10 ? sec.toFixed(2) : sec.toFixed(1)) + "s";
+  const m = Math.floor(sec / 60);
+  const rem = Math.round(sec % 60);
+  return rem ? `${m}m ${rem}s` : `${m}m`;
+}
+
+function fmtClockTime(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return "";
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toISOString().slice(11, 23);
+}
+
+function parseTsMs(ts) {
+  if (ts == null || ts === "" || typeof ts === "boolean") return null;
+  if (typeof ts === "number") {
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    return ts > 1e11 ? ts : ts * 1000;
+  }
+  const s = String(ts).trim();
+  if (!s) return null;
+  const num = Number(s);
+  if (Number.isFinite(num) && num > 0) return num > 1e11 ? num : num * 1000;
+  const parsed = Date.parse(s);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function shortModel(m) {
@@ -584,6 +622,7 @@ function renderDetailShell() {
     </div>
     <div class="tabs">
       <div class="tab ${state.detailTab === "conversation" ? "active" : ""}" data-tab="conversation">Conversation</div>
+      <div class="tab ${state.detailTab === "trajectory" ? "active" : ""}" data-tab="trajectory">Trajectory</div>
       ${caps.has_tasks ? `<div class="tab ${state.detailTab === "tasks" ? "active" : ""}" data-tab="tasks">Tasks${s && s.total_tasks ? ` (${s.total_tasks})` : ""}</div>` : ""}
       ${caps.has_memory ? `<div class="tab ${state.detailTab === "memory" ? "active" : ""}" data-tab="memory">Memory</div>` : ""}
     </div>
@@ -858,17 +897,25 @@ async function loadTab() {
     if (state.detailTab === "conversation") {
       state.convOffset = 0;
       state.convTotal = 0;
+      state.convTurns = [];
+      state.trajRange = null;
       // If navigating to a specific turn, load enough to include it in one go.
       const need = (typeof state.targetSeq === "number")
         ? Math.max(CONV_PAGE, state.targetSeq + 5) : CONV_PAGE;
       const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}?offset=0&limit=${need}`);
       state.convTotal = data.total;
       state.convOffset = data.turns.length;
+      state.convTurns = data.turns.slice();
       renderConversation(body, data.turns, true);
       if (typeof state.targetSeq === "number") {
         scrollToTurn(state.targetSeq);
         state.targetSeq = null;
       }
+    } else if (state.detailTab === "trajectory") {
+      state.trajRange = null;
+      const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}?offset=0&limit=0`);
+      state.convTurns = data.turns || [];
+      renderTrajectoryView(body, state.convTurns);
     } else if (state.detailTab === "tasks") {
       const tasks = await api(`/api/sessions/${encodeURIComponent(state.activeSession)}/tasks`);
       renderTasks(body, tasks);
@@ -891,10 +938,42 @@ function turnPreview(turn) {
   return "(empty)";
 }
 
+function turnTimingBadges(t) {
+  const tm = t.timing || {};
+  const roleLabel = t.kind === "tool" ? "tool" : t.role;
+  const badges = [];
+  if (roleLabel === "assistant") {
+    if (tm.thinking_ms != null && tm.thinking_ms > 0) {
+      badges.push(`<span class="turn-time-pill thinking" title="Model thinking time">${esc(fmtDuration(tm.thinking_ms))} think</span>`);
+    }
+    if (tm.output_ms != null && tm.output_ms > 0) {
+      badges.push(`<span class="turn-time-pill output" title="Model output time">${esc(fmtDuration(tm.output_ms))} out</span>`);
+    }
+    if (tm.tool_ms != null && tm.tool_ms > 0) {
+      badges.push(`<span class="turn-time-pill tool" title="Inline tool execution time">${esc(fmtDuration(tm.tool_ms))} tool</span>`);
+    }
+    if (tm.duration_ms != null && tm.duration_ms > 0 && badges.length === 0) {
+      badges.push(`<span class="turn-time-pill total" title="Total turn duration">${esc(fmtDuration(tm.duration_ms))}</span>`);
+    }
+  } else if (roleLabel === "tool") {
+    const tools = (tm.tools && tm.tools.length) ? tm.tools.join(", ") : "";
+    const dur = tm.tool_ms != null ? tm.tool_ms : tm.duration_ms;
+    if (tools || (dur != null && dur >= 0)) {
+      const label = [tools, dur != null ? fmtDuration(dur) : ""].filter(Boolean).join(" · ");
+      if (label) badges.push(`<span class="turn-time-pill tool" title="Tool calling duration">${esc(label)}</span>`);
+    }
+  } else if (roleLabel === "user") {
+    const clk = fmtClockTime(tm.started_at != null ? tm.started_at : parseTsMs(t.timestamp));
+    if (clk) badges.push(`<span class="turn-time-pill clock" title="User input timestamp">${esc(clk.slice(0, 8))}</span>`);
+  }
+  return badges.join("");
+}
+
 function turnHtml(t, seq) {
   const roleLabel = t.kind === "tool" ? "tool" : t.role;
-  const toks = t.output_tokens ? `<span class="turn-toks">${fmtTokens(t.output_tokens)}</span>` : "";
+  const toks = t.output_tokens ? `<span class="turn-toks">${fmtTokens(t.output_tokens)} tok</span>` : "";
   const skill = t.attribution_skill ? ` · ${esc(t.attribution_skill)}` : "";
+  const timingHtml = turnTimingBadges(t);
   const blocks = t.blocks.map(renderBlock).join("");
   const openByDefault = t.role === "user" && t.kind !== "tool";
   return `
@@ -903,7 +982,7 @@ function turnHtml(t, seq) {
         <span class="turn-caret">▶</span>
         <span class="turn-role">${esc(roleLabel)}${skill}</span>
         <span class="turn-preview">${esc(turnPreview(t))}</span>
-        ${toks}
+        ${timingHtml}${toks}
       </div>
       <div class="turn-body">${blocks}</div>
     </div>`;
@@ -912,6 +991,7 @@ function turnHtml(t, seq) {
 function scrollToTurn(seq) {
   const node = document.querySelector(`.turn[data-seq="${seq}"]`);
   if (!node) return;
+  node.hidden = false;
   node.classList.add("open", "turn-highlight");
   node.scrollIntoView({ behavior: "smooth", block: "center" });
   setTimeout(() => node.classList.remove("turn-highlight"), 2600);
@@ -937,11 +1017,12 @@ function renderConversation(body, turns, fresh) {
   const base = fresh ? 0 : (state.convOffset - turns.length);
   const turnsHtml = turns.map((t, i) => turnHtml(t, base + i)).join("");
   if (fresh) {
-    body.innerHTML = `<div class="turns" id="turnsWrap">${turnsHtml}</div><div id="loadMoreWrap">${loadMoreBar()}</div>`;
+    body.innerHTML = `<div id="convTrajWrap"></div><div id="convFilterBanner" hidden></div><div class="turns" id="turnsWrap">${turnsHtml}</div><div id="loadMoreWrap">${loadMoreBar()}</div>`;
   } else {
     $("#turnsWrap").insertAdjacentHTML("beforeend", turnsHtml);
     $("#loadMoreWrap").innerHTML = loadMoreBar();
   }
+  renderConversationTrajectory();
   wireTurns(body);
   const btn = $("#loadMore");
   if (btn) btn.addEventListener("click", loadMoreTurns);
@@ -954,10 +1035,981 @@ async function loadMoreTurns() {
     const data = await api(`/api/projects/${encodeURIComponent(state.activeProject)}/sessions/${encodeURIComponent(state.activeSession)}?offset=${state.convOffset}&limit=${CONV_PAGE}`);
     state.convTotal = data.total;
     state.convOffset += data.turns.length;
+    state.convTurns = state.convTurns.concat(data.turns);
     renderConversation($("#tabBody"), data.turns, false);
   } catch (e) {
     if (btn) btn.textContent = `Load more failed (${e.message}) — click to retry`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Trajectory & Timing Visualization (deepseek-harness inspired)
+// ---------------------------------------------------------------------------
+
+// Derive 3-lane trajectory spans (Input / Model [Thinking + Output] / Tools),
+// turn-grouped rounds, and aggregate timing metrics from a conversation's turns.
+function deriveTrajectory(turns) {
+  const list = Array.isArray(turns) ? turns : [];
+  const spans = [];
+  const roundsMap = new Map();
+  let turnNum = 0;
+  let index = 0;
+  let prevEnd = null;
+  let lastToolNames = [];
+
+  let userTurns = 0;
+  let modelTurns = 0;
+  let toolCalls = 0;
+  let thinkingTotal = 0;
+  let outputTotal = 0;
+  let toolTotal = 0;
+  let minTs = null;
+  let maxTs = null;
+
+  const noteTs = (v) => {
+    if (v == null || !Number.isFinite(v)) return;
+    minTs = minTs == null ? v : Math.min(minTs, v);
+    maxTs = maxTs == null ? v : Math.max(maxTs, v);
+  };
+
+  const ensureRound = (num) => {
+    if (!roundsMap.has(num)) {
+      roundsMap.set(num, {
+        turn: num,
+        startedAt: null,
+        endedAt: null,
+        durationMs: 0,
+        thinkingMs: 0,
+        outputMs: 0,
+        toolMs: 0,
+        tools: {},
+        items: [],
+      });
+    }
+    return roundsMap.get(num);
+  };
+
+  for (let seq = 0; seq < list.length; seq++) {
+    const t = list[seq] || {};
+    const role = t.role || "user";
+    const kind = t.kind || role;
+    const blocks = Array.isArray(t.blocks) ? t.blocks : [];
+    const tm = t.timing || {};
+
+    let thinkChars = 0;
+    let outChars = 0;
+    let thinkPreview = "";
+    let outPreview = "";
+    const ownTools = [];
+    let isError = false;
+    let hasInlineToolResult = false;
+
+    for (const b of blocks) {
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "thinking") {
+        const txt = String(b.text || "");
+        thinkChars += txt.length;
+        if (!thinkPreview && txt.trim()) thinkPreview = txt.trim().slice(0, 140);
+      } else if (b.type === "text") {
+        const txt = String(b.text || "");
+        outChars += txt.length;
+        if (!outPreview && txt.trim()) outPreview = txt.trim().slice(0, 140);
+        if (/^(\[error\]|error:)/i.test(txt.trim())) isError = true;
+      } else if (b.type === "tool_use") {
+        const name = String(b.name || "tool");
+        ownTools.push(name);
+        let inpStr = "";
+        try { inpStr = b.input ? JSON.stringify(b.input) : ""; } catch { inpStr = ""; }
+        outChars += name.length + inpStr.length;
+        if (!outPreview) outPreview = `→ ${name}(${inpStr.slice(0, 80)})`;
+      } else if (b.type === "tool_result") {
+        hasInlineToolResult = true;
+        const txt = String(b.text || "").trim();
+        if (/^(\[error\]|error:)/i.test(txt)) isError = true;
+        if (!outPreview && txt) outPreview = txt.slice(0, 140);
+      }
+    }
+
+    const tsMs = parseTsMs(t.timestamp);
+    let startedAt = tm.started_at != null ? Number(tm.started_at) : null;
+    let endedAt = tm.ended_at != null ? Number(tm.ended_at) : null;
+    let durationMs = tm.duration_ms != null ? Number(tm.duration_ms) : null;
+
+    if (startedAt == null || endedAt == null) {
+      if (kind === "user") {
+        startedAt = tsMs;
+        endedAt = tsMs;
+        durationMs = tsMs != null ? 0 : null;
+      } else if (tsMs != null && prevEnd != null && tsMs >= prevEnd && (tsMs - prevEnd) <= 1800000) {
+        startedAt = prevEnd;
+        endedAt = tsMs;
+        if (durationMs == null) durationMs = tsMs - prevEnd;
+      } else {
+        startedAt = tsMs;
+        endedAt = tsMs;
+      }
+    }
+    if (endedAt != null) prevEnd = endedAt;
+    else if (tsMs != null) prevEnd = tsMs;
+    noteTs(startedAt);
+    noteTs(endedAt);
+
+    if (kind === "user") {
+      turnNum += 1;
+      userTurns += 1;
+      lastToolNames = [];
+      const r = ensureRound(turnNum);
+      if (startedAt != null && (r.startedAt == null || startedAt < r.startedAt)) r.startedAt = startedAt;
+      if (endedAt != null && (r.endedAt == null || endedAt > r.endedAt)) r.endedAt = endedAt;
+      const item = {
+        index: ++index,
+        seq,
+        turn: turnNum,
+        lane: 0,
+        kind: "user",
+        label: outPreview || turnPreview(t),
+        tools: [],
+        startedAt,
+        endedAt,
+        durationMs: 0,
+        thinkingMs: 0,
+        outputMs: 0,
+        toolMs: 0,
+        thinkingPct: 0,
+        hasThinking: false,
+        hasOutput: true,
+        thinkingPreview: "",
+        outputPreview: outPreview,
+        outputTokens: 0,
+        model: "",
+        isError: false,
+        splitSource: null,
+      };
+      spans.push(item);
+      r.items.push(item);
+      continue;
+    }
+
+    const curTurn = Math.max(1, turnNum || 1);
+    if (turnNum === 0) turnNum = 1;
+    const r = ensureRound(curTurn);
+    if (startedAt != null && (r.startedAt == null || startedAt < r.startedAt)) r.startedAt = startedAt;
+    if (endedAt != null && (r.endedAt == null || endedAt > r.endedAt)) r.endedAt = endedAt;
+
+    if (kind === "tool") {
+      toolCalls += 1;
+      const tools = (Array.isArray(tm.tools) && tm.tools.length)
+        ? tm.tools : (ownTools.length ? ownTools : lastToolNames.slice());
+      if (ownTools.length) lastToolNames = ownTools;
+      const toolMs = tm.tool_ms != null ? Number(tm.tool_ms) : (durationMs != null ? durationMs : null);
+      if (toolMs != null && toolMs > 0) {
+        toolTotal += toolMs;
+        r.toolMs += toolMs;
+        r.durationMs += toolMs;
+      }
+      for (const tn of tools) r.tools[tn] = (r.tools[tn] || 0) + 1;
+      const toolLabel = tools.length ? tools.join(", ") : "tool";
+      const item = {
+        index: ++index,
+        seq,
+        turn: curTurn,
+        lane: 2,
+        kind: "tool",
+        label: outPreview ? `${toolLabel} — ${outPreview}` : toolLabel,
+        tools,
+        startedAt,
+        endedAt,
+        durationMs: toolMs,
+        thinkingMs: 0,
+        outputMs: 0,
+        toolMs,
+        thinkingPct: 0,
+        hasThinking: false,
+        hasOutput: Boolean(outPreview),
+        thinkingPreview: "",
+        outputPreview: outPreview || turnPreview(t),
+        outputTokens: 0,
+        model: t.model || "",
+        isError,
+        splitSource: tm.split_source || (toolMs != null ? "recorded" : null),
+      };
+      spans.push(item);
+      r.items.push(item);
+      continue;
+    }
+
+    if (role === "assistant") {
+      modelTurns += 1;
+      const tools = (Array.isArray(tm.tools) && tm.tools.length) ? tm.tools : ownTools;
+      if (tools.length) lastToolNames = tools;
+      const hasThinking = thinkChars > 0;
+      const hasOutput = outChars > 0 || ownTools.length > 0;
+      const charRatio = (hasThinking && hasOutput)
+        ? (thinkChars / Math.max(1, thinkChars + outChars))
+        : (hasThinking ? 1 : 0);
+
+      let toolMs = tm.tool_ms != null ? Number(tm.tool_ms) : null;
+      let modelDur = durationMs != null ? Math.max(0, durationMs - (toolMs || 0)) : null;
+      let thinkingMs = tm.thinking_ms != null ? Number(tm.thinking_ms) : null;
+      let outputMs = tm.output_ms != null ? Number(tm.output_ms) : null;
+      let splitSource = tm.split_source || null;
+
+      if ((thinkingMs == null || outputMs == null) && modelDur != null) {
+        thinkingMs = Math.round(modelDur * charRatio * 10) / 10;
+        outputMs = Math.round(Math.max(0, modelDur - thinkingMs) * 10) / 10;
+        splitSource = (hasThinking && hasOutput) ? "estimated" : "recorded";
+      } else if (thinkingMs != null && outputMs != null && modelDur == null) {
+        modelDur = thinkingMs + outputMs;
+      }
+
+      if (thinkingMs != null && thinkingMs > 0) {
+        thinkingTotal += thinkingMs;
+        r.thinkingMs += thinkingMs;
+      }
+      if (outputMs != null && outputMs > 0) {
+        outputTotal += outputMs;
+        r.outputMs += outputMs;
+      }
+      if (modelDur != null && modelDur > 0) {
+        r.durationMs += modelDur;
+      }
+
+      const thinkingPct = (modelDur != null && modelDur > 0 && thinkingMs != null)
+        ? Math.min(100, Math.max(0, (thinkingMs / modelDur) * 100))
+        : (charRatio * 100);
+
+      const modelEndedAt = (startedAt != null && modelDur != null && toolMs != null && toolMs > 0)
+        ? (startedAt + modelDur) : endedAt;
+
+      const modelItem = {
+        index: ++index,
+        seq,
+        turn: curTurn,
+        lane: 1,
+        kind: "model",
+        label: outPreview || thinkPreview || turnPreview(t),
+        tools,
+        startedAt,
+        endedAt: modelEndedAt,
+        durationMs: modelDur,
+        thinkingMs,
+        outputMs,
+        toolMs: 0,
+        thinkingPct,
+        hasThinking,
+        hasOutput,
+        thinkingPreview: thinkPreview,
+        outputPreview: outPreview,
+        outputTokens: Number(t.output_tokens || 0),
+        model: t.model || "",
+        isError,
+        splitSource,
+      };
+      spans.push(modelItem);
+      r.items.push(modelItem);
+
+      // If the assistant turn also executed inline tools (e.g. OpenCode), emit a Tools lane span too.
+      if ((toolMs != null && toolMs > 0) || hasInlineToolResult) {
+        toolCalls += 1;
+        if (toolMs != null && toolMs > 0) {
+          toolTotal += toolMs;
+          r.toolMs += toolMs;
+          r.durationMs += toolMs;
+        }
+        for (const tn of tools) r.tools[tn] = (r.tools[tn] || 0) + 1;
+        const toolLabel = tools.length ? tools.join(", ") : "tool";
+        const toolItem = {
+          index: ++index,
+          seq,
+          turn: curTurn,
+          lane: 2,
+          kind: "tool",
+          label: `${toolLabel} (inline)`,
+          tools,
+          startedAt: modelEndedAt,
+          endedAt,
+          durationMs: toolMs,
+          thinkingMs: 0,
+          outputMs: 0,
+          toolMs,
+          thinkingPct: 0,
+          hasThinking: false,
+          hasOutput: true,
+          thinkingPreview: "",
+          outputPreview: outPreview,
+          outputTokens: 0,
+          model: t.model || "",
+          isError,
+          splitSource: toolMs != null ? "recorded" : null,
+        };
+        spans.push(toolItem);
+        r.items.push(toolItem);
+      }
+      continue;
+    }
+
+    // System / checkpoint / compaction turn
+    const sysItem = {
+      index: ++index,
+      seq,
+      turn: curTurn,
+      lane: 0,
+      kind: "system",
+      label: outPreview || turnPreview(t),
+      tools: [],
+      startedAt,
+      endedAt,
+      durationMs: durationMs || 0,
+      thinkingMs: 0,
+      outputMs: 0,
+      toolMs: 0,
+      thinkingPct: 0,
+      hasThinking: false,
+      hasOutput: true,
+      thinkingPreview: "",
+      outputPreview: outPreview,
+      outputTokens: 0,
+      model: "",
+      isError,
+      splitSource: null,
+    };
+    spans.push(sysItem);
+    r.items.push(sysItem);
+  }
+
+  const modelMs = Math.round((thinkingTotal + outputTotal) * 10) / 10;
+  const thinkingMs = Math.round(thinkingTotal * 10) / 10;
+  const outputMs = Math.round(outputTotal * 10) / 10;
+  const toolMs = Math.round(toolTotal * 10) / 10;
+  const activeMs = Math.round((modelMs + toolMs) * 10) / 10;
+  const wallMs = (minTs != null && maxTs != null && maxTs >= minTs)
+    ? Math.round((maxTs - minTs) * 10) / 10 : activeMs;
+
+  const pct = (num, den) => (den > 0 ? Math.min(100, Math.max(0, (num / den) * 100)) : 0);
+
+  return {
+    summary: {
+      userTurns,
+      modelTurns,
+      toolCalls,
+      thinkingMs,
+      outputMs,
+      modelMs,
+      toolMs,
+      activeMs,
+      wallMs,
+      thinkingPct: pct(thinkingMs, activeMs),
+      outputPct: pct(outputMs, activeMs),
+      modelPct: pct(modelMs, activeMs),
+      toolPct: pct(toolMs, activeMs),
+      modelThinkingPct: pct(thinkingMs, modelMs),
+      modelOutputPct: pct(outputMs, modelMs),
+      startedAt: minTs,
+      endedAt: maxTs,
+    },
+    spans,
+    rounds: Array.from(roundsMap.values()),
+  };
+}
+
+// Project trajectory spans onto a horizontal timeline domain [start, end]:
+// mode = "duration" (idle-compressed actual durations) | "wall" (wall-clock) | "sequence" (equal steps).
+function projectTrajectoryTimeline(traj, mode = "duration") {
+  const spans = (traj && Array.isArray(traj.spans)) ? traj.spans : [];
+  if (!spans.length) return null;
+
+  const hasTimed = spans.some((s) => s.startedAt != null && Number.isFinite(s.startedAt));
+  const hasPositiveDur = spans.some((s) => s.durationMs != null && s.durationMs > 0);
+  const effMode = (mode === "sequence" || !hasTimed || (!hasPositiveDur && mode === "duration"))
+    ? "sequence" : mode;
+
+  if (effMode === "sequence") {
+    const n = spans.length;
+    const turnFirst = new Map();
+    const projSpans = spans.map((s, i) => {
+      if (!turnFirst.has(s.turn)) turnFirst.set(s.turn, i);
+      return {
+        ...s,
+        projStart: i,
+        projEnd: i + 1,
+        leftPct: (i / n) * 100,
+        widthPct: (1 / n) * 100,
+      };
+    });
+    const turnBoundaries = Array.from(turnFirst.entries())
+      .filter(([, pos]) => pos > 0)
+      .map(([turn, pos]) => ({ turn, time: pos, leftPct: (pos / n) * 100 }));
+    return { mode: "sequence", start: 0, end: n, duration: n, spans: projSpans, turnBoundaries };
+  }
+
+  if (effMode === "duration") {
+    // Compress idle gaps between steps and allocate each step its actual duration
+    // (with a small floor for 0ms user input markers so they stay visible).
+    const activeTotal = Math.max(1, (traj.summary && traj.summary.activeMs) || 1000);
+    const markerMs = Math.max(20, activeTotal * 0.018);
+    let cursor = 0;
+    const turnFirst = new Map();
+    const rawProj = spans.map((s) => {
+      if (!turnFirst.has(s.turn)) turnFirst.set(s.turn, cursor);
+      const w = (s.durationMs != null && s.durationMs > 0) ? s.durationMs : markerMs;
+      const st = cursor;
+      const en = cursor + w;
+      cursor = en;
+      return { ...s, projStart: st, projEnd: en };
+    });
+    const total = Math.max(1, cursor);
+    const projSpans = rawProj.map((s) => ({
+      ...s,
+      leftPct: (s.projStart / total) * 100,
+      widthPct: Math.max(0.8, ((s.projEnd - s.projStart) / total) * 100),
+    }));
+    const turnBoundaries = Array.from(turnFirst.entries())
+      .filter(([, pos]) => pos > 0)
+      .map(([turn, pos]) => ({ turn, time: pos, leftPct: (pos / total) * 100 }));
+    return { mode: "duration", start: 0, end: total, duration: total, spans: projSpans, turnBoundaries };
+  }
+
+  // Wall-clock mode: project onto [minStart, maxEnd]
+  const timed = spans.filter((s) => s.startedAt != null && Number.isFinite(s.startedAt));
+  const minStart = Math.min(...timed.map((s) => s.startedAt));
+  const maxEnd = Math.max(...timed.map((s) => (s.endedAt != null ? s.endedAt : s.startedAt + (s.durationMs || 0))));
+  const total = Math.max(1, maxEnd - minStart);
+  const markerMs = Math.max(10, total * 0.015);
+  const turnFirst = new Map();
+  let lastPos = minStart;
+  const projSpans = spans.map((s) => {
+    const st = s.startedAt != null ? s.startedAt : lastPos;
+    const dur = (s.durationMs != null && s.durationMs > 0) ? s.durationMs : markerMs;
+    const en = s.endedAt != null && s.endedAt > st ? s.endedAt : (st + dur);
+    lastPos = en;
+    if (!turnFirst.has(s.turn)) turnFirst.set(s.turn, st);
+    return {
+      ...s,
+      projStart: st,
+      projEnd: en,
+      leftPct: Math.min(99.2, Math.max(0, ((st - minStart) / total) * 100)),
+      widthPct: Math.max(0.8, Math.min(100, ((en - st) / total) * 100)),
+    };
+  });
+  const turnBoundaries = Array.from(turnFirst.entries())
+    .filter(([, pos]) => pos > minStart)
+    .map(([turn, pos]) => ({ turn, time: pos, leftPct: ((pos - minStart) / total) * 100 }));
+  return { mode: "wall", start: minStart, end: minStart + total, duration: total, spans: projSpans, turnBoundaries };
+}
+
+// Identify conversation turn seqs active inside a projected range {start, end}.
+function trajectoryFocusSeqs(proj, range) {
+  if (!proj || !range) return null;
+  const lo = Math.min(range.start, range.end);
+  const hi = Math.max(range.start, range.end);
+  const seqs = new Set();
+  for (const s of proj.spans || []) {
+    if (s.projStart <= hi && s.projEnd >= lo) seqs.add(s.seq);
+  }
+  return Array.from(seqs).sort((a, b) => a - b);
+}
+
+function spanTooltipText(s) {
+  const kindName = s.kind === "user" ? "User Input"
+    : s.kind === "model" ? `Model${s.model ? ` (${shortModel(s.model)})` : ""}`
+    : s.kind === "tool" ? `Tool (${(s.tools && s.tools.length) ? s.tools.join(", ") : "call"})`
+    : "System";
+  const parts = [`#${s.index} · Turn ${s.turn} · ${kindName}`];
+  if (s.startedAt != null) {
+    const st = fmtClockTime(s.startedAt);
+    const en = (s.endedAt != null && s.endedAt > s.startedAt) ? fmtClockTime(s.endedAt) : "";
+    if (st) parts.push(en ? `${st} → ${en}` : st);
+  }
+  if (s.kind === "model") {
+    const dur = s.durationMs != null ? fmtDuration(s.durationMs) : "—";
+    const th = s.thinkingMs != null ? fmtDuration(s.thinkingMs) : "0ms";
+    const out = s.outputMs != null ? fmtDuration(s.outputMs) : "0ms";
+    const thPct = Math.round(s.thinkingPct || 0);
+    const outPct = 100 - thPct;
+    let detail = `Total: ${dur} · Thinking: ${th} (${thPct}%) · Output: ${out} (${outPct}%)`;
+    if (s.outputTokens) {
+      const tps = (s.outputMs && s.outputMs > 0) ? ` (${(s.outputTokens / (s.outputMs / 1000)).toFixed(1)} tok/s)` : "";
+      detail += ` · ${fmtTokens(s.outputTokens)} tok${tps}`;
+    }
+    parts.push(detail);
+  } else if (s.kind === "tool") {
+    if (s.durationMs != null) parts.push(`Duration: ${fmtDuration(s.durationMs)}`);
+  }
+  if (s.label) parts.push(s.label.slice(0, 100));
+  return parts.join(" | ");
+}
+
+function renderTrajectoryOverviewHtml(traj, proj, opts = {}) {
+  const s = traj.summary;
+  const activeMode = state.trajMode || "duration";
+  const hasRange = Boolean(state.trajRange);
+  const focusSet = hasRange ? new Set(trajectoryFocusSeqs(proj, state.trajRange) || []) : null;
+
+  const boundariesHtml = (proj ? proj.turnBoundaries : []).map((b) =>
+    `<span class="traj-turn-line" style="left:${b.leftPct.toFixed(2)}%" title="Turn ${b.turn}">
+       <span class="traj-turn-tag">T${b.turn}</span>
+     </span>`
+  ).join("");
+
+  const spansHtml = (proj ? proj.spans : []).map((sp) => {
+    const selected = !focusSet || focusSet.has(sp.seq);
+    const tip = spanTooltipText(sp);
+    const styleParts = [
+      `left:${sp.leftPct.toFixed(2)}%`,
+      `width:${Math.min(100 - sp.leftPct, Math.max(0.8, sp.widthPct)).toFixed(2)}%`,
+      `top:${sp.lane * 16 + 4}px`,
+    ];
+    if (sp.kind === "model") {
+      styleParts.push(`--traj-think-pct:${(sp.thinkingPct || 0).toFixed(1)}%`);
+    }
+    return `<span class="traj-span ${esc(sp.kind)} ${sp.isError ? "error" : ""} ${selected ? "" : "dimmed"}"
+                  data-seq="${sp.seq}" data-index="${sp.index}" data-kind="${esc(sp.kind)}"
+                  title="${esc(tip)}" style="${styleParts.join(";")}"></span>`;
+  }).join("");
+
+  let selHtml = "";
+  if (hasRange && proj && proj.duration > 0) {
+    const lo = Math.max(proj.start, Math.min(state.trajRange.start, state.trajRange.end));
+    const hi = Math.min(proj.end, Math.max(state.trajRange.start, state.trajRange.end));
+    const leftP = ((lo - proj.start) / proj.duration) * 100;
+    const widthP = Math.max(0.5, ((hi - lo) / proj.duration) * 100);
+    selHtml = `<div class="traj-selection" style="left:${leftP.toFixed(2)}%;width:${widthP.toFixed(2)}%"></div>`;
+  }
+
+  const distBar = s.activeMs > 0 ? `
+    <div class="traj-dist-bar" title="Active time breakdown: Thinking ${fmtDuration(s.thinkingMs)} (${s.thinkingPct.toFixed(0)}%) · Output ${fmtDuration(s.outputMs)} (${s.outputPct.toFixed(0)}%) · Tools ${fmtDuration(s.toolMs)} (${s.toolPct.toFixed(0)}%)">
+      ${s.thinkingPct > 0 ? `<div class="traj-dist-seg thinking" style="width:${s.thinkingPct.toFixed(2)}%"></div>` : ""}
+      ${s.outputPct > 0 ? `<div class="traj-dist-seg output" style="width:${s.outputPct.toFixed(2)}%"></div>` : ""}
+      ${s.toolPct > 0 ? `<div class="traj-dist-seg tool" style="width:${s.toolPct.toFixed(2)}%"></div>` : ""}
+    </div>` : "";
+
+  return `
+    <section class="traj-overview" aria-label="Trajectory timing overview">
+      <div class="traj-ov-head">
+        <div class="traj-legend">
+          <span class="traj-chip input" title="User inputs">
+            <span class="traj-dot input"></span>Input <b>${s.userTurns}</b>
+          </span>
+          <span class="traj-chip model" title="Total model time (Thinking + Output)">
+            <span class="traj-dot model"></span>Model <b>${fmtDuration(s.modelMs) || "0ms"}</b>
+            <span class="traj-sub-pill thinking" title="Model thinking / reasoning time">🧠 Think ${fmtDuration(s.thinkingMs) || "0ms"}${s.modelMs > 0 ? ` (${s.modelThinkingPct.toFixed(0)}%)` : ""}</span>
+            <span class="traj-sub-pill output" title="Model output / generation time">💬 Out ${fmtDuration(s.outputMs) || "0ms"}${s.modelMs > 0 ? ` (${s.modelOutputPct.toFixed(0)}%)` : ""}</span>
+          </span>
+          <span class="traj-chip tool" title="Tool calling execution time">
+            <span class="traj-dot tool"></span>Tools <b>${fmtDuration(s.toolMs) || "0ms"}</b> <span class="traj-dim">(${s.toolCalls})</span>
+          </span>
+          <span class="traj-chip total" title="Total active execution time (wall clock: ${fmtDuration(s.wallMs) || "0ms"})">
+            ⏱ Active <b>${fmtDuration(s.activeMs) || "0ms"}</b>
+          </span>
+        </div>
+        <div class="traj-modes">
+          ${hasRange ? '<button class="traj-mode-btn reset" data-traj-reset="1" title="Clear timeline selection (Esc)">✕ Clear range</button>' : ""}
+          <button class="traj-mode-btn ${activeMode === "duration" ? "active" : ""}" data-traj-mode="duration" title="Proportional to actual duration (idle gaps compressed)">Duration</button>
+          <button class="traj-mode-btn ${activeMode === "wall" ? "active" : ""}" data-traj-mode="wall" title="Wall-clock timeline (retains idle gaps)">Wall</button>
+          <button class="traj-mode-btn ${activeMode === "sequence" ? "active" : ""}" data-traj-mode="sequence" title="Equal width per operation step">Seq</button>
+          ${opts.showOpenTabBtn ? '<button class="traj-mode-btn open-tab" id="openTrajTabBtn" title="Open full Trajectory ledger view">Trajectory ↗</button>' : ""}
+        </div>
+      </div>
+      ${distBar}
+      <div class="traj-plot">
+        <div class="traj-lane-labels" aria-hidden="true">
+          <span>Input</span>
+          <span>Model</span>
+          <span>Tools</span>
+        </div>
+        <div class="traj-track" id="trajTrack" tabindex="0">
+          ${selHtml}
+          <div class="traj-boundaries">${boundariesHtml}</div>
+          <div class="traj-lanes">${spansHtml}</div>
+        </div>
+      </div>
+      <div class="traj-hover-bar" id="trajHoverBar">
+        Hover any bar for Thinking / Output / Tool timing · Click to jump to turn · Drag across track to filter range
+      </div>
+    </section>`;
+}
+
+function wireTrajectoryOverview(scope, traj, proj, handlers = {}) {
+  scope.querySelectorAll(".traj-mode-btn[data-traj-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.trajMode = btn.dataset.trajMode;
+      localStorage.setItem("cc_trajMode", state.trajMode);
+      state.trajRange = null;
+      if (handlers.onUpdate) handlers.onUpdate();
+    });
+  });
+  const resetBtn = scope.querySelector("[data-traj-reset]");
+  if (resetBtn) {
+    resetBtn.addEventListener("click", () => {
+      state.trajRange = null;
+      if (handlers.onUpdate) handlers.onUpdate();
+    });
+  }
+  const openTabBtn = scope.querySelector("#openTrajTabBtn");
+  if (openTabBtn) {
+    openTabBtn.addEventListener("click", () => {
+      state.detailTab = "trajectory";
+      renderDetailShell();
+      loadTab();
+    });
+  }
+  const hoverBar = scope.querySelector("#trajHoverBar");
+  const defaultHint = "Hover any bar for Thinking / Output / Tool timing · Click to jump to turn · Drag across track to filter range";
+  const spanByIndex = new Map((proj ? proj.spans : []).map((s) => [String(s.index), s]));
+
+  scope.querySelectorAll(".traj-span").forEach((el) => {
+    el.addEventListener("mouseenter", () => {
+      const sp = spanByIndex.get(el.dataset.index);
+      if (sp && hoverBar) hoverBar.textContent = spanTooltipText(sp);
+    });
+    el.addEventListener("mouseleave", () => {
+      if (hoverBar) hoverBar.textContent = defaultHint;
+    });
+  });
+
+  const track = scope.querySelector("#trajTrack");
+  if (!track || !proj) return;
+
+  let dragStartFrac = null;
+  let dragStartX = 0;
+  let dragTargetSeq = null;
+
+  const fracAt = (ev) => {
+    const rect = track.getBoundingClientRect();
+    return Math.min(1, Math.max(0, (ev.clientX - rect.left) / Math.max(1, rect.width)));
+  };
+
+  track.addEventListener("mousedown", (ev) => {
+    if (ev.button === 2) {
+      ev.preventDefault();
+      state.trajRange = null;
+      if (handlers.onUpdate) handlers.onUpdate();
+      return;
+    }
+    if (ev.button !== 0) return;
+    dragStartFrac = fracAt(ev);
+    dragStartX = ev.clientX;
+    const spanEl = ev.target.closest ? ev.target.closest(".traj-span") : null;
+    dragTargetSeq = spanEl ? Number(spanEl.dataset.seq) : null;
+  });
+
+  track.addEventListener("mouseup", (ev) => {
+    if (dragStartFrac == null) return;
+    const movedPx = Math.abs(ev.clientX - dragStartX);
+    const endFrac = fracAt(ev);
+    const startFrac = dragStartFrac;
+    dragStartFrac = null;
+
+    if (movedPx < 4) {
+      if (dragTargetSeq != null && Number.isFinite(dragTargetSeq)) {
+        if (handlers.onSelectSeq) handlers.onSelectSeq(dragTargetSeq);
+      } else if (state.trajRange) {
+        state.trajRange = null;
+        if (handlers.onUpdate) handlers.onUpdate();
+      }
+      return;
+    }
+    const t1 = proj.start + Math.min(startFrac, endFrac) * proj.duration;
+    const t2 = proj.start + Math.max(startFrac, endFrac) * proj.duration;
+    state.trajRange = { start: t1, end: t2 };
+    if (handlers.onUpdate) handlers.onUpdate();
+  });
+
+  track.addEventListener("dblclick", () => {
+    if (state.trajRange) {
+      state.trajRange = null;
+      if (handlers.onUpdate) handlers.onUpdate();
+    }
+  });
+
+  track.addEventListener("contextmenu", (ev) => ev.preventDefault());
+
+  track.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && state.trajRange) {
+      ev.preventDefault();
+      state.trajRange = null;
+      if (handlers.onUpdate) handlers.onUpdate();
+    }
+  });
+}
+
+function renderConversationTrajectory() {
+  const wrap = $("#convTrajWrap");
+  if (!wrap) return;
+  const turns = state.convTurns || [];
+  if (!turns.length) {
+    wrap.innerHTML = "";
+    return;
+  }
+  const traj = deriveTrajectory(turns);
+  const proj = projectTrajectoryTimeline(traj, state.trajMode);
+  wrap.innerHTML = renderTrajectoryOverviewHtml(traj, proj, { showOpenTabBtn: true });
+
+  // Apply range filter to visible conversation turns if active
+  const banner = $("#convFilterBanner");
+  const focusSeqs = state.trajRange ? trajectoryFocusSeqs(proj, state.trajRange) : null;
+  const focusSet = focusSeqs ? new Set(focusSeqs) : null;
+  document.querySelectorAll("#turnsWrap .turn").forEach((node) => {
+    const seq = Number(node.dataset.seq);
+    node.hidden = Boolean(focusSet && !focusSet.has(seq));
+  });
+  if (banner) {
+    if (focusSet) {
+      banner.hidden = false;
+      banner.className = "traj-filter-banner";
+      banner.innerHTML = `<span>Showing <b>${focusSet.size}</b> of <b>${turns.length}</b> loaded turns in selected timeline interval</span>
+        <button class="dbtn" id="clearConvRangeBtn">Reset filter</button>`;
+      const cbtn = banner.querySelector("#clearConvRangeBtn");
+      if (cbtn) {
+        cbtn.addEventListener("click", () => {
+          state.trajRange = null;
+          renderConversationTrajectory();
+        });
+      }
+    } else {
+      banner.hidden = true;
+      banner.innerHTML = "";
+    }
+  }
+
+  wireTrajectoryOverview(wrap, traj, proj, {
+    onUpdate: () => renderConversationTrajectory(),
+    onSelectSeq: (seq) => scrollToTurn(seq),
+  });
+}
+
+function renderTrajectoryView(body, turns) {
+  if (!turns || !turns.length) {
+    body.innerHTML = '<div class="empty">No trajectory records in this session.</div>';
+    return;
+  }
+  const traj = deriveTrajectory(turns);
+  const proj = projectTrajectoryTimeline(traj, state.trajMode);
+  const s = traj.summary;
+  const focusSeqs = state.trajRange ? trajectoryFocusSeqs(proj, state.trajRange) : null;
+  const focusSet = focusSeqs ? new Set(focusSeqs) : null;
+  const query = (state.trajSearch || "").trim().toLowerCase();
+
+  // Max step duration across the session for relative waterfall bars
+  const maxStepMs = Math.max(
+    1,
+    ...traj.spans.map((sp) => (sp.durationMs != null && sp.durationMs > 0 ? sp.durationMs : 0))
+  );
+
+  const cardsHtml = `
+    <div class="traj-cards">
+      <div class="traj-card input">
+        <div class="tc-label"><span class="traj-dot input"></span>User Input</div>
+        <div class="tc-val">${s.userTurns} <span class="tc-unit">turn${s.userTurns === 1 ? "" : "s"}</span></div>
+        <div class="tc-sub">${turns.length} total records</div>
+      </div>
+      <div class="traj-card model">
+        <div class="tc-label"><span class="traj-dot model"></span>Model Total Time</div>
+        <div class="tc-val">${fmtDuration(s.modelMs) || "0ms"} <span class="tc-unit">${s.activeMs > 0 ? `${s.modelPct.toFixed(0)}%` : ""}</span></div>
+        <div class="tc-sub">
+          <span class="tc-think">🧠 Think: <b>${fmtDuration(s.thinkingMs) || "0ms"}</b> (${s.modelThinkingPct.toFixed(0)}%)</span>
+          ·
+          <span class="tc-out">💬 Output: <b>${fmtDuration(s.outputMs) || "0ms"}</b> (${s.modelOutputPct.toFixed(0)}%)</span>
+        </div>
+      </div>
+      <div class="traj-card tool">
+        <div class="tc-label"><span class="traj-dot tool"></span>Tool Calling Time</div>
+        <div class="tc-val">${fmtDuration(s.toolMs) || "0ms"} <span class="tc-unit">${s.activeMs > 0 ? `${s.toolPct.toFixed(0)}%` : ""}</span></div>
+        <div class="tc-sub">${s.toolCalls} tool execution${s.toolCalls === 1 ? "" : "s"}</div>
+      </div>
+    </div>`;
+
+  const toolbarHtml = `
+    <div class="traj-toolbar" role="toolbar" aria-label="Trajectory controls">
+      <button type="button" class="traj-tb-btn" id="trajFoldTurnsBtn" title="Collapse or expand all turns">
+        ${state.trajFoldTurns ? "⊞ Expand turns" : "⊟ Fold turns"}
+      </button>
+      <button type="button" class="traj-tb-btn ${state.trajShowPhases ? "active" : ""}" id="trajTogglePhasesBtn" title="Toggle Thinking / Output sub-phase breakdown rows under Model steps">
+        ${state.trajShowPhases ? "⊟ Thinking / Output phases" : "⊞ Thinking / Output phases"}
+      </button>
+      <div class="traj-tb-search">
+        <input type="search" id="trajSearchBox" value="${esc(state.trajSearch)}" placeholder="Filter turns, tools, thinking, output…" />
+      </div>
+    </div>`;
+
+  const roundsHtml = traj.rounds.map((r) => {
+    const visibleItems = r.items.filter((item) => {
+      if (focusSet && !focusSet.has(item.seq)) return false;
+      if (!query) return true;
+      const hay = `${item.kind} ${item.label} ${item.thinkingPreview} ${item.outputPreview} ${(item.tools || []).join(" ")} ${item.model}`.toLowerCase();
+      return hay.includes(query);
+    });
+    if (!visibleItems.length) return "";
+
+    const toolHist = Object.entries(r.tools)
+      .map(([name, cnt]) => `<span class="traj-hist-chip">🔧 ${esc(cnt > 1 ? `${name}×${cnt}` : name)}</span>`)
+      .join("");
+
+    const rowsHtml = visibleItems.map((item) => {
+      const turnObj = turns[item.seq] || {};
+      const wfWidth = item.durationMs != null && item.durationMs > 0
+        ? Math.max(4, Math.min(100, (item.durationMs / maxStepMs) * 100))
+        : (item.kind === "user" ? 3 : 8);
+
+      let wfBar = "";
+      if (item.kind === "model") {
+        const thPct = (item.thinkingPct || 0).toFixed(1);
+        wfBar = `<div class="traj-wf-track" title="Thinking ${thPct}% · Output ${(100 - item.thinkingPct).toFixed(1)}%">
+          <div class="traj-wf-fill model" style="width:${wfWidth.toFixed(1)}%;--traj-think-pct:${thPct}%"></div>
+        </div>`;
+      } else {
+        wfBar = `<div class="traj-wf-track">
+          <div class="traj-wf-fill ${esc(item.kind)} ${item.isError ? "error" : ""}" style="width:${wfWidth.toFixed(1)}%"></div>
+        </div>`;
+      }
+
+      const kindTag = item.kind === "user" ? "Input"
+        : item.kind === "model" ? "Model"
+        : item.kind === "tool" ? `Tool${item.tools.length ? ` · ${item.tools[0]}` : ""}`
+        : "System";
+
+      let subPhasesHtml = "";
+      if (item.kind === "model" && state.trajShowPhases && (item.hasThinking || item.hasOutput)) {
+        const thPct = Math.round(item.thinkingPct || 0);
+        const outPct = 100 - thPct;
+        const tps = (item.outputTokens && item.outputMs && item.outputMs > 0)
+          ? ` · ${(item.outputTokens / (item.outputMs / 1000)).toFixed(1)} tok/s` : "";
+        subPhasesHtml = `
+          <div class="traj-subphases">
+            ${item.hasThinking || (item.thinkingMs != null && item.thinkingMs > 0) ? `
+              <div class="traj-subrow thinking">
+                <span class="traj-sub-indent">↳</span>
+                <span class="traj-sub-tag thinking">🧠 Thinking</span>
+                <span class="traj-sub-text">${esc(item.thinkingPreview || "(reasoning phase)")}</span>
+                <span class="traj-sub-bar"><span class="traj-sub-fill thinking" style="width:${thPct}%"></span></span>
+                <span class="traj-sub-pct">${thPct}%</span>
+                <span class="traj-sub-dur">${fmtDuration(item.thinkingMs) || "0ms"}</span>
+              </div>` : ""}
+            ${item.hasOutput || (item.outputMs != null && item.outputMs > 0) ? `
+              <div class="traj-subrow output">
+                <span class="traj-sub-indent">↳</span>
+                <span class="traj-sub-tag output">💬 Output</span>
+                <span class="traj-sub-text">${esc(item.outputPreview || "(response output)")}${item.outputTokens ? ` <span class="traj-sub-toks">(${fmtTokens(item.outputTokens)} tok${tps})</span>` : ""}</span>
+                <span class="traj-sub-bar"><span class="traj-sub-fill output" style="width:${outPct}%"></span></span>
+                <span class="traj-sub-pct">${outPct}%</span>
+                <span class="traj-sub-dur">${fmtDuration(item.outputMs) || "0ms"}</span>
+              </div>` : ""}
+          </div>`;
+      }
+
+      const timingMeta = [];
+      if (item.startedAt != null) timingMeta.push(`<span><b>Started:</b> ${esc(fmtClockTime(item.startedAt))}</span>`);
+      if (item.endedAt != null && item.endedAt > item.startedAt) timingMeta.push(`<span><b>Completed:</b> ${esc(fmtClockTime(item.endedAt))}</span>`);
+      if (item.durationMs != null) timingMeta.push(`<span><b>Total Duration:</b> ${esc(fmtDuration(item.durationMs))}</span>`);
+      if (item.kind === "model") {
+        timingMeta.push(`<span><b>Thinking Time:</b> ${esc(fmtDuration(item.thinkingMs) || "0ms")} (${Math.round(item.thinkingPct || 0)}%)</span>`);
+        timingMeta.push(`<span><b>Output Time:</b> ${esc(fmtDuration(item.outputMs) || "0ms")} (${100 - Math.round(item.thinkingPct || 0)}%)</span>`);
+        if (item.splitSource) timingMeta.push(`<span><b>Timing Split:</b> ${esc(item.splitSource)}</span>`);
+      }
+
+      const blocksHtml = (turnObj.blocks || []).map(renderBlock).join("");
+
+      return `
+        <div class="traj-item" data-seq="${item.seq}" data-index="${item.index}">
+          <div class="traj-row ${esc(item.kind)} ${item.isError ? "error" : ""}">
+            <span class="traj-idx">#${item.index}</span>
+            <span class="traj-tag ${esc(item.kind)}">${esc(kindTag)}</span>
+            <span class="traj-text">${esc(item.label)}</span>
+            <span class="traj-metrics">
+              ${item.kind === "model" && item.thinkingMs != null ? `<span class="traj-m-pill thinking" title="Thinking time">🧠 ${fmtDuration(item.thinkingMs)}</span>` : ""}
+              ${item.kind === "model" && item.outputMs != null ? `<span class="traj-m-pill output" title="Output time">💬 ${fmtDuration(item.outputMs)}</span>` : ""}
+              ${item.outputTokens ? `<span class="traj-m-tok">${fmtTokens(item.outputTokens)} tok</span>` : ""}
+            </span>
+            <span class="traj-wf">${wfBar}</span>
+            <span class="traj-dur">${item.kind === "user" ? (fmtClockTime(item.startedAt).slice(0, 8) || "—") : (fmtDuration(item.durationMs) || "—")}</span>
+          </div>
+          ${subPhasesHtml}
+          <div class="traj-inspector" hidden>
+            <div class="traj-insp-timing">${timingMeta.join(" · ")}</div>
+            <div class="traj-insp-blocks">${blocksHtml}</div>
+          </div>
+        </div>`;
+    }).join("");
+
+    return `
+      <div class="traj-turn ${state.trajFoldTurns ? "folded" : ""}" data-turn="${r.turn}">
+        <div class="traj-turn-head">
+          <span class="traj-turn-caret">▼</span>
+          <span class="traj-turn-title">Turn ${r.turn}</span>
+          <span class="traj-turn-summary">
+            ${r.durationMs > 0 ? `<span class="traj-ts-total">⏱ ${fmtDuration(r.durationMs)}</span>` : ""}
+            ${r.thinkingMs > 0 ? `<span class="traj-ts-think">🧠 ${fmtDuration(r.thinkingMs)}</span>` : ""}
+            ${r.outputMs > 0 ? `<span class="traj-ts-out">💬 ${fmtDuration(r.outputMs)}</span>` : ""}
+            ${r.toolMs > 0 ? `<span class="traj-ts-tool">🔧 ${fmtDuration(r.toolMs)}</span>` : ""}
+            ${toolHist}
+          </span>
+        </div>
+        <div class="traj-turn-body">${rowsHtml}</div>
+      </div>`;
+  }).join("");
+
+  body.innerHTML = `
+    <div class="traj-view">
+      ${cardsHtml}
+      <div id="trajOvMount">${renderTrajectoryOverviewHtml(traj, proj, { showOpenTabBtn: false })}</div>
+      ${toolbarHtml}
+      <div class="traj-ledger" id="trajLedger">
+        ${roundsHtml || '<div class="empty">No matching trajectory records in the selected filter.</div>'}
+      </div>
+    </div>`;
+
+  wireTrajectoryOverview(body.querySelector("#trajOvMount"), traj, proj, {
+    onUpdate: () => renderTrajectoryView(body, turns),
+    onSelectSeq: (seq) => {
+      const row = body.querySelector(`.traj-item[data-seq="${seq}"]`);
+      if (!row) return;
+      const turnGroup = row.closest(".traj-turn");
+      if (turnGroup) turnGroup.classList.remove("folded");
+      const insp = row.querySelector(".traj-inspector");
+      if (insp) insp.hidden = false;
+      row.classList.add("turn-highlight");
+      row.scrollIntoView({ behavior: "smooth", block: "center" });
+      setTimeout(() => row.classList.remove("turn-highlight"), 2600);
+    },
+  });
+
+  const foldBtn = body.querySelector("#trajFoldTurnsBtn");
+  if (foldBtn) {
+    foldBtn.addEventListener("click", () => {
+      state.trajFoldTurns = !state.trajFoldTurns;
+      renderTrajectoryView(body, turns);
+    });
+  }
+  const phasesBtn = body.querySelector("#trajTogglePhasesBtn");
+  if (phasesBtn) {
+    phasesBtn.addEventListener("click", () => {
+      state.trajShowPhases = !state.trajShowPhases;
+      renderTrajectoryView(body, turns);
+    });
+  }
+  const searchBox = body.querySelector("#trajSearchBox");
+  if (searchBox) {
+    searchBox.addEventListener("input", (e) => {
+      state.trajSearch = e.target.value;
+      const pos = e.target.selectionStart;
+      renderTrajectoryView(body, turns);
+      const nextBox = body.querySelector("#trajSearchBox");
+      if (nextBox) {
+        nextBox.focus();
+        try { nextBox.setSelectionRange(pos, pos); } catch { /* ignore */ }
+      }
+    });
+  }
+
+  body.querySelectorAll(".traj-turn-head").forEach((th) => {
+    th.addEventListener("click", () => th.parentElement.classList.toggle("folded"));
+  });
+  body.querySelectorAll(".traj-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const insp = row.parentElement.querySelector(".traj-inspector");
+      if (insp) insp.hidden = !insp.hidden;
+    });
+  });
 }
 
 function renderBlock(b) {

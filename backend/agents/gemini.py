@@ -27,8 +27,8 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities
 from .common import (
-    SessionSummary, context_window, is_safe_id, is_safe_name, iter_jsonl,
-    new_trash_dir, read_doc_file, read_git_info, safe_join,
+    SessionSummary, annotate_turn_timings, context_window, is_safe_id, is_safe_name,
+    iter_jsonl, new_trash_dir, read_doc_file, read_git_info, safe_join,
 )
 
 
@@ -88,9 +88,25 @@ def _turn_blocks(turn: dict) -> list[dict]:
     """Normalize a Gemini turn's polymorphic content into typed blocks.
 
     Handles: plain string, [{"text": ...}], [{"functionResponse": {...}}], plus
-    a gemini turn's `toolCalls` (surfaced as tool_use blocks).
+    a gemini turn's `thoughts` (thinking) and `toolCalls` (surfaced as tool_use blocks).
     """
     out: list[dict] = []
+    thoughts = turn.get("thoughts")
+    if isinstance(thoughts, str) and thoughts.strip():
+        out.append({"type": "thinking", "text": thoughts})
+    elif isinstance(thoughts, list):
+        t_parts = []
+        for th in thoughts:
+            if isinstance(th, str) and th.strip():
+                t_parts.append(th)
+            elif isinstance(th, dict):
+                subj = th.get("subject") or ""
+                desc = th.get("description") or th.get("text") or ""
+                piece = f"{subj}: {desc}".strip(": ") if subj and desc else (desc or subj)
+                if piece:
+                    t_parts.append(str(piece))
+        if t_parts:
+            out.append({"type": "thinking", "text": "\n".join(t_parts)})
     content = turn.get("content")
     if isinstance(content, str):
         if content:
@@ -263,7 +279,7 @@ class GeminiAdapter(AgentAdapter):
             is_tool_only = (role == "user" and blocks
                             and all(b["type"] == "tool_result" for b in blocks))
             tok = m.get("tokens") or {}
-            turns.append({
+            t_dict: dict[str, Any] = {
                 "uuid": m.get("id"),
                 "role": role,
                 "kind": "tool" if is_tool_only else role,
@@ -273,7 +289,11 @@ class GeminiAdapter(AgentAdapter):
                 "attribution_skill": None,
                 "attribution_plugin": None,
                 "output_tokens": tok.get("output", 0) or 0,
-            })
+            }
+            if tok.get("thoughts"):
+                t_dict["_raw_timing"] = {"reasoning_tokens": int(tok["thoughts"])}
+            turns.append(t_dict)
+        annotate_turn_timings(turns)
         total = len(turns)
         end = total if limit is None else min(total, offset + limit)
         return {"total": total, "offset": offset, "limit": limit,

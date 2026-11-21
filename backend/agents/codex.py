@@ -35,8 +35,8 @@ from typing import Any, Iterator
 
 from . import AgentAdapter, Capabilities, UnsupportedCapability
 from .common import (
-    SessionSummary, context_window, is_safe_id, iter_jsonl, project_names, read_doc_file,
-    read_git_info, save_doc_file,
+    SessionSummary, annotate_turn_timings, context_window, is_safe_id, iter_jsonl,
+    project_names, read_doc_file, read_git_info, save_doc_file,
 )
 
 _UUID_AT_END = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -298,6 +298,7 @@ class CodexAdapter(AgentAdapter):
                 "attribution_plugin": None,
                 "output_tokens": turn["output_tokens"],
             })
+        annotate_turn_timings(turns)
         total = len(turns)
         end = total if limit is None else min(total, offset + limit)
         return {"total": total, "offset": offset, "limit": limit,

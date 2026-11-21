@@ -53,6 +53,15 @@ Each agent's data root can be relocated via an env var: `CLAUDE_HOME` /
   sessions load lazily (40 turns per page with a "Load more" button). The context
   bar shows the live context of the last turn; a 1M window is only claimed when a
   Claude session's usage proved it.
+- **Trajectory & timing visualization** — inspired by `deepseek-harness`
+  (`ui-trajectory`): a 3-lane interactive timing overview (**Input** / **Model** /
+  **Tools**) and a dedicated **Trajectory** tab with a turn-grouped event ledger.
+  Model execution time is subdivided into **Thinking** time and **Output** time
+  (rendered as a two-tone horizontal gradient on timeline bars and waterfalls,
+  with sub-phase rows and percentage breakdowns). Switch between **Duration**
+  (idle-compressed actual durations), **Wall** (wall-clock time), and **Seq**
+  (equal-width steps); click any span to jump to the turn or drag across the
+  track to filter the conversation/ledger to a time range.
 - **Draggable kanban tasks tab** — drag cards between pending / in progress /
   completed; the new status is written back to the task JSON.
 - **Memory tab** — renders `MEMORY.md` and all memory files for the project.

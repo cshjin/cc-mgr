@@ -544,3 +544,387 @@ class SessionSummary:
     agent: str = "claude"
     title: str = ""
     parent_id: str = ""  # set for subagent (child) sessions
+
+
+# ---------------------------------------------------------------------------
+# Trajectory & turn timing analysis (Input / Model [Thinking + Output] / Tools)
+# ---------------------------------------------------------------------------
+
+# Maximum gap (30 minutes) between consecutive records that can be attributed
+# to a single model inference or tool execution when only end timestamps exist.
+_MAX_STEP_GAP_MS = 1_800_000.0
+
+
+def parse_timestamp_ms(ts: Any) -> float | None:
+    """Parse an ISO-8601 string or numeric epoch (s or ms) into epoch ms."""
+    if ts is None or ts == "" or isinstance(ts, bool):
+        return None
+    if isinstance(ts, (int, float)):
+        val = float(ts)
+        if val <= 0:
+            return None
+        # Values above 1e11 are already epoch milliseconds (e.g. 1780000000000).
+        return val if val > 1e11 else val * 1000.0
+    if not isinstance(ts, str):
+        return None
+    s = ts.strip()
+    if not s:
+        return None
+    try:
+        val = float(s)
+        if val <= 0:
+            return None
+        return val if val > 1e11 else val * 1000.0
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp() * 1000.0
+    except ValueError:
+        return None
+
+
+def _block_char_counts(blocks: list[dict[str, Any]]) -> tuple[int, int]:
+    """Return (thinking_chars, output_chars) for an assistant turn's blocks."""
+    think_chars = 0
+    out_chars = 0
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        btype = b.get("type")
+        if btype == "thinking":
+            think_chars += len(str(b.get("text") or ""))
+        elif btype == "text":
+            out_chars += len(str(b.get("text") or ""))
+        elif btype == "tool_use":
+            inp = b.get("input")
+            try:
+                inp_str = json.dumps(inp, ensure_ascii=False) if inp else ""
+            except (TypeError, ValueError):
+                inp_str = str(inp or "")
+            out_chars += len(str(b.get("name") or "")) + len(inp_str)
+    return think_chars, out_chars
+
+
+def annotate_turn_timings(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Populate `turn["timing"]` on every turn in a session's conversation.
+
+    Timing schema per turn:
+      {
+        "started_at": float | None,    # epoch ms
+        "ended_at": float | None,      # epoch ms
+        "duration_ms": float | None,   # total turn duration in ms
+        "thinking_ms": float | None,   # model thinking/reasoning duration in ms
+        "output_ms": float | None,     # model output generation duration in ms
+        "tool_ms": float | None,       # tool execution duration in ms
+        "tools": list[str],            # tool names invoked or completed
+        "split_source": str | None,    # "recorded" | "tokens" | "estimated" | None
+      }
+    """
+    prev_end: float | None = None
+    last_tool_names: list[str] = []
+
+    for t in turns:
+        raw: dict[str, Any] = t.pop("_raw_timing", None) or {}
+        ts_ms = parse_timestamp_ms(t.get("timestamp"))
+        blocks = t.get("blocks") or []
+        role = t.get("role") or "user"
+        kind = t.get("kind") or role
+
+        own_tools = [
+            str(b.get("name"))
+            for b in blocks
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")
+        ]
+
+        started_at: float | None = raw.get("started_at")
+        ended_at: float | None = raw.get("ended_at")
+        duration_ms: float | None = raw.get("duration_ms")
+
+        if started_at is not None and ended_at is not None:
+            started_at = float(started_at)
+            ended_at = float(ended_at)
+            if duration_ms is None:
+                duration_ms = max(0.0, ended_at - started_at)
+            else:
+                duration_ms = float(duration_ms)
+        elif kind == "user":
+            started_at = ts_ms
+            ended_at = ts_ms
+            duration_ms = 0.0 if ts_ms is not None else None
+        else:
+            if duration_ms is not None:
+                duration_ms = max(0.0, float(duration_ms))
+                if ts_ms is not None:
+                    ended_at = ts_ms
+                    started_at = ts_ms - duration_ms
+                elif prev_end is not None:
+                    started_at = prev_end
+                    ended_at = prev_end + duration_ms
+            elif ts_ms is not None and prev_end is not None and 0.0 <= ts_ms - prev_end <= _MAX_STEP_GAP_MS:
+                started_at = prev_end
+                ended_at = ts_ms
+                duration_ms = ts_ms - prev_end
+            else:
+                started_at = ts_ms
+                ended_at = ts_ms
+                duration_ms = None
+
+        if ended_at is not None:
+            prev_end = ended_at
+        elif ts_ms is not None:
+            prev_end = ts_ms
+
+        thinking_ms: float | None = None
+        output_ms: float | None = None
+        tool_ms: float | None = None
+        tools: list[str] = []
+        split_source: str | None = None
+
+        if kind == "tool":
+            tools = own_tools or list(last_tool_names)
+            tool_ms = float(raw["tool_ms"]) if raw.get("tool_ms") is not None else duration_ms
+            duration_ms = tool_ms if duration_ms is None else duration_ms
+            split_source = "recorded" if tool_ms is not None else None
+            if own_tools:
+                last_tool_names = own_tools
+        elif role == "assistant":
+            tools = own_tools
+            if own_tools:
+                last_tool_names = own_tools
+            if raw.get("tool_ms") is not None:
+                tool_ms = max(0.0, float(raw["tool_ms"]))
+
+            if raw.get("thinking_ms") is not None and raw.get("output_ms") is not None:
+                thinking_ms = max(0.0, float(raw["thinking_ms"]))
+                output_ms = max(0.0, float(raw["output_ms"]))
+                split_source = str(raw.get("split_source") or "recorded")
+            elif duration_ms is not None:
+                model_ms = max(0.0, duration_ms - (tool_ms or 0.0))
+                think_chars, out_chars = _block_char_counts(blocks)
+                has_thinking = any(
+                    isinstance(b, dict) and b.get("type") == "thinking" and str(b.get("text") or "").strip()
+                    for b in blocks
+                )
+                has_output = any(
+                    isinstance(b, dict) and b.get("type") in ("text", "tool_use")
+                    for b in blocks
+                )
+                r_tok = int(raw.get("reasoning_tokens") or 0)
+                o_tok = int(t.get("output_tokens") or 0)
+                if has_thinking and not has_output:
+                    thinking_ms = round(model_ms, 1)
+                    output_ms = 0.0
+                    split_source = "recorded"
+                elif has_output and not has_thinking:
+                    thinking_ms = 0.0
+                    output_ms = round(model_ms, 1)
+                    split_source = "recorded"
+                elif has_thinking and has_output:
+                    if r_tok > 0 and o_tok > 0:
+                        ratio = r_tok / (r_tok + o_tok)
+                        thinking_ms = round(model_ms * ratio, 1)
+                        output_ms = round(max(0.0, model_ms - thinking_ms), 1)
+                        split_source = "tokens"
+                    else:
+                        tot_chars = max(1, think_chars + out_chars)
+                        thinking_ms = round(model_ms * (think_chars / tot_chars), 1)
+                        output_ms = round(max(0.0, model_ms - thinking_ms), 1)
+                        split_source = "estimated"
+                else:
+                    thinking_ms = 0.0
+                    output_ms = round(model_ms, 1)
+                    split_source = "recorded"
+        elif kind == "user":
+            last_tool_names = []
+
+        t["timing"] = {
+            "started_at": round(started_at, 1) if started_at is not None else None,
+            "ended_at": round(ended_at, 1) if ended_at is not None else None,
+            "duration_ms": round(duration_ms, 1) if duration_ms is not None else None,
+            "thinking_ms": thinking_ms,
+            "output_ms": output_ms,
+            "tool_ms": round(tool_ms, 1) if tool_ms is not None else None,
+            "tools": tools,
+            "split_source": split_source,
+        }
+    return turns
+
+
+def build_trajectory(turns: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a session-level trajectory summary and 3-lane span list from turns.
+
+    Lanes:
+      0 = Input (user prompts / system injections)
+      1 = Model (assistant turns, subdivided into thinking_ms and output_ms)
+      2 = Tools (tool calls and tool results)
+    """
+    if turns and any("timing" not in t for t in turns):
+        annotate_turn_timings(turns)
+
+    spans: list[dict[str, Any]] = []
+    turn_num = 0
+    user_count = 0
+    model_count = 0
+    tool_count = 0
+    thinking_total = 0.0
+    output_total = 0.0
+    tool_total = 0.0
+    min_ts: float | None = None
+    max_ts: float | None = None
+
+    def _note_ts(val: float | None) -> None:
+        nonlocal min_ts, max_ts
+        if val is None:
+            return
+        min_ts = val if min_ts is None else min(min_ts, val)
+        max_ts = val if max_ts is None else max(max_ts, val)
+
+    for seq, t in enumerate(turns):
+        role = t.get("role") or "user"
+        kind = t.get("kind") or role
+        blocks = t.get("blocks") or []
+        timing = t.get("timing") or {}
+        started_at = timing.get("started_at")
+        ended_at = timing.get("ended_at")
+        duration_ms = timing.get("duration_ms")
+        _note_ts(started_at)
+        _note_ts(ended_at)
+
+        if kind == "user":
+            turn_num += 1
+            user_count += 1
+            spans.append({
+                "seq": seq,
+                "turn": turn_num,
+                "lane": 0,
+                "kind": "user",
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "duration_ms": 0.0,
+                "thinking_ms": 0.0,
+                "output_ms": 0.0,
+                "tool_ms": 0.0,
+                "tools": [],
+                "output_tokens": 0,
+            })
+            continue
+
+        cur_turn = max(1, turn_num)
+        if kind == "tool":
+            tool_count += 1
+            t_ms = timing.get("tool_ms")
+            if t_ms is None:
+                t_ms = duration_ms
+            if t_ms is not None and t_ms > 0:
+                tool_total += float(t_ms)
+            spans.append({
+                "seq": seq,
+                "turn": cur_turn,
+                "lane": 2,
+                "kind": "tool",
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "duration_ms": t_ms,
+                "thinking_ms": 0.0,
+                "output_ms": 0.0,
+                "tool_ms": t_ms,
+                "tools": timing.get("tools") or [],
+                "output_tokens": 0,
+            })
+        elif role == "assistant":
+            model_count += 1
+            th_ms = timing.get("thinking_ms")
+            out_ms = timing.get("output_ms")
+            t_ms = timing.get("tool_ms")
+            if th_ms is not None:
+                thinking_total += float(th_ms)
+            if out_ms is not None:
+                output_total += float(out_ms)
+            m_dur = (
+                (float(th_ms or 0.0) + float(out_ms or 0.0))
+                if (th_ms is not None or out_ms is not None)
+                else duration_ms
+            )
+            m_end = (
+                (started_at + m_dur)
+                if (started_at is not None and m_dur is not None and t_ms)
+                else ended_at
+            )
+            spans.append({
+                "seq": seq,
+                "turn": cur_turn,
+                "lane": 1,
+                "kind": "model",
+                "started_at": started_at,
+                "ended_at": m_end,
+                "duration_ms": round(m_dur, 1) if m_dur is not None else None,
+                "thinking_ms": th_ms,
+                "output_ms": out_ms,
+                "tool_ms": 0.0,
+                "tools": timing.get("tools") or [],
+                "output_tokens": int(t.get("output_tokens") or 0),
+                "split_source": timing.get("split_source"),
+            })
+            has_inline_result = any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks
+            )
+            if (t_ms is not None and t_ms > 0) or has_inline_result:
+                tool_count += 1
+                if t_ms is not None and t_ms > 0:
+                    tool_total += float(t_ms)
+                spans.append({
+                    "seq": seq,
+                    "turn": cur_turn,
+                    "lane": 2,
+                    "kind": "tool",
+                    "started_at": m_end,
+                    "ended_at": ended_at,
+                    "duration_ms": t_ms,
+                    "thinking_ms": 0.0,
+                    "output_ms": 0.0,
+                    "tool_ms": t_ms,
+                    "tools": timing.get("tools") or [],
+                    "output_tokens": 0,
+                })
+        else:
+            spans.append({
+                "seq": seq,
+                "turn": cur_turn,
+                "lane": 0,
+                "kind": "system",
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "duration_ms": duration_ms or 0.0,
+                "thinking_ms": 0.0,
+                "output_ms": 0.0,
+                "tool_ms": 0.0,
+                "tools": [],
+                "output_tokens": 0,
+            })
+
+    model_total = round(thinking_total + output_total, 1)
+    thinking_total = round(thinking_total, 1)
+    output_total = round(output_total, 1)
+    tool_total = round(tool_total, 1)
+    active_total = round(model_total + tool_total, 1)
+    wall_ms = round(max_ts - min_ts, 1) if (min_ts is not None and max_ts is not None and max_ts >= min_ts) else active_total
+
+    return {
+        "summary": {
+            "user_turns": user_count,
+            "model_turns": model_count,
+            "tool_calls": tool_count,
+            "thinking_ms": thinking_total,
+            "output_ms": output_total,
+            "model_ms": model_total,
+            "tool_ms": tool_total,
+            "active_ms": active_total,
+            "wall_ms": wall_ms,
+            "started_at": round(min_ts, 1) if min_ts is not None else None,
+            "ended_at": round(max_ts, 1) if max_ts is not None else None,
+        },
+        "spans": spans,
+    }
