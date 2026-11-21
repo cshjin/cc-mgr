@@ -113,3 +113,31 @@ def test_launcher_pidfile_is_owner_only(launcher):
     launcher._write_pidfile(123, "loopback", 8765, "tok")
     assert stat.S_IMODE(launcher._pid_file().stat().st_mode) == 0o600
     assert launcher._read_pidfile()["token"] == "tok"
+
+
+def test_launcher_token_defaults_to_none_unless_requested(launcher, monkeypatch):
+    args = launcher.argparse.Namespace(
+        host="loopback", port=8765, reload=False, auto_port=False,
+        token=False, no_token=False, read_only=False, background=False
+    )
+    served = {}
+    monkeypatch.setattr(launcher, "_serve", lambda *a, **k: served.update(k))
+    launcher.cmd_run(args)
+    assert served.get("token") == ""
+
+    # --token: generates a token
+    args.token = True
+    launcher.cmd_run(args)
+    assert len(served.get("token")) > 10
+
+    # $CC_MGR_TOKEN: uses pinned token
+    args.token = False
+    monkeypatch.setenv("CC_MGR_TOKEN", "pinned-secret")
+    launcher.cmd_run(args)
+    assert served.get("token") == "pinned-secret"
+
+    # --no-token: forces empty token even if $CC_MGR_TOKEN is set
+    args.no_token = True
+    launcher.cmd_run(args)
+    assert served.get("token") == ""
+

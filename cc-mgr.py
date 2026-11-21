@@ -3,7 +3,7 @@
 
 Usage:
     python cc-mgr.py run [--host H] [--port P] [--reload] [--background]
-                         [--read-only] [--no-token]
+                         [--read-only] [--token]
     python cc-mgr.py stop [--port P]
     python cc-mgr.py status [--port P]
 
@@ -11,10 +11,9 @@ Usage:
 the server and return to the shell. `stop` terminates a server previously
 started by this script. Cross-platform (Windows + Linux).
 
-Every start generates a random access token (or uses $CC_MGR_TOKEN) and prints
-http://localhost:PORT/?token=… — the API refuses requests without it, so other
-users on a shared machine (loopback is shared by everyone on the host) can't
-read or change your data.
+By default, the server runs without an access token (convenient for local use
+and SSH port forwarding). An access token can optionally be enabled via
+--token or $CC_MGR_TOKEN.
 """
 from __future__ import annotations
 
@@ -394,7 +393,7 @@ def _loopback_sockets(port: int) -> list[socket.socket]:
 
 
 def _serve(host: str, port: int, reload: bool, auto_port: bool = False,
-           no_token: bool = False, read_only: bool = False) -> None:
+           token: str = "", no_token: bool = False, read_only: bool = False) -> None:
     """Run uvicorn in the foreground (blocking). Manages the pidfile."""
     # Ensure imports + data paths resolve regardless of the caller's cwd.
     os.chdir(HERE)
@@ -416,14 +415,11 @@ def _serve(host: str, port: int, reload: bool, auto_port: bool = False,
         else:
             _die_port_in_use(port, holder)
 
-    token = "" if no_token else (os.environ.get("CC_MGR_TOKEN") or secrets.token_urlsafe(24))
+    if no_token:
+        token = ""
     os.environ.update(_security_env(host, token, read_only))
     _secure_state()
-    if not token:
-        exposure = ("anyone who can reach it over the network" if host not in LOOPBACK_NAMES
-                    else "every user logged into this machine")
-        print(f"WARNING: --no-token: the API is open to {exposure}.", file=sys.stderr)
-    elif host not in LOOPBACK_NAMES:
+    if token and host not in LOOPBACK_NAMES:
         print("WARNING: serving on a non-loopback address over plain HTTP; the token "
               "travels unencrypted. Prefer the default bind plus `ssh -L`.", file=sys.stderr)
 
@@ -493,9 +489,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     if existing:
         _clear_pidfile()  # stale
 
+    token = ""
+    if getattr(args, "no_token", False):
+        token = ""
+    elif getattr(args, "token", False):
+        token = os.environ.get("CC_MGR_TOKEN") or secrets.token_urlsafe(24)
+    elif os.environ.get("CC_MGR_TOKEN"):
+        token = os.environ.get("CC_MGR_TOKEN", "")
+
     if not args.background:
         _serve(args.host, args.port, args.reload, auto_port=args.auto_port,
-               no_token=args.no_token, read_only=args.read_only)
+               token=token, read_only=args.read_only)
         return 0
 
     # --- background: spawn a detached copy running in the foreground ---
@@ -505,7 +509,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd.append("--reload")
     if args.auto_port:
         cmd.append("--auto-port")
-    if args.no_token:
+    if getattr(args, "token", False):
+        cmd.append("--token")
+    if getattr(args, "no_token", False):
         cmd.append("--no-token")
     if args.read_only:
         cmd.append("--read-only")
@@ -606,9 +612,11 @@ def main() -> int:
                        help="if --port is taken, try the next free one")
     p_run.add_argument("--read-only", action="store_true",
                        help="disable every endpoint that writes or deletes data")
+    p_run.add_argument("--token", action="store_true",
+                       help="require an access token (generated randomly or from "
+                            "$CC_MGR_TOKEN)")
     p_run.add_argument("--no-token", action="store_true",
-                       help="serve the API without an access token (unsafe on "
-                            "shared machines: loopback is shared by all users)")
+                       help=argparse.SUPPRESS)  # backwards compatibility: default is already no token
     p_run.set_defaults(func=cmd_run)
 
     p_stop = sub.add_parser("stop", help="stop a server started by this script")

@@ -29,10 +29,10 @@ CLAUDE_HOME=/path/to/.claude python cc-mgr.py run    # point at a different data
 python -m pytest                                     # test suite (pip install -r requirements-dev.txt)
 ```
 
-`cc-mgr.py` is the single entry point (`run`/`stop`/`status`). Every start prints
-`http://localhost:PORT/?token=…`: the API requires that token (exchanged for an
-HttpOnly cookie on first visit) because loopback is shared by every user on a
-multi-user host. `$CC_MGR_TOKEN` pins it; `--no-token` disables it (warns).
+`cc-mgr.py` is the single entry point (`run`/`stop`/`status`). By default,
+every start prints `http://localhost:PORT/` without a token (convenient for
+local use and SSH port forwarding). An access token can optionally be enabled
+via `--token` or `$CC_MGR_TOKEN`.
 State lives in `$CC_MGR_DATA_DIR` (default `data/`, kept 0700): a **per-host**
 pidfile `cc_mgr.<host>.pid` (0600, holds the token) and log `cc_mgr.<host>.log`
 (0600; neither the banner nor uvicorn's access log ever records the token) — the

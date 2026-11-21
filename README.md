@@ -77,13 +77,12 @@ Each agent's data root can be relocated via an env var: `CLAUDE_HOME` /
 
 ```bash
 pip install -r requirements.txt
-python cc-mgr.py run             # prints http://localhost:8765/?token=…  (Ctrl+C to stop)
+python cc-mgr.py run             # prints http://localhost:8765/  (Ctrl+C to stop)
 ```
 
-Open the printed URL: it carries a random **access token**, which the page swaps
-for a cookie. The API refuses requests without it — on a shared machine (e.g. an
-HPC login node) loopback is reachable by every logged-in user. Set `CC_MGR_TOKEN`
-for a stable token; `--no-token` turns the check off (not recommended).
+By default the server runs without an access token (convenient for local use
+and SSH port forwarding). An access token can optionally be enabled via
+`--token` or `CC_MGR_TOKEN` on shared multi-user machines (e.g. an HPC login node).
 
 One file manages the whole lifecycle (works on Windows and Linux):
 
@@ -96,8 +95,7 @@ python cc-mgr.py stop                # stop the server started on this host
 ```
 
 For a remote machine, keep the default loopback bind and forward the port:
-`ssh -L 8765:localhost:8765 remote`, then open the printed URL locally. Binding
-all interfaces (`--host 0.0.0.0`) works but sends the token over plain HTTP.
+`ssh -L 8765:localhost:8765 remote`, then open `http://localhost:8765` locally.
 
 ```bash
 CLAUDE_HOME=/path/to/.claude python cc-mgr.py run   # point at a different data root
